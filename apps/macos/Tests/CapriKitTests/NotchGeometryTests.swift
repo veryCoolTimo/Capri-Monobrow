@@ -11,31 +11,50 @@ final class NotchGeometryTests: XCTestCase {
         auxiliaryTopLeft: CGRect(x: 0, y: 950, width: 663.5, height: 32),
         auxiliaryTopRight: CGRect(x: 848.5, y: 950, width: 663.5, height: 32))
 
+    private let external = NotchScreen(
+        frame: CGRect(x: -1920, y: 200, width: 1920, height: 1080),
+        visibleFrame: CGRect(x: -1920, y: 200, width: 1920, height: 1055),
+        safeAreaTop: 0, auxiliaryTopLeft: nil, auxiliaryTopRight: nil)
+
     func testNotchIsGapBetweenAuxiliaryAreas() {
         XCTAssertEqual(NotchGeometry.notchRect(builtIn), CGRect(x: 663.5, y: 950, width: 185, height: 32))
     }
 
-    func testCollapsedPanelExtendsNotchSideways() {
-        let f = NotchGeometry.collapsedFrame(builtIn)
-        // 663.5 - 76 = 587.5 → 587; 848.5 + 76 = 924.5 → 925 (округление наружу).
-        XCTAssertEqual(f, CGRect(x: 587, y: 950, width: 338, height: 32))
+    func testCollapsedShapeExtendsNotchSideways() {
+        XCTAssertEqual(NotchGeometry.shapeRect(.collapsed, builtIn),
+                       CGRect(x: 663.5 - 76, y: 950, width: 185 + 152, height: 32))
     }
 
-    func testExpandedPanelHangsFromTopCenteredOnNotch() {
-        let f = NotchGeometry.expandedFrame(builtIn)
+    func testPeekIsOnlySlightlyBiggerThanCollapsed() {
+        let collapsed = NotchGeometry.shapeRect(.collapsed, builtIn)
+        let peek = NotchGeometry.shapeRect(.peek, builtIn)
+        XCTAssertEqual(peek.maxY, 982)
+        XCTAssertEqual(peek.midX, collapsed.midX)
+        XCTAssertEqual(peek.height - collapsed.height, 34)
+        XCTAssertEqual(peek.width - collapsed.width, 40)
+    }
+
+    func testExpandedHangsFromTopCenteredOnNotch() {
+        let f = NotchGeometry.shapeRect(.expanded, builtIn)
         XCTAssertEqual(f.maxY, 982)
-        XCTAssertEqual(f.midX, 756, accuracy: 0.5)
+        XCTAssertEqual(f.midX, 756)
         XCTAssertEqual(f.size, NotchGeometry.expandedSize)
     }
 
-    func testScreenWithoutNotchGetsPillUnderMenuBar() {
-        let external = NotchScreen(frame: CGRect(x: -1920, y: 200, width: 1920, height: 1080),
-                                   visibleFrame: CGRect(x: -1920, y: 200, width: 1920, height: 1055),
-                                   safeAreaTop: 0, auxiliaryTopLeft: nil, auxiliaryTopRight: nil)
+    func testHostPanelIsFixedAndContainsEveryState() {
+        let host = NotchGeometry.hostFrame(builtIn)
+        XCTAssertEqual(host.maxY, 982)
+        for state in NotchState.allCases {
+            XCTAssertTrue(host.contains(NotchGeometry.shapeRect(state, builtIn)), "\(state)")
+        }
+    }
+
+    func testScreenWithoutNotchGrowsFromPillUnderMenuBar() {
         XCTAssertNil(NotchGeometry.notchRect(external))
-        XCTAssertEqual(NotchGeometry.collapsedFrame(external),
+        XCTAssertEqual(NotchGeometry.shapeRect(.collapsed, external),
                        CGRect(x: -960 - 100, y: 1255 - 26, width: 200, height: 26))
-        XCTAssertEqual(NotchGeometry.expandedFrame(external).maxY, 1255)
+        XCTAssertEqual(NotchGeometry.shapeRect(.expanded, external).maxY, 1255)
+        XCTAssertEqual(NotchGeometry.hostFrame(external).maxY, 1255)
     }
 
     func testAuxiliaryAreasRelativeToSecondaryScreenAreOffset() {
@@ -45,10 +64,10 @@ final class NotchGeometryTests: XCTestCase {
         XCTAssertEqual(NotchGeometry.notchRect(s), CGRect(x: 1920 + 663.5, y: -300 + 950, width: 185, height: 32))
     }
 
-    func testExpandedPanelStaysOnScreen() {
+    func testHostPanelStaysOnNarrowScreen() {
         let narrow = NotchScreen(frame: CGRect(x: 0, y: 0, width: 400, height: 600),
                                  visibleFrame: CGRect(x: 0, y: 0, width: 400, height: 575),
                                  safeAreaTop: 0, auxiliaryTopLeft: nil, auxiliaryTopRight: nil)
-        XCTAssertEqual(NotchGeometry.expandedFrame(narrow).minX, 0)
+        XCTAssertEqual(NotchGeometry.hostFrame(narrow).minX, 0)
     }
 }

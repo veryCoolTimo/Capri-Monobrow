@@ -21,10 +21,19 @@ public struct NotchScreen: Equatable {
     }
 }
 
+/// Свёрнутый — продолжение выреза; peek — чуть выехал вниз, одна строка; expanded — полная панель.
+public enum NotchState: String, CaseIterable {
+    case collapsed, peek, expanded
+}
+
 public enum NotchGeometry {
     public static let sideWidth: CGFloat = 76
     public static let pillSize = CGSize(width: 200, height: 26)
-    public static let expandedSize = CGSize(width: 440, height: 320)
+    public static let peekExtraHeight: CGFloat = 34
+    public static let peekExtraWidth: CGFloat = 40
+    public static let expandedSize = CGSize(width: 440, height: 284)
+    /// Запас прозрачной панели вокруг самой большой формы: под перелёт пружины и тень.
+    public static let hostMargin: CGFloat = 24
 
     /// Прямоугольник физического выреза или nil, если его нет.
     /// Вспомогательные области AppKit отдаёт в координатах экрана; если они уже
@@ -44,24 +53,44 @@ public enum NotchGeometry {
         max(0, s.frame.maxY - s.visibleFrame.maxY)
     }
 
-    /// Свёрнутая панель: «продолжение» выреза с полями по бокам или пилюля под строкой меню.
-    public static func collapsedFrame(_ s: NotchScreen) -> CGRect {
-        if let notch = notchRect(s) {
-            // AppKit округляет frame окна до целых точек; расширяем наружу, чтобы вырез был закрыт целиком.
-            return CGRect(x: notch.minX - sideWidth, y: notch.minY,
-                          width: notch.width + 2 * sideWidth, height: notch.height).integral
-        }
-        let top = s.frame.maxY - menuBarHeight(s)
-        return CGRect(x: s.frame.midX - pillSize.width / 2, y: top - pillSize.height,
-                      width: pillSize.width, height: pillSize.height).integral
+    /// Верхняя кромка капли: верх экрана при вырезе, низ строки меню без него.
+    public static func anchorTop(_ s: NotchScreen) -> CGFloat {
+        notchRect(s) == nil ? s.frame.maxY - menuBarHeight(s) : s.frame.maxY
     }
 
-    /// Раскрытая панель: прижата к верху экрана под вырезом (или под строкой меню), по центру выреза.
-    public static func expandedFrame(_ s: NotchScreen) -> CGRect {
-        let collapsed = collapsedFrame(s)
-        let top = notchRect(s) == nil ? collapsed.maxY : s.frame.maxY
-        var x = collapsed.midX - expandedSize.width / 2
-        x = max(min(x, s.frame.maxX - expandedSize.width), s.frame.minX)
-        return CGRect(x: x, y: top - expandedSize.height, width: expandedSize.width, height: expandedSize.height).integral
+    public static func anchorX(_ s: NotchScreen) -> CGFloat {
+        notchRect(s)?.midX ?? s.frame.midX
+    }
+
+    public static func shapeSize(_ state: NotchState, _ s: NotchScreen) -> CGSize {
+        let collapsed: CGSize
+        if let notch = notchRect(s) {
+            collapsed = CGSize(width: notch.width + 2 * sideWidth, height: notch.height)
+        } else {
+            collapsed = pillSize
+        }
+        switch state {
+        case .collapsed: return collapsed
+        case .peek: return CGSize(width: collapsed.width + peekExtraWidth, height: collapsed.height + peekExtraHeight)
+        case .expanded: return expandedSize
+        }
+    }
+
+    /// Фиксированная прозрачная панель, внутри которой анимируется капля. Её frame не меняется.
+    public static func hostFrame(_ s: NotchScreen) -> CGRect {
+        let width = expandedSize.width + 2 * hostMargin
+        let height = expandedSize.height + hostMargin
+        var x = anchorX(s) - width / 2
+        x = max(min(x, s.frame.maxX - width), s.frame.minX)
+        return CGRect(x: x, y: anchorTop(s) - height, width: width, height: height).integral
+    }
+
+    /// Капля в состоянии `state` (глобальные координаты) — для отрисовки и проверки попадания мыши.
+    public static func shapeRect(_ state: NotchState, _ s: NotchScreen) -> CGRect {
+        let size = shapeSize(state, s)
+        let host = hostFrame(s)
+        var x = anchorX(s) - size.width / 2
+        x = max(min(x, host.maxX - size.width), host.minX)
+        return CGRect(x: x, y: anchorTop(s) - size.height, width: size.width, height: size.height)
     }
 }

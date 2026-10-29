@@ -23,8 +23,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 codesign --force --sign - "$APP" >/dev/null 2>&1
-pkill -x NotchSpike 2>/dev/null || true
-sleep 0.5
+bash "$ROOT/scripts/stop-macos.sh"
 rm -f /tmp/capri-notch.json*
 open -n "$APP" --args "$@"
 for _ in $(seq 1 20); do [ -f /tmp/capri-notch.json ] && break; sleep 0.25; done

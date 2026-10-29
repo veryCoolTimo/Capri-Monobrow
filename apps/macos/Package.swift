@@ -12,7 +12,7 @@ let package = Package(
         .target(name: "CapriKit"),
         .executableTarget(name: "Capri", dependencies: ["CapriKit"], resources: [.copy("Resources/Character")]),
         .executableTarget(name: "NotchSpike", dependencies: ["CapriKit"]),
-        .testTarget(name: "CapriKitTests", dependencies: ["CapriKit"])
+        .testTarget(name: "CapriKitTests", dependencies: ["CapriKit"], resources: [.copy("Fixtures")])
     ],
     swiftLanguageModes: [.v5]
 )
