@@ -1,0 +1,3 @@
+html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; user-select: none; }
+canvas { display: block; width: 100%; height: 100%; pointer-events: none; }
+#fallback { position: absolute; left: 15.91%; top: 10.53%; width: 68.18%; height: 78.95%; object-fit: contain; }

@@ -1,0 +1,16 @@
+{
+  "name": "capri-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.18" },
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "test": "node --test packages/core/test/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "test:macos": "bash scripts/test-macos.sh",
+    "build:macos": "bash scripts/build-macos.sh",
+    "start": "bash scripts/run-macos.sh"
+  },
+  "devDependencies": { "typescript": "7.0.2" }
+}
