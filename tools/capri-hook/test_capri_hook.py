@@ -204,6 +204,40 @@ class CodexTrustTests(Base):
         self.assertIn("доверие выставлено %d" % len(ours), out.stdout)
 
 
+class AgentDetectionTests(unittest.TestCase):
+    def test_agent_of(self):
+        self.assertEqual(ch.agent_of("claude --settings x"), "claude")
+        self.assertEqual(ch.agent_of("/Users/u/.local/share/claude/versions/2.1.310 --model haiku"), "claude")
+        self.assertEqual(ch.agent_of("node /home/u/.local/bin/codex -a on-request"), None)
+        self.assertEqual(ch.agent_of("/home/u/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex -a x"), "codex")
+        self.assertEqual(ch.agent_of("/opt/homebrew/bin/codex"), "codex")
+        self.assertEqual(ch.agent_of("vim codex.md"), None)
+        self.assertEqual(ch.agent_of("/bin/bash ./start-codex.sh"), None)
+
+    def test_pane_agent_walks_children(self):
+        children = {"10": ["11"], "11": ["12"]}
+        self.assertEqual(ch.pane_agent("10", children, {"12": "codex"}), "codex")
+        self.assertIsNone(ch.pane_agent("10", children, {}))
+
+
+class PaneFilterTests(Base):
+    def test_only_sessions_prefix(self):
+        fake = os.path.join(self.tmp, "bin")
+        os.makedirs(fake)
+        with open(os.path.join(fake, "tmux"), "w") as f:
+            f.write("#!/bin/sh\nprintf '%%1\\tcapri-test-a\\t0\\tclaude\\t1\\t/p\\tt\\t80\\t24\\n%%2\\twork\\t0\\tclaude\\t2\\t/p\\tt\\t80\\t24\\n'\n")
+        os.chmod(os.path.join(fake, "tmux"), 0o755)
+        old = os.environ["PATH"]
+        os.environ["PATH"] = fake + os.pathsep + old
+        try:
+            ch.SESSION_PREFIX = "capri-test-"
+            self.assertEqual([p["pane"] for p in ch.list_panes()], ["%1"])
+            ch.SESSION_PREFIX = None
+            self.assertEqual(len(ch.list_panes()), 2)
+        finally:
+            os.environ["PATH"] = old
+
+
 class FollowerTests(Base):
     def test_follow_survives_rotation(self):
         path = os.path.join(self.tmp, "events.jsonl")

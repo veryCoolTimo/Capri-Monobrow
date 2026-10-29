@@ -4,8 +4,10 @@
 Режимы:
   capri-hook claude | codex           хук: JSON из stdin -> строка в ~/.capri/events.jsonl
   capri-hook codex-notify [-- PROG..] JSON   notify Codex: записать и вызвать исходную программу
-  capri-hook stream [--replay N]      для Capri: снимок (последние события, панели tmux, экраны)
-                                      и дальше поток новых строк; JSON по строке в stdout
+  capri-hook stream [--replay N] [--only-sessions PREFIX]
+                                      для Capri: снимок (последние события, панели tmux, экраны)
+                                      и дальше поток новых строк; JSON по строке в stdout.
+                                      --only-sessions — только tmux-сессии с этим префиксом (тесты)
   capri-hook install|uninstall|status [--dry-run] [--no-claude] [--no-codex] [--codex-notify]
 
 Хук-режим ничего не печатает, всегда выходит с 0 и укладывается в десятки миллисекунд:
@@ -39,7 +41,6 @@ CODEX_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PermissionReq
 MATCHER_EVENTS = {"PreToolUse", "PostToolUse", "PermissionRequest", "Notification"}
 # Поля, которые в журнал не пишем: большие и Capri не нужны.
 DROP_FIELDS = {"tool_response"}
-AGENT_COMMANDS = {"claude", "claude.exe", "codex", "node"}
 
 
 def capri_dir():
@@ -168,6 +169,51 @@ def emit(obj):
     sys.stdout.flush()
 
 
+SESSION_PREFIX = None
+
+
+def agent_of(args):
+    """claude/codex по командной строке процесса (на Маке Claude лежит как …/claude/versions/2.1.x)."""
+    argv0 = args.split(" ", 1)[0]
+    base = os.path.basename(argv0)
+    if base in ("claude", "claude.exe") or "/claude/versions/" in argv0 or "claude-code" in argv0:
+        return "claude"
+    if base == "codex" or "@openai/codex" in args.split(" --", 1)[0] or "/codex/codex" in argv0:
+        return "codex"
+    return None
+
+
+def process_agents():
+    """pid -> агент для всех потомков; один вызов ps на опрос."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return {}, {}
+    children, agents = {}, {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, ppid, args = parts
+        children.setdefault(ppid, []).append(pid)
+        a = agent_of(args)
+        if a:
+            agents[pid] = a
+    return children, agents
+
+
+def pane_agent(pid, children, agents, depth=0):
+    if pid in agents:
+        return agents[pid]
+    if depth > 6:
+        return None
+    for c in children.get(pid, []):
+        a = pane_agent(c, children, agents, depth + 1)
+        if a:
+            return a
+    return None
+
+
 def list_panes():
     fmt = "\t".join(["#{pane_id}", "#{session_name}", "#{window_index}", "#{pane_current_command}",
                      "#{pane_pid}", "#{pane_current_path}", "#{pane_title}", "#{pane_width}", "#{pane_height}"])
@@ -178,13 +224,17 @@ def list_panes():
     if out.returncode != 0:
         return []   # tmux-сервер не запущен
     panes = []
+    children, agents = process_agents()
     for line in out.stdout.splitlines():
         parts = line.split("\t")
         if len(parts) < 9:
             continue
+        if SESSION_PREFIX and not parts[1].startswith(SESSION_PREFIX):
+            continue
         panes.append({"pane": parts[0], "session": parts[1], "window": parts[2], "command": parts[3],
                       "pid": parts[4], "path": parts[5], "title": parts[6],
-                      "width": parts[7], "height": parts[8]})
+                      "width": parts[7], "height": parts[8],
+                      "agent": pane_agent(parts[4], children, agents)})
     return panes
 
 
@@ -300,7 +350,7 @@ def emit_event_line(line, replay):
 def send_screens(panes, cache):
     alive = set()
     for p in panes:
-        if p["command"] not in AGENT_COMMANDS:
+        if not p.get("agent"):
             continue
         alive.add(p["pane"])
         rows = capture_screen(p["pane"])
@@ -311,7 +361,7 @@ def send_screens(panes, cache):
             continue
         cache[p["pane"]] = digest
         emit({"kind": "screen", "ts": round(time.time(), 3), "pane": p["pane"], "session": p["session"],
-              "command": p["command"], "lines": rows})
+              "command": p["command"], "agent": p["agent"], "lines": rows})
     for pane in list(cache):
         if pane not in alive:
             del cache[pane]
@@ -628,6 +678,8 @@ def main(argv):
     if mode == "codex-notify":
         return run_notify(rest)
     if mode == "stream":
+        global SESSION_PREFIX
+        SESSION_PREFIX = option(rest, "--only-sessions")
         replay = int(option(rest, "--replay") or 300)
         return run_stream(replay=replay, once="--once" in rest)
     if mode == "install":

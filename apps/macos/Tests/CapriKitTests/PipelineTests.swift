@@ -39,8 +39,8 @@ final class EventDecodingTests: XCTestCase {
     func testStreamMessages() {
         XCTAssertEqual(StreamMessage.decode(line: #"{"kind":"snapshot-end","ts":1}"#), .snapshotEnd)
         XCTAssertEqual(StreamMessage.decode(line: #"{"kind":"panes","ts":1,"panes":null}"#), .panes(nil))
-        let screen = StreamMessage.decode(line: #"{"kind":"screen","ts":5,"pane":"%3","session":"s","command":"claude","lines":["a"]}"#)
-        XCTAssertEqual(screen, .screen(pane: "%3", command: "claude", lines: ["a"], ts: 5))
+        let screen = StreamMessage.decode(line: #"{"kind":"screen","ts":5,"pane":"%3","session":"s","command":"bash","agent":"claude","lines":["a"]}"#)
+        XCTAssertEqual(screen, .screen(pane: "%3", agent: .claude, lines: ["a"], ts: 5))
         XCTAssertNil(StreamMessage.decode(line: "мусор"))
     }
 }
@@ -163,7 +163,7 @@ final class SessionReducerTests: XCTestCase {
         XCTAssertEqual(s.status, .running, "после Esc у Claude хука нет — по хукам всё ещё работает")
         let pane = s.tmux!.pane
         let t = s.statusSince + 5
-        SessionReducer.reduce(&state, .screen(host: "server", pane: pane, command: "claude", lines: Fixtures.screen("claude-interrupted"), ts: t))
+        SessionReducer.reduce(&state, .screen(host: "server", pane: pane, agent: .claude, lines: Fixtures.screen("claude-interrupted"), ts: t))
         SessionReducer.reduce(&state, .tick(t + 1))
         XCTAssertEqual(session(state, .claude).status, .running, "ещё не прошла пауза")
         SessionReducer.reduce(&state, .tick(t + SessionReducer.screenIdleGrace))
@@ -179,7 +179,7 @@ final class SessionReducerTests: XCTestCase {
         let s = session(state, .claude)
         XCTAssertEqual(s.status, .needsInput)
         let t = s.statusSince + 4
-        SessionReducer.reduce(&state, .screen(host: "server", pane: s.tmux!.pane, command: "claude", lines: Fixtures.screen("claude-denied"), ts: t))
+        SessionReducer.reduce(&state, .screen(host: "server", pane: s.tmux!.pane, agent: .claude, lines: Fixtures.screen("claude-denied"), ts: t))
         // До истечения паузы пришёл новый промпт — он и решает.
         _ = run([claude[11], claude[12]], into: &state)
         SessionReducer.reduce(&state, .tick(t + 10))
@@ -190,7 +190,7 @@ final class SessionReducerTests: XCTestCase {
         var state = CapriState()
         _ = run(Array(live.filter { $0.agent == .claude }.prefix(2)), into: &state)  // UserPromptSubmit
         let s = session(state, .claude)
-        SessionReducer.reduce(&state, .screen(host: "server", pane: s.tmux!.pane, command: "claude",
+        SessionReducer.reduce(&state, .screen(host: "server", pane: s.tmux!.pane, agent: .claude,
                                               lines: Fixtures.screen("claude-idle-suggestion"), ts: s.statusSince + 0.3))
         SessionReducer.reduce(&state, .tick(s.statusSince + 10))
         XCTAssertEqual(session(state, .claude).status, .running)
@@ -256,7 +256,7 @@ final class SessionReducerTests: XCTestCase {
         var state = CapriState()
         let first = live.filter { $0.agent == .claude }
         let pane = first[0].tmux!.pane
-        let effects = SessionReducer.reduce(&state, .screen(host: "server", pane: pane, command: "claude",
+        let effects = SessionReducer.reduce(&state, .screen(host: "server", pane: pane, agent: .claude,
                                                             lines: Fixtures.screen("claude-permission"), ts: 100))
         let inferred = SessionKey(host: "server", agent: .claude, id: "pane:\(pane)")
         XCTAssertEqual(state.sessions[inferred]?.status, .needsInput)
@@ -272,7 +272,7 @@ final class SessionReducerTests: XCTestCase {
         var state = CapriState()
         _ = run(Array(live.filter { $0.agent == .claude }.prefix(1)), into: &state)
         let s = session(state, .claude)
-        SessionReducer.reduce(&state, .screen(host: "server", pane: s.tmux!.pane, command: "claude",
+        SessionReducer.reduce(&state, .screen(host: "server", pane: s.tmux!.pane, agent: .claude,
                                               lines: Fixtures.screen("claude-typed"), ts: s.statusSince + 5))
         XCTAssertEqual(session(state, .claude).typedInput, "hello typed text")
     }

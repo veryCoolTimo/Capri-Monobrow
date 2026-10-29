@@ -73,7 +73,7 @@ public struct CapriState: Equatable {
 
 public enum CapriInput: Equatable {
     case event(host: String, CapriEvent, replay: Bool)
-    case screen(host: String, pane: String, command: String, lines: [String], ts: Double)
+    case screen(host: String, pane: String, agent: Agent?, lines: [String], ts: Double)
     case panes(host: String, [PaneInfo]?, ts: Double)
     case connection(host: String, connected: Bool, ts: Double)
     case tick(Double)
@@ -98,8 +98,8 @@ public enum SessionReducer {
         switch input {
         case let .event(host, event, replay):
             return apply(&state, host: host, event: event, replay: replay)
-        case let .screen(host, pane, command, lines, ts):
-            return applyScreen(&state, host: host, pane: pane, command: command, lines: lines, ts: ts)
+        case let .screen(host, pane, agent, lines, ts):
+            return applyScreen(&state, host: host, pane: pane, agent: agent, lines: lines, ts: ts)
         case let .panes(host, panes, ts):
             applyPanes(&state, host: host, panes: panes, ts: ts)
             return []
@@ -203,11 +203,11 @@ public enum SessionReducer {
 
     // MARK: экран (фолбэк)
 
-    static func applyScreen(_ state: inout CapriState, host: String, pane: String, command: String, lines: [String], ts: Double) -> [CapriEffect] {
+    static func applyScreen(_ state: inout CapriState, host: String, pane: String, agent paneAgent: Agent?, lines: [String], ts: Double) -> [CapriEffect] {
         let hooked = state.sessions.values
             .filter { $0.key.host == host && $0.tmux?.pane == pane && $0.status != .ended && !$0.key.id.hasPrefix("pane:") }
             .max { $0.lastEventAt < $1.lastEventAt }
-        let agent = hooked?.key.agent ?? PaneInfo(pane: pane, session: "", command: command).agentGuess
+        let agent = hooked?.key.agent ?? paneAgent
         let screen = ScreenClassifier.classify(lines: lines, agent: agent)
 
         if var s = hooked {

@@ -85,19 +85,13 @@ public struct PaneInfo: Codable, Equatable {
     public var pid: String
     public var path: String
     public var title: String
+    /// Агент по дереву процессов панели (capri-hook смотрит `ps`), nil — не агент.
+    public var agent: Agent?
 
-    public init(pane: String, session: String, window: String = "0", command: String, pid: String = "", path: String = "", title: String = "") {
+    public init(pane: String, session: String, window: String = "0", command: String, pid: String = "",
+                path: String = "", title: String = "", agent: Agent? = nil) {
         self.pane = pane; self.session = session; self.window = window; self.command = command
-        self.pid = pid; self.path = path; self.title = title
-    }
-
-    /// Агент по имени процесса в панели; `node` неоднозначен.
-    public var agentGuess: Agent? {
-        switch command {
-        case "claude", "claude.exe": return .claude
-        case "codex": return .codex
-        default: return nil
-        }
+        self.pid = pid; self.path = path; self.title = title; self.agent = agent
     }
 }
 
@@ -106,7 +100,7 @@ public enum StreamMessage: Equatable {
     case hello(host: String)
     case event(CapriEvent, replay: Bool)
     case panes([PaneInfo]?)
-    case screen(pane: String, command: String, lines: [String], ts: Double)
+    case screen(pane: String, agent: Agent?, lines: [String], ts: Double)
     case snapshotEnd
     case heartbeat
 
@@ -117,7 +111,7 @@ public enum StreamMessage: Equatable {
         var event: CapriEvent?
         var panes: [PaneInfo]?
         var pane: String?
-        var command: String?
+        var agent: Agent?
         var lines: [String]?
         var ts: Double?
     }
@@ -130,7 +124,7 @@ public enum StreamMessage: Equatable {
         case "panes": return .panes(raw.panes)
         case "screen":
             guard let pane = raw.pane, let lines = raw.lines else { return nil }
-            return .screen(pane: pane, command: raw.command ?? "", lines: lines, ts: raw.ts ?? 0)
+            return .screen(pane: pane, agent: raw.agent, lines: lines, ts: raw.ts ?? 0)
         case "snapshot-end": return .snapshotEnd
         case "heartbeat": return .heartbeat
         default: return nil

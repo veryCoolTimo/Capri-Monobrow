@@ -185,8 +185,8 @@ public final class HostCollector {
             onInput?(.event(host: source.name, e, replay: replay))
         case let .panes(panes):
             onInput?(.panes(host: source.name, panes, ts: now))
-        case let .screen(pane, command, lines, ts):
-            onInput?(.screen(host: source.name, pane: pane, command: command, lines: lines, ts: ts))
+        case let .screen(pane, agent, lines, ts):
+            onInput?(.screen(host: source.name, pane: pane, agent: agent, lines: lines, ts: ts))
         }
     }
 
