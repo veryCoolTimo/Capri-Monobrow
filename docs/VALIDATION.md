@@ -5,6 +5,47 @@
 Фикстуры для тестов Этапа 1: `apps/macos/Tests/CapriKitTests/Fixtures/`.
 Код спайков: `spikes/`.
 
+### 1. Notch-панель (Mac, macOS 27.0.1, MacBook Pro M4 Pro) — геометрия и отрисовка работают, наведение и клики не проверены вручную
+
+Код: `apps/macos/Sources/CapriKit/NotchGeometry.swift` (чистая геометрия, 6 тестов в
+`NotchGeometryTests`), спайк-приложение `apps/macos/Sources/NotchSpike/main.swift`.
+Запуск: `scripts/mac.sh "bash spikes/notch/run.sh [--expanded] [--no-notch] [--screen N]"` —
+собирает `dist/NotchSpike.app`, запускает и печатает диагностику `/tmp/capri-notch.json`.
+Снимки: [свёрнутый](preview/notch-collapsed.png), [раскрытый](preview/notch-expanded.png),
+[пилюля без выреза](preview/notch-pill.png).
+
+| Проверка | Результат |
+|---|---|
+| Геометрия выреза | Встроенный дисплей 1512×982 pt @2x: `safeAreaInsets.top = 32`, `auxiliaryTopLeftArea = (0, 950, 663.5×32)`, `auxiliaryTopRightArea = (848.5, 950, 663.5×32)` → вырез `x 663.5…848.5` (185×32 pt). Строка меню 33 pt (`frame.maxY − visibleFrame.maxY`) — на 1 pt выше выреза |
+| Панель над строкой меню | `NSPanel` borderless + nonactivating, level `mainMenu + 3 = 27` (строка меню — слой 24 у WindowServer), `constrainFrameRect` не даёт AppKit увести окно ниже меню. По `CGWindowList`: слой 27, bounds `Y = 0`, на экране. На снимке чёрная полоса продолжает вырез поверх строки меню |
+| Свёрнутый вид | 338×32 pt по центру выреза, по бокам иконка и счётчики |
+| Раскрытый вид (`--expanded`) | 440×320 pt, прижат к верху экрана, центр по вырезу; список «ждут меня» рисуется |
+| Экран без выреза (`--no-notch`) | Пилюля 200×26 pt по центру под строкой меню (`y = visibleFrame.maxY − 26`) |
+| Фокус | `canBecomeKey == false`: панель не забирает фокус у текущего приложения |
+| Тесты | `npm run test:macos` — 10/10 |
+
+**Найдено:**
+- `auxiliaryTop*Area` на основном экране совпадают с глобальными координатами (origin экрана 0,0),
+  поэтому нельзя отличить «локальные» от «глобальных». Геометрия считает так: если центр области
+  не внутри `screen.frame`, это локальные координаты и добавляется origin экрана.
+- AppKit округляет frame окна до целых точек, а вырез стоит на полуточках (663.5). Рамки
+  округляются наружу (`.integral`), чтобы вырез был закрыт целиком.
+- `screencapture` из ssh не работает (`could not create image from display`); работает из
+  Terminal (`open -a Terminal x.command`), но на macOS 27 Terminal запросил разрешение «обойти
+  системный выбор окна» — **на экране Мака остался системный диалог, его нужно закрыть**.
+  Дальше скриншоты — только с согласия Тимофея.
+
+**Не проверено (нужны глаза/руки Тимофея):**
+- Раскрытие по наведению и сворачивание при уходе мыши (`NSTrackingArea .activeAlways`) —
+  синтетические события мыши требуют Accessibility, не давали.
+- Клики мимо панели проходят насквозь: окно размером ровно с видимую форму, поэтому мимо него
+  клики идут в другие окна; прозрачные углы скругления — по опыту прототипа WindowServer
+  пропускает (alpha 0). Нужно кликнуть рядом с панелью в строку меню и в окно под раскрытой панелью.
+- Полноэкранные приложения (`.fullScreenAuxiliary`, `.canJoinAllSpaces`) и строка меню с
+  автоскрытием.
+- Внешний монитор: не подключён. Нужно проверить координаты `auxiliaryTop*Area` и пилюлю на
+  экране с отрицательным origin (`--screen 1`).
+
 ### 2. Хуки Claude Code и Codex — работают на Маке и timoserver
 
 Скрипты: `spikes/hooks/` — `record.py` (пишет stdin/argv/env хука в JSONL, всегда exit 0),
