@@ -1,0 +1,45 @@
+
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   ~/capri-test-hooks
+
+  Updated to latest. Got 5 features, 56 bugfixes, and 31 other changes.
+  code.claude.com/docs/en/changelog for details
+
+▎ Your Max plan includes $200 a month in API credits to power your apps and agents. Claim them at https://clau.de/api-credits
+
+❯ Run this exact bash command: date > stamp.txt && echo done
+
+  Ran 1 shell command
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Worked for 2s · done 11:22 AM
+
+❯ Say hi in one word.
+
+⏺ Hi.
+
+✻ Cogitated for 1s · done 11:23 AM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ run the date command again
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← 1 agent

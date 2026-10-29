@@ -1,0 +1,29 @@
+
+ ▐▛███▛█   Claude Code v2.1.295
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   ~/capri-test-hooks
+
+
+❯ Run this exact bash command: date > stamp.txt && echo done
+
+  Ran 1 shell command
+
+● The command ran and printed done. It wrote the current date to stamp.txt in the working directory, /home/user/capri-test-hooks.
+
+✻ Baked for 3s · done 10:20 AM
+
+❯ Use the AskUserQuestion tool to ask me which color I prefer: red or blue. Then reply with my choice.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Color
+
+Which color do you prefer?
+
+❯ 1. Red
+     Choose red
+  2. Blue
+     Choose blue
+  3. Type something.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

@@ -1,0 +1,48 @@
+
+ ▐▛███▛█   Claude Code v2.1.295
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   ~/capri-test-hooks
+
+
+❯ Run this exact bash command: date > stamp.txt && echo done
+
+  Ran 1 shell command
+
+● The command ran and printed done. It wrote the current date to stamp.txt in the working directory, /home/user/capri-test-hooks.
+
+✻ Baked for 3s · done 10:20 AM
+
+❯ Use the AskUserQuestion tool to ask me which color I prefer: red or blue. Then reply with my choice.
+
+● User answered Claude's questions:
+  ⎿  · Which color do you prefer? → Blue
+
+● You chose blue.
+
+✻ Sautéed for 3s · done 10:22 AM
+
+❯ Write a 600-word story about a goat in a lighthouse.
+
+● The Keeper's Goat
+
+  Nobody on the island remembered how the goat got into the lighthouse. Old Marta swore it had climbed the seventy-two iron steps on its own, one hoof at a time, the way a sailor climbs
+  a rope. The goat, a scruffy brown thing with one yellow eye and one blue, did not explain itself.
+
+  The lighthouse had been empty for eleven years, since the automatic beacon replaced the last keeper. Its glass lantern still turned on its brass track, and the great lens still
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                          ✘ Auto-update failed · Try claude doctor or npm i -g @anthropic-ai/claude-code
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · esc to interrupt · ← for agents

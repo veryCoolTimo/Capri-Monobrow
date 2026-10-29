@@ -1,0 +1,48 @@
+
+ ▐▛███▛█   Claude Code v2.1.295
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   ~/capri-test-hooks
+
+
+❯ Run this exact bash command: date > stamp.txt && echo done
+
+  Ran 1 shell command
+
+● The command ran and printed done. It wrote the current date to stamp.txt in the working directory, /home/user/capri-test-hooks.
+
+✻ Baked for 3s · done 10:20 AM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                          ✘ Auto-update failed · Try claude doctor or npm i -g @anthropic-ai/claude-code
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ show the contents of stamp.txt
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents

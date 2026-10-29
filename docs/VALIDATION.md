@@ -5,6 +5,89 @@
 Фикстуры для тестов Этапа 1: `apps/macos/Tests/CapriKitTests/Fixtures/`.
 Код спайков: `spikes/`.
 
+### 2. Хуки Claude Code и Codex — работают на Маке и timoserver
+
+Скрипты: `spikes/hooks/` — `record.py` (пишет stdin/argv/env хука в JSONL, всегда exit 0),
+`claude-settings.json` (все события → record.py), `codex-hooks.json` (проектные хуки Codex),
+`start-codex.sh`, `setup-testdir.sh` (готовит `~/capri-test-hooks`), `make-fixtures.py`
+(обезличивание). Глобальные `~/.claude/settings.json` и `~/.codex/*` не менялись:
+Claude запускался с `--settings ~/capri-test-hooks/claude-settings.json`, Codex — с проектным
+`./.codex/hooks.json`, `--dangerously-bypass-hook-trust` (доверие не пишется в конфиг) и
+`-c notify=[...]` только на запуск. Сессии: tmux `capri-test-claude`, `capri-test-codex`.
+
+Фикстуры: `Fixtures/hooks/{claude,codex}-{mac,server}.jsonl`, `claude-mac-stopfailure.jsonl`,
+снимки экрана `Fixtures/hooks/screens/` (диалоги разрешений, работает, прерван, простой).
+Формат строки: `{ts, host, label:"<agent>:<Event>", argv, stdin, env}`.
+
+Версии: Claude Code 2.1.310 (Mac), 2.1.295 (timoserver), модель haiku; Codex 0.147.0 (Mac),
+0.151.0 (timoserver), gpt-5.6-sol.
+
+**Claude Code — наблюдаемые последовательности**
+
+| Сценарий | События (Δ от начала) |
+|---|---|
+| Запрос разрешения Bash → «1 Yes» | `UserPromptSubmit` → `PreToolUse` (+1.8 с) → `PermissionRequest` (+0.06 с) → `Notification{notification_type:"permission_prompt", message:"Claude needs your permission"}` (**+6.0 с после PermissionRequest**) → ответ → `PostToolUse` → `Stop` → `SubagentStop` |
+| Простой после `Stop` | `Notification{notification_type:"idle_prompt", message:"Claude is waiting for your input"}` через ~60 с |
+| AskUserQuestion | `PreToolUse` + `PermissionRequest` с `tool_name:"AskUserQuestion"` и `tool_input.questions[{question, header, options[{label,description}], multiSelect}]` → `Notification permission_prompt` (+6 с). После ответа `PostToolUse.tool_input.answers{вопрос: ответ}` |
+| Разрешение «4 No» | **Ничего**: ни `Stop`, ни `PermissionDenied`, ни `idle_prompt` (ждали >2 мин). Экран: `Interrupted · What should Claude do instead?` |
+| Esc во время ответа | **Ничего** после `UserPromptSubmit`. Экран: `Interrupted · What should Claude do instead?` |
+| `/exit` | `SessionEnd{reason:"prompt_input_exit"}` |
+| Не залогинен | `StopFailure{error:"authentication_failed", last_assistant_message:"Not logged in · Please run /login"}` |
+
+Поля: везде `session_id`, `transcript_path`, `cwd`, `hook_event_name`; с хода — `prompt_id`,
+`permission_mode`, `effort`. `SessionStart` даёт `source`, `model`. `Stop` даёт
+`last_assistant_message`, `stop_hook_active`, `background_tasks`, `session_crons`.
+`PermissionRequest` даёт `tool_input` и `permission_suggestions`. В env хука:
+`TMUX_PANE`, `TMUX`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PROJECT_DIR`.
+
+**Codex — наблюдаемые последовательности** (события хуков: SessionStart, SessionEnd,
+UserPromptSubmit, Stop, PreToolUse, PostToolUse, PermissionRequest, SubagentStart/Stop,
+Interrupt, PreCompact/PostCompact; события `Notification` нет)
+
+| Сценарий | События |
+|---|---|
+| Первый промпт | `SessionStart{source:"startup"}` приходит **только с первым ходом**, не при запуске TUI |
+| Запрос разрешения → «1 Yes» | `UserPromptSubmit` → `PreToolUse` → `PermissionRequest{tool_input:{command, description}}` (сразу, без задержки) → `PostToolUse` → `Stop{last_assistant_message}` → notify |
+| Разрешение → Esc (отказ) | `Interrupt` (без `Stop` и notify). Экран: `■ Conversation interrupted` |
+| `/quit` | `Interrupt` (если был незавершённый ход) → `SessionEnd{reason:"other"}` |
+
+Поля Codex: `session_id` (= `thread-id` в notify), `turn_id`, `transcript_path`, `cwd`,
+`hook_event_name`, `model`, `permission_mode`. `TMUX_PANE` в env есть.
+notify: JSON последним аргументом argv: `{type:"agent-turn-complete", thread-id, turn-id, cwd,
+client:"codex-tui", input-messages[], last-assistant-message}`.
+
+**Найдено (важно для Этапа 1):**
+- Самый быстрый сигнал «ждёт меня» у Claude — `PermissionRequest`, а не `Notification`
+  (та приходит на ~6 с позже). Брать `PermissionRequest` → `needs_input`, `Notification` —
+  подтверждение и текст.
+- AskUserQuestion приходит как `PermissionRequest` с вопросами и вариантами — можно сразу
+  рисовать кнопки в notch.
+- **Отказ в разрешении и Esc не дают никакого хука у Claude** — состояние застрянет в
+  `needs_input`/`running`. Нужен фолбэк по экрану (`Interrupted ·`) или по следующему
+  `UserPromptSubmit`. У Codex есть `Interrupt`.
+- Codex 0.151 шлёт notify и для **служебного хода генерации заголовка** (другой
+  `thread-id`, `input-messages` начинается с `Generate a concise, single-line task title`).
+  Фильтровать: учитывать notify только для известных `session_id` из хуков. В 0.147 такого нет.
+- В строке ввода Claude после ответа бывает **серая подсказка** (`❯ show the contents of
+  stamp.txt`), у Codex — плейсхолдер (`› Write tests for @filename`). Проверка «нет чужого
+  набранного текста» по `capture-pane -p` их не отличит — нужен `capture-pane -e` (цвета)
+  или другой признак.
+- Подсказки генерирует субагент — отсюда `SubagentStop` с `agent_type:""` после каждого
+  `Stop` у Claude. Не путать с концом хода.
+- Маркер «работает» у Claude 2.1.x — в нижней строке: `esc to interrupt`.
+- Диалог доверия папке и диалог MCP-серверов проекта у Claude не дают хуков (только экран).
+  Курсор по умолчанию в диалоге доверия на `No, exit`.
+
+**Неизвестные:**
+- Claude на Маке, запущенный в tmux-сервере, поднятом **из ssh**, не видит Keychain →
+  `Not logged in`. Тестовый tmux пришлось стартовать через `open -a Terminal x.command`.
+  Для Capri это не мешает (сессии Тимофея запущены из GUI), но «Открыть»/перезапуск сессий
+  из Capri должны стартовать tmux в GUI-контексте.
+- Есть ли у Claude `idle_prompt` после отказа/прерывания при более долгом ожидании — нет за 2 мин.
+- Codex: Esc во время потокового ответа не дал `Interrupt` сразу (пришёл только при `/quit`) —
+  повторить.
+- Хуки Codex на quiz не проверялись (план: Mac и timoserver).
+
 ### 3. `codex app-server` (Mac, codex-cli 0.147.0 из Homebrew) — работает
 
 Скрипт: `spikes/codex-app-server/spike.py` (python3, stdio JSON-RPC, одна строка = одно сообщение).
