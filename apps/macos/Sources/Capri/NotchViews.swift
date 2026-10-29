@@ -15,27 +15,14 @@ struct NotchActions {
     var send: (SessionKey, ReplyAction) -> Void
     var open: (SessionKey) -> Void
     var select: (SessionKey) -> Void
+    /// «Подробнее» — основное окно на этой сессии.
+    var details: (SessionKey) -> Void
 }
 
 func agoText(_ seconds: Double) -> String {
     let s = max(0, Int(seconds))
     if s >= 3600 { return String(format: "%dh%02d", s / 3600, (s % 3600) / 60) }
     return String(format: "%02d:%02d", s / 60, s % 60)
-}
-
-extension Session {
-    var hostLabel: String { "\(SessionStore.displayHost(key.host)) · \(key.agent.rawValue)" }
-    /// Одна строка о том, чего ждёт или что делает сессия.
-    var headline: String {
-        if let r = request { return r.summary }
-        switch status {
-        case .running: return "работает"
-        case .idle: return lastMessage.map { $0.split(separator: "\n").first.map(String.init) ?? $0 } ?? "ждёт задачу"
-        case .error: return "ошибка: \(lastMessage ?? "")"
-        case .rateLimited: return "упёрлась в лимит"
-        default: return status.rawValue
-        }
-    }
 }
 
 /// «Сколько ждёт» — подписан только на часы, тик не перерисовывает остальную панель.
@@ -222,9 +209,11 @@ struct ExpandedView: View {
             HStack(spacing: 6) {
                 Caps(waiting ? "▲ attention" : s.status.rawValue.replacingOccurrences(of: "_", with: " "),
                      size: 8, color: accent, weight: .bold).fixedSize()
-                Caps(kindLabel(s), size: 8).fixedSize()
+                Caps(s.kindLabel, size: 8).fixedSize()
                 Spacer(minLength: 4)
                 if waiting { WaitBar(clock: store.clock, since: s.statusSince, color: accent) }
+                hudButton("подробнее", accent: Palette.crimson) { actions.details(s.key) }
+                    .help("Основное окно: экран сессии и история")
                 hudButton("открыть ↗", accent: Palette.crimson, enabled: s.tmux != nil) { actions.open(s.key) }
                     .help(s.tmux == nil ? "сессия не в tmux" : "Terminal с tmux attach на эту панель")
             }
@@ -284,32 +273,8 @@ struct ExpandedView: View {
 
     @ViewBuilder
     private func status(_ s: Session) -> some View {
-        let delivery = store.deliveries[s.key]
-        let hint: (String, Color)? = {
-            switch delivery {
-            case .sending?: return ("отправляю…", Palette.dim)
-            case .sent?: return ("отправлено · жду подтверждения", Palette.dim)
-            case .delivered?: return ("доставлено ✓", Palette.acid)
-            case .refused(let m)?: return (m, Palette.crimson)
-            case .notDelivered?: return ("не подтверждено — проверьте сессию («открыть»)", Palette.crimson)
-            case nil:
-                let action: ReplyAction = s.status == .needsInput && !(s.request?.choices.isEmpty ?? true) ? .choose(1) : .text("x")
-                if let r = store.check(s.key, action), r != .empty { return (r.message, Palette.dim) }
-                return nil
-            }
-        }()
-        if let (text, color) = hint {
-            Text(text).font(.system(size: 9.5)).foregroundColor(color).lineLimit(1)
-        }
-    }
-
-    private func kindLabel(_ s: Session) -> String {
-        switch (s.status, s.request?.kind) {
-        case (.needsInput, .question?): return "вопрос"
-        case (.needsInput, .permission?): return "разрешение"
-        case (.needsInput, _): return "нужен ответ"
-        case (.idle, _): return "ждёт задачу"
-        default: return ""
+        if let h = store.hint(s) {
+            Text(h.text).font(.system(size: 9.5)).foregroundColor(h.color).lineLimit(1)
         }
     }
 

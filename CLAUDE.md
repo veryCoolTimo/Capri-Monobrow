@@ -18,7 +18,9 @@
   - `scripts/mac.sh "npm run test:macos"`
   - `scripts/mac.sh "npm run build:macos"`
   - `scripts/mac.sh sync` — только синхронизировать.
-- Запуск GUI на Маке: `scripts/mac.sh "open 'dist/Capri Prototype.app'"`. Перед новым
+- Установка и запуск на Маке: `scripts/mac.sh "bash scripts/install-macos.sh"` — собирает, ставит
+  `/Applications/Capri.app` и запускает (`--no-open` — только поставить). Отладка без окна:
+  `open -a /Applications/Capri.app --args --debug-control`. Перед новым
   запуском закрыть старый экземпляр: `scripts/mac.sh "bash scripts/stop-macos.sh"`
   (скрипты запуска делают это сами).
 - **Любая GUI-сборка (приложение и спайки) обязана иметь выход:** значок в строке меню с

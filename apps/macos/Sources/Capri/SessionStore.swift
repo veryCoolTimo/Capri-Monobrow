@@ -6,6 +6,54 @@ final class Clock: ObservableObject {
     @Published var now = Date().timeIntervalSince1970
 }
 
+/// Подробности для основного окна: последние экраны панелей и история событий. Отдельный объект —
+/// чтобы снимки экрана раз в 2 с не перерисовывали notch.
+final class DetailStore: ObservableObject {
+    /// Сырой снимок экрана. Разбор ANSI — лениво, только когда окно его показывает.
+    struct Screen: Equatable {
+        var raw: [String]
+        var ts: Double
+    }
+    @Published private(set) var screens: [String: Screen] = [:]
+    @Published private(set) var history = SessionHistory()
+    /// Разобранные строки последнего показанного снимка (не публикуется: кэш для отрисовки).
+    private var parsed: [String: (raw: [String], lines: [ScreenLine])] = [:]
+
+    static func screenKey(host: String, pane: String) -> String { "\(host) \(pane)" }
+
+    func screen(_ s: Session) -> Screen? {
+        s.tmux.flatMap { screens[Self.screenKey(host: s.key.host, pane: $0.pane)] }
+    }
+
+    func lines(_ s: Session) -> [ScreenLine]? {
+        guard let pane = s.tmux?.pane else { return nil }
+        let key = Self.screenKey(host: s.key.host, pane: pane)
+        guard let snap = screens[key] else { return nil }
+        if let p = parsed[key], p.raw == snap.raw { return p.lines }
+        let lines = ScreenText.lines(snap.raw)
+        parsed[key] = (snap.raw, lines)
+        return lines
+    }
+
+    func setScreen(host: String, pane: String, lines: [String], ts: Double) {
+        screens[Self.screenKey(host: host, pane: pane)] = Screen(raw: lines, ts: ts)
+    }
+
+    func record(host: String, event: CapriEvent) { history.record(host: host, event: event) }
+    func note(_ key: SessionKey, kind: HistoryEntry.Kind, text: String) {
+        history.note(key, ts: Date().timeIntervalSince1970, kind: kind, text: text)
+    }
+
+    /// Убрать экраны исчезнувших панелей и истории закрытых сессий.
+    func prune(sessions: [SessionKey: Session], panes: [String: [PaneInfo]]) {
+        let alive = Set(panes.flatMap { host, list in list.map { Self.screenKey(host: host, pane: $0.pane) } })
+        let dead = screens.keys.filter { !alive.contains($0) }
+        if !dead.isEmpty { for k in dead { screens[k] = nil; parsed[k] = nil } }
+        let keys = Set(sessions.keys)
+        if history.entries.keys.contains(where: { !keys.contains($0) }) { history.keep(only: keys) }
+    }
+}
+
 /// Живое состояние для интерфейса: сборщики хостов → SessionReducer → сессии для notch;
 /// отправка ответов с проверкой доставки. Всё на главном потоке.
 final class SessionStore: ObservableObject {
@@ -20,6 +68,7 @@ final class SessionStore: ObservableObject {
     @Published private(set) var hosts: [HostRow] = []
     @Published private(set) var deliveries = DeliveryTracker()
     let clock = Clock()
+    let details = DetailStore()
 
     var waiting: [Session] { sessions.filter { $0.status == .needsInput } }
     var runningCount: Int { sessions.filter { $0.status == .running }.count }
@@ -58,6 +107,13 @@ final class SessionStore: ObservableObject {
     /// Как достучаться до хоста сессии (для «Открыть»).
     func transport(_ host: String) -> HostSource.Transport? { collector(host)?.source.transport }
 
+    /// «Открыть»: Terminal с tmux attach на панель сессии.
+    @discardableResult
+    func openTerminal(_ key: SessionKey) -> Bool {
+        guard let s = session(key), let pane = s.tmux?.pane, let transport = transport(key.host) else { return false }
+        return TerminalOpener.open(pane: pane, transport: transport)
+    }
+
     static func displayHost(_ name: String) -> String { name == "local" ? "mac" : name }
 
     // MARK: состояние
@@ -65,9 +121,21 @@ final class SessionStore: ObservableObject {
     private func feed(_ input: CapriInput) {
         let before = state
         let effects = SessionReducer.reduce(&state, input)
-        if case .tick(let t) = input {
+        switch input {
+        case let .tick(t):
             clock.now = t
-            for key in deliveries.expire(now: t) { record(key, nil, result: "not-confirmed") }
+            for key in deliveries.expire(now: t) {
+                record(key, nil, result: "not-confirmed")
+                details.note(key, kind: .problem, text: "ответ не подтвердился")
+            }
+        case let .screen(host, pane, _, lines, ts):
+            details.setScreen(host: host, pane: pane, lines: lines, ts: ts)
+        case let .event(host, event, _):
+            details.record(host: host, event: event)
+        case let .panes(_, panes, _) where panes != nil:
+            details.prune(sessions: state.sessions, panes: state.hosts.compactMapValues(\.panes))
+        default:
+            break
         }
         if state.sessions != before.sessions {
             publishSessions()
@@ -106,6 +174,7 @@ final class SessionStore: ObservableObject {
         if let r = check(key, action) {
             deliveries.refused(key, r.message)
             record(key, action, result: "refused:\(r)")
+            details.note(key, kind: .problem, text: "не отправлено: \(r.message)")
             completion?(false)
             return
         }
@@ -119,14 +188,26 @@ final class SessionStore: ObservableObject {
             if let r = Reply.parseResult(out) {
                 self.deliveries.refused(key, r.message)
                 self.record(key, action, result: "refused:\(r)")
+                self.details.note(key, kind: .problem, text: "не отправлено: \(r.message)")
                 completion?(false)
                 return
             }
             // Точка отсчёта — сессия до отправки: хук может прийти раньше, чем ssh вернёт ответ.
             self.deliveries.sent(key, before: s, action: action, at: Date().timeIntervalSince1970)
             self.record(key, action, result: "sent")
+            self.details.note(key, kind: .reply, text: Self.describe(action, s))
             self.confirmDeliveries()
             completion?(true)
+        }
+    }
+
+    /// Для истории: что отправили (текст ответа целиком — он и так виден на экране сессии).
+    static func describe(_ action: ReplyAction, _ s: Session) -> String {
+        switch action {
+        case .text(let t): return "ты: \(t.split(whereSeparator: \.isNewline).first.map(String.init) ?? t)"
+        case .choose(let n):
+            let label = s.request?.choices.first { $0.index == n }?.label
+            return "выбран вариант \(n)" + (label.map { " \($0)" } ?? "")
         }
     }
 

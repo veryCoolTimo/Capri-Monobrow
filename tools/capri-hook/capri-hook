@@ -34,7 +34,7 @@ import time
 import uuid
 import shlex
 
-VERSION = 4          # версия скрипта; 3 — режим send, 4 — send сверяет агента и диалог
+VERSION = 5          # версия скрипта; 3 — режим send, 4 — send сверяет агента и диалог, 5 — экран 60 строк
 PROTO = 1            # версия протокола stream и формата строки журнала
 # Наша запись — команда, где исполняемый файл называется capri-hook (путь может быть любым,
 # в том числе в кавычках shlex.quote).
@@ -338,7 +338,10 @@ def list_panes():
     return panes
 
 
-def capture_screen(pane, lines=40):
+SCREEN_LINES = 60     # для просмотра в окне Capri; классификатору хватает нижних 22
+
+
+def capture_screen(pane, lines=SCREEN_LINES):
     try:
         out = subprocess.run([tmux_bin(), "capture-pane", "-p", "-e", "-t", pane, "-S", "-%d" % lines],
                              capture_output=True, text=True, errors="replace", timeout=2)

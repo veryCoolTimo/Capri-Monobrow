@@ -92,6 +92,10 @@ final class NotchController: NSObject {
     /// Меню по правому клику (с «Выйти») — его даёт AppDelegate.
     var makeMenu: (() -> NSMenu)?
     var soundEnabled: () -> Bool = { true }
+    /// «Подробнее» в карточке — открыть основное окно.
+    var onDetails: ((SessionKey, String) -> Void)?
+    /// Отладочные команды, которые обрабатывает не notch (окно и т.п.).
+    var onDebug: ((String, String) -> Void)?
 
     private var panel: NotchPanel!
     private var container: NSView!
@@ -159,7 +163,13 @@ final class NotchController: NSObject {
         let actions = NotchActions(
             send: { [weak self] key, action in self?.send(key, action) },
             open: { [weak self] key in self?.open(key) },
-            select: { [weak self] key in self?.select(key) })
+            select: { [weak self] key in self?.select(key) },
+            details: { [weak self] key in
+                guard let self else { return }
+                let draft = self.ui.selected.flatMap(self.store.resolve) == self.store.resolve(key) ? self.ui.reply : ""
+                self.go(.collapsed, reason: "details")
+                self.onDetails?(key, draft)
+            })
         topRow = FadingHost(rootView: TopRowView(store: store, ui: ui, notchWidth: 0))
         peekLine = FadingHost(rootView: PeekLineView(store: store, ui: ui))
         expandedHost = FadingHost(rootView: ExpandedView(store: store, ui: ui, actions: actions))
@@ -448,8 +458,7 @@ final class NotchController: NSObject {
     }
 
     private func open(_ key: SessionKey) {
-        guard let s = store.session(key), let pane = s.tmux?.pane, let transport = store.transport(key.host) else { return }
-        if TerminalOpener.open(pane: pane, transport: transport) { go(.collapsed, reason: "open") }
+        if store.openTerminal(key) { go(.collapsed, reason: "open") }
     }
 
     // MARK: отладочное управление
@@ -487,7 +496,7 @@ final class NotchController: NSObject {
         case "open": if let k = ui.selected { open(k) }
         case "snapshot": snapshot()
         case "dump": dumpState()
-        default: break
+        default: if let cmd = parts.first { onDebug?(cmd, arg) }
         }
     }
 

@@ -4,7 +4,7 @@
 
 ## Запуск
 
-Готовая локальная сборка для Apple Silicon: `dist/Capri Prototype.app` — открыть двойным кликом. Значок ✦ в строке меню остаётся доступен после закрытия основного окна. Выход — через меню «Завершить Capri» или ⌘Q.
+Установка на Маке: `bash scripts/install-macos.sh` — собирает и ставит `/Applications/Capri.app` (запуск из Launchpad, Spotlight, Dock). Запускается один экземпляр; повторный запуск открывает окно. Значок ✦ в строке меню остаётся после закрытия окна. Выход — «Выйти» в меню или ⌘Q.
 
 Из исходников:
 
@@ -61,7 +61,7 @@ node scripts/check-diagnostics.mjs docs/preview
 Экспорт только собственного WebView для диагностики:
 
 ```sh
-"dist/Capri Prototype.app/Contents/MacOS/Capri" --export-diagnostics /absolute/path/to/capri-diagnostics
+"/Applications/Capri.app/Contents/MacOS/Capri" --export-diagnostics /absolute/path/to/capri-diagnostics
 ```
 
 Не запускать второй экземпляр поверх первого: сначала завершить Capri через его меню.
