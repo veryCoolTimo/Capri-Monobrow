@@ -1,0 +1,95 @@
+// CapriCollect — консольная проверка конвейера Этапа 1 без интерфейса.
+// Подключается к хостам (`capri-hook stream` локально или по ssh), гонит события через
+// SessionReducer и печатает переходы статусов с задержкой «событие на хосте → состояние в Capri».
+//
+//   CapriCollect --ssh timoserver [--ssh-cmd 'python3 ~/x/capri-hook stream'] --local [--local-cmd '...']
+//   --state PATH   куда писать снимок состояния (JSON), по умолчанию /tmp/capri-state.json
+//   --seconds N    выйти через N секунд
+// Выход: Ctrl-C.
+import AppKit
+import CapriKit
+
+var sources: [HostSource] = []
+var statePath = "/tmp/capri-state.json"
+var seconds: Double?
+var args = Array(CommandLine.arguments.dropFirst())
+while !args.isEmpty {
+    let a = args.removeFirst()
+    switch a {
+    case "--ssh":
+        let host = args.removeFirst()
+        if args.first == "--ssh-cmd" { args.removeFirst(); sources.append(.ssh(host, remoteCommand: args.removeFirst())) }
+        else { sources.append(.ssh(host)) }
+    case "--local":
+        if args.first == "--local-cmd" { args.removeFirst(); sources.append(.local(hookCommand: args.removeFirst())) }
+        else { sources.append(.local()) }
+    case "--state": statePath = args.removeFirst()
+    case "--seconds": seconds = Double(args.removeFirst())
+    default:
+        FileHandle.standardError.write("неизвестный аргумент \(a)\n".data(using: .utf8)!)
+        exit(2)
+    }
+}
+if sources.isEmpty { sources = [.local()] }
+
+setvbuf(stdout, nil, _IOLBF, 0)
+var state = CapriState()
+let started = Date()
+
+func stamp() -> String { String(format: "%7.2f", Date().timeIntervalSince(started)) }
+
+func describe(_ s: Session) -> String {
+    var line = "\(s.key) [\(s.project)] \(s.status.rawValue) (\(s.confidence.rawValue))"
+    if let r = s.request { line += " · \(r.kind.rawValue): \(r.summary.prefix(60))" }
+    if let o = s.request?.options, !o.isEmpty { line += " · варианты: \(o.joined(separator: " / "))" }
+    if let t = s.typedInput { line += " · набрано: «\(t)»" }
+    if let p = s.tmux { line += " · tmux \(p.session ?? "?") \(p.pane)" }
+    return line
+}
+
+func dump() {
+    let enc = JSONEncoder()
+    enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+    struct Out: Encodable { var hosts: [String: HostState]; var sessions: [Session]; var waiting: [SessionKey] }
+    let out = Out(hosts: state.hosts, sessions: state.sessions.values.sorted { $0.key.description < $1.key.description },
+                  waiting: state.waiting.map(\.key))
+    if let d = try? enc.encode(out) { try? d.write(to: URL(fileURLWithPath: statePath)) }
+}
+
+func feed(_ input: CapriInput) {
+    let before = state.sessions
+    let effects = SessionReducer.reduce(&state, input)
+    let now = Date().timeIntervalSince1970
+    for (key, s) in state.sessions where before[key]?.status != s.status || before[key]?.request != s.request {
+        var lag = ""
+        if case let .event(_, e, replay) = input, !replay { lag = String(format: " · задержка %.2f с", now - e.ts) }
+        if case let .screen(_, _, _, _, ts) = input { lag = String(format: " · по экрану, снят %.2f с назад", now - ts) }
+        print("\(stamp()) \(describe(s))\(lag)")
+    }
+    for key in before.keys where state.sessions[key] == nil { print("\(stamp()) \(key) убрана") }
+    for e in effects {
+        if case let .notifyNeedsInput(key) = e { print("\(stamp()) 🔔 ЖДЁТ МЕНЯ: \(key)") }
+    }
+    if case let .connection(host, c, _) = input { print("\(stamp()) хост \(host): \(c ? "подключён" : "отключён")") }
+    dump()
+}
+
+let collectors = sources.map(HostCollector.init(source:))
+for c in collectors {
+    c.onInput = feed
+    c.onLog = { print("\(stamp()) \($0)") }
+    c.start()
+}
+Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in feed(.tick(Date().timeIntervalSince1970)) }
+NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
+    print("\(stamp()) пробуждение — переподключаюсь")
+    collectors.forEach { $0.reconnectNow() }
+}
+if let seconds {
+    DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { collectors.forEach { $0.stop() }; exit(0) }
+}
+signal(SIGINT, SIG_IGN)
+let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+sigint.setEventHandler { collectors.forEach { $0.stop() }; exit(0) }
+sigint.resume()
+RunLoop.main.run()
