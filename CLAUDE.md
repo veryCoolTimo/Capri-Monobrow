@@ -36,3 +36,5 @@
 
 ## Git
 Коммиты: `<Action> <what changed>`, без "Generated with Claude Code" и без Co-Authored-By.
+Репозиторий: https://github.com/veryCoolTimo/Capri-Monobrow (ветка `main`, **публичный**). После коммита — `git push`.
+Не коммитить секреты, токены, email и личные данные — фикстуры обезличивать (как в codex-app-server).
