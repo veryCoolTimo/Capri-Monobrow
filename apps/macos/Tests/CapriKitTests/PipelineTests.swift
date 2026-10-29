@@ -97,6 +97,13 @@ final class ScreenClassifierTests: XCTestCase {
         XCTAssertEqual(d.options.map(\.key), ["1", "2"])
     }
 
+    func testCodexUpdateMenuIsDialog() {
+        guard case .dialog(let d) = classify("codex-update", .codex) else { return XCTFail() }
+        XCTAssertEqual(d.options.map(\.key), ["1", "2", "3"])
+        XCTAssertEqual(d.options[1].label, "Skip")
+        XCTAssertTrue(d.title?.contains("Update available") ?? false)
+    }
+
     func testAfterDenialOrEscItIsIdle() {
         XCTAssertEqual(classify("claude-denied", .claude), .idle(typed: nil))
         XCTAssertEqual(classify("claude-interrupted", .claude), .idle(typed: nil))

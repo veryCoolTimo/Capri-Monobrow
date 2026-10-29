@@ -125,6 +125,12 @@ final class CharacterController: NSObject, ObservableObject, WKScriptMessageHand
         hiddenUntil = nil; defaults.removeObject(forKey: "hiddenUntil"); isHidden = false
         panel.orderFrontRegardless(); inputPanel.orderFrontRegardless(); screensChanged(); configureRenderer()
     }
+    /// Скрыть без срока (по умолчанию персонаж выключен) — до явного show().
+    func hide() {
+        teleportGeneration += 1
+        hiddenUntil = Date.distantFuture; isHidden = true
+        inputPanel.orderOut(nil); panel.orderOut(nil); configureRenderer()
+    }
     func hideForOneHour() {
         teleportGeneration += 1
         if currentState == "teleport" { setState("idle") }

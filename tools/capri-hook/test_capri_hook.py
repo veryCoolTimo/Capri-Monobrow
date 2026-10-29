@@ -322,6 +322,7 @@ class PaneFilterTests(Base):
         os.chmod(os.path.join(fake, "tmux"), 0o755)
         old = os.environ["PATH"]
         os.environ["PATH"] = fake + os.pathsep + old
+        ch._TMUX_BIN = None     # путь к tmux кэшируется — пусть найдёт подменённый
         try:
             ch.SESSION_PREFIX = "capri-test-"
             self.assertEqual([p["pane"] for p in ch.list_panes()], ["%1"])
@@ -329,6 +330,22 @@ class PaneFilterTests(Base):
             self.assertEqual(len(ch.list_panes()), 2)
         finally:
             os.environ["PATH"] = old
+            ch._TMUX_BIN = None
+            ch.SESSION_PREFIX = None
+
+    def test_only_sessions_prefix_filters_events(self):
+        out = []
+        old_emit = ch.emit
+        ch.emit = out.append
+        try:
+            ch.SESSION_PREFIX = "capri-test-"
+            for sess in ["capri-test-a", "work", None]:
+                rec = {"v": 1, "event": "Stop", "tmux": {"pane": "%1", "session": sess} if sess else None}
+                ch.emit_event_line(json.dumps(rec), False)
+        finally:
+            ch.emit = old_emit
+            ch.SESSION_PREFIX = None
+        self.assertEqual([m["event"]["tmux"]["session"] for m in out], ["capri-test-a"])
 
 
 class FollowerTests(Base):
@@ -397,7 +414,7 @@ class ScreenParseTests(unittest.TestCase):
         return [r[0] for r in screen_fixture(name)]
 
     def test_modes(self):
-        for name in ["claude-permission", "claude-ask-question", "claude-trust-folder", "codex-permission"]:
+        for name in ["claude-permission", "claude-ask-question", "claude-trust-folder", "codex-permission", "codex-update"]:
             self.assertEqual(ch.screen_mode(self.plain(name)), "dialog", name)
         for name in ["claude-running", "codex-running"]:
             self.assertEqual(ch.screen_mode(self.plain(name)), "running", name)
@@ -413,7 +430,7 @@ class ScreenParseTests(unittest.TestCase):
 
     def test_dialog_options_and_cursor(self):
         for name, count in [("claude-permission", 4), ("codex-permission", 3), ("claude-ask-question", 4),
-                            ("claude-trust-folder", 2)]:
+                            ("claude-trust-folder", 2), ("codex-update", 3)]:
             rows, cursor = ch.dialog_options(self.plain(name))
             self.assertEqual((len(rows), cursor), (count, 0), name)
 

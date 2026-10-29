@@ -31,7 +31,7 @@ public enum NotchGeometry {
     public static let pillSize = CGSize(width: 200, height: 26)
     public static let peekExtraHeight: CGFloat = 34
     public static let peekExtraWidth: CGFloat = 40
-    public static let expandedSize = CGSize(width: 440, height: 284)
+    public static let expandedSize = CGSize(width: 440, height: 320)
     /// Запас прозрачной панели вокруг самой большой формы: под перелёт пружины и тень.
     public static let hostMargin: CGFloat = 24
 
@@ -62,7 +62,8 @@ public enum NotchGeometry {
         notchRect(s)?.midX ?? s.frame.midX
     }
 
-    public static func shapeSize(_ state: NotchState, _ s: NotchScreen) -> CGSize {
+    /// `quiet` — нет активности: свёрнутая капля совпадает с вырезом (без выреза — невидимая полоска).
+    public static func shapeSize(_ state: NotchState, _ s: NotchScreen, quiet: Bool = false) -> CGSize {
         let collapsed: CGSize
         if let notch = notchRect(s) {
             collapsed = CGSize(width: notch.width + 2 * sideWidth, height: notch.height)
@@ -70,6 +71,8 @@ public enum NotchGeometry {
             collapsed = pillSize
         }
         switch state {
+        case .collapsed where quiet:
+            return notchRect(s)?.size ?? CGSize(width: pillSize.width, height: 0)
         case .collapsed: return collapsed
         case .peek: return CGSize(width: collapsed.width + peekExtraWidth, height: collapsed.height + peekExtraHeight)
         case .expanded: return expandedSize
@@ -86,8 +89,8 @@ public enum NotchGeometry {
     }
 
     /// Капля в состоянии `state` (глобальные координаты) — для отрисовки и проверки попадания мыши.
-    public static func shapeRect(_ state: NotchState, _ s: NotchScreen) -> CGRect {
-        let size = shapeSize(state, s)
+    public static func shapeRect(_ state: NotchState, _ s: NotchScreen, quiet: Bool = false) -> CGRect {
+        let size = shapeSize(state, s, quiet: quiet)
         let host = hostFrame(s)
         var x = anchorX(s) - size.width / 2
         x = max(min(x, host.maxX - size.width), host.minX)

@@ -54,12 +54,14 @@ public enum ScreenClassifier {
         let claudeDialog = bottom.contains("esc to cancel") && plain.contains(where: { isOption($0) })
         // Меню без номеров (доверие к папке при первом запуске): «❯ No, exit / Yes, I trust…».
         let claudeMenu = bottom.contains("enter to confirm") && bottom.contains("esc to cancel")
+        // Codex: запрос разрешения и меню вроде «Update available … Press enter to continue».
         let codexDialog = bottom.contains("press enter to confirm or esc to cancel")
+            || (bottom.contains("press enter to continue") && plain.contains(where: { isOption($0) }))
         guard claudeDialog || claudeMenu || codexDialog else { return nil }
         let kind: DialogInfo.Kind = bottom.contains("enter to select") ? .question : .permission
         var options = plain.compactMap(option)
         if options.isEmpty { options = menuOptions(plain) }
-        let titleMarkers = ["Do you want", "Would you like", "?"]
+        let titleMarkers = ["Do you want", "Would you like", "?", "!"]
         let title = plain.last(where: { line in titleMarkers.contains(where: { line.contains($0) }) && !isOption(line) })?
             .trimmingCharacters(in: .whitespaces)
         return DialogInfo(kind: kind, title: title, options: options)

@@ -469,6 +469,8 @@ def emit_event_line(line, replay):
         rec = json.loads(line)
     except ValueError:
         return
+    if SESSION_PREFIX and not ((rec.get("tmux") or {}).get("session") or "").startswith(SESSION_PREFIX):
+        return   # фильтр тестов: события чужих tmux-сессий (и без tmux) не отдаём
     emit({"kind": "event", "replay": replay, "event": rec})
 
 
@@ -984,7 +986,8 @@ def screen_mode(plain):
     bottom = "\n".join(plain[-4:]).lower()
     numbered = any(OPTION_RE.match(r) for r in plain)
     if ("esc to cancel" in bottom and (numbered or "enter to confirm" in bottom)) \
-            or "press enter to confirm or esc to cancel" in bottom:
+            or "press enter to confirm or esc to cancel" in bottom \
+            or ("press enter to continue" in bottom and numbered):
         return "dialog"
     if "esc to interrupt" in "\n".join(plain[-8:]).lower():
         return "running"

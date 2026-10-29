@@ -6,13 +6,11 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: [
         .executable(name: "Capri", targets: ["Capri"]),
-        .executable(name: "NotchSpike", targets: ["NotchSpike"]),
         .executable(name: "CapriCollect", targets: ["CapriCollect"])
     ],
     targets: [
         .target(name: "CapriKit"),
         .executableTarget(name: "Capri", dependencies: ["CapriKit"], resources: [.copy("Resources/Character")]),
-        .executableTarget(name: "NotchSpike", dependencies: ["CapriKit"]),
         .executableTarget(name: "CapriCollect", dependencies: ["CapriKit"]),
         .testTarget(name: "CapriKitTests", dependencies: ["CapriKit"], resources: [.copy("Fixtures")])
     ],
