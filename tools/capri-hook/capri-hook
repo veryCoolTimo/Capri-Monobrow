@@ -4,7 +4,7 @@
 Режимы:
   capri-hook claude | codex           хук: JSON из stdin -> строка в ~/.capri/events.jsonl
   capri-hook codex-notify [-- PROG..] JSON   notify Codex: записать и вызвать исходную программу
-  capri-hook stream [--replay N] [--only-sessions PREFIX]
+  capri-hook stream [--no-replay] [--only-sessions PREFIX]
                                       для Capri: снимок (последние события, панели tmux, экраны)
                                       и дальше поток новых строк; JSON по строке в stdout.
                                       --only-sessions — только tmux-сессии с этим префиксом (тесты)
@@ -19,19 +19,23 @@ import hashlib
 import json
 import os
 import re
+import select
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
+import shlex
 
-VERSION = 1
-# Наша запись — команда, где исполняемый файл называется capri-hook (путь может быть любым).
-OURS = re.compile(r"(^|[/\s])capri-hook(\s|$)")
+VERSION = 2          # версия скрипта
+PROTO = 1            # версия протокола stream и формата строки журнала
+# Наша запись — команда, где исполняемый файл называется capri-hook (путь может быть любым,
+# в том числе в кавычках shlex.quote).
+OURS = re.compile(r"""(^|[/\s'"])capri-hook['"]?(\s|$)""")
 MAX_LOG_BYTES = 5 * 1024 * 1024
-MAX_STRING = 2000
-TITLE_PROMPT_PREFIX = "Generate a concise, single-line task title"
+LOCK_TIMEOUT = 1.0
 
 CLAUDE_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PermissionRequest",
                  "Notification", "PostToolUse", "Stop", "StopFailure"]
@@ -39,8 +43,25 @@ CODEX_EVENTS = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PermissionReq
                 "PostToolUse", "Stop", "Interrupt"]
 # События, у которых Claude/Codex поддерживают matcher по имени инструмента.
 MATCHER_EVENTS = {"PreToolUse", "PostToolUse", "PermissionRequest", "Notification"}
-# Поля, которые в журнал не пишем: большие и Capri не нужны.
-DROP_FIELDS = {"tool_response"}
+
+# В журнал пишем только то, что нужно Capri: промпты, ответы инструментов и содержимое файлов
+# остаются на хосте только в транскрипте самого агента. Значение — предел длины строки.
+COMMON_FIELDS = {"hook_event_name": 64, "session_id": 128, "cwd": 512, "transcript_path": 512,
+                 "turn_id": 128, "model": 128, "permission_mode": 64, "source": 64}
+EVENT_FIELDS = {
+    "PermissionRequest": {"tool_name": 128, "tool_input": 2000},
+    "PreToolUse": {"tool_name": 128},
+    "PostToolUse": {"tool_name": 128},
+    "Notification": {"notification_type": 64, "message": 300},
+    "Stop": {"last_assistant_message": 500, "stop_hook_active": 8},
+    "StopFailure": {"error": 300, "last_assistant_message": 300},
+    "SessionEnd": {"reason": 64},
+    "SubagentStop": {"agent_type": 64},
+}
+# Из tool_input запроса разрешения — только то, что показываем человеку.
+TOOL_INPUT_FIELDS = ("command", "description", "file_path", "url", "questions")
+NOTIFY_FIELDS = {"type": 64, "thread-id": 128, "turn-id": 128, "cwd": 512, "client": 64,
+                 "last-assistant-message": 500}
 
 
 def capri_dir():
@@ -55,16 +76,48 @@ def hook_path():
     return os.path.join(capri_dir(), "bin", "capri-hook")
 
 
+def ensure_capri_dir(path):
+    """~/.capri и подкаталоги — только для владельца: в журнале команды и пути."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+
+
+def dumps(obj):
+    # ensure_ascii: строка всегда ASCII — переживает любую локаль ssh и одиночные суррогаты.
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
+
+
 # ---------------------------------------------------------------- запись событий
 
-def trim(value, limit=MAX_STRING):
+def trim(value, limit):
     if isinstance(value, str):
         return value if len(value) <= limit else value[:limit] + "…"
     if isinstance(value, list):
-        return [trim(v, limit) for v in value[:50]]
+        return [trim(v, limit) for v in value[:20]]
     if isinstance(value, dict):
-        return {k: trim(v, limit) for k, v in value.items() if k not in DROP_FIELDS}
+        return {k: trim(v, limit) for k, v in list(value.items())[:30]}
     return value
+
+
+def pick(payload, fields):
+    return {k: trim(payload[k], limit) for k, limit in fields.items() if k in payload}
+
+
+def minimize(source, payload):
+    if source == "notify":
+        data = pick(payload, NOTIFY_FIELDS)
+        msgs = payload.get("input-messages")
+        if isinstance(msgs, list) and msgs:
+            # Только начало первого сообщения: по нему отсекаем служебный ход генерации заголовка.
+            data["input-messages"] = [trim(str(msgs[0]), 120)]
+        return data
+    event = payload.get("hook_event_name") or ""
+    data = pick(payload, COMMON_FIELDS)
+    fields = EVENT_FIELDS.get(event, {})
+    data.update(pick(payload, {k: v for k, v in fields.items() if k != "tool_input"}))
+    if "tool_input" in fields and isinstance(payload.get("tool_input"), dict):
+        ti = payload["tool_input"]
+        data["tool_input"] = {k: trim(ti[k], 2000) for k in TOOL_INPUT_FIELDS if k in ti}
+    return data
 
 
 def tmux_info():
@@ -73,41 +126,61 @@ def tmux_info():
         return None
     info = {"pane": pane}
     try:
-        out = subprocess.run(["tmux", "display", "-p", "-t", pane, "#{session_name}\t#{window_index}"],
-                             capture_output=True, text=True, timeout=1).stdout.strip()
+        out = subprocess.run(["tmux", "display", "-p", "-t", pane, "#{session_name}\t#{window_index}\t#{pane_pid}"],
+                             capture_output=True, text=True, errors="replace", timeout=1).stdout.strip()
         if out:
-            session, window = (out.split("\t") + [""])[:2]
+            session, window, pid = (out.split("\t") + ["", ""])[:3]
             info["session"] = session
             info["window"] = window
+            if pid:
+                info["pid"] = pid
     except Exception:
         pass
     return info
 
 
+def lock(fd, timeout=LOCK_TIMEOUT):
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.005)
+
+
 def append_event(record, path=None):
+    """Дописать строку под flock. Ротация (>5 МБ → .1) тоже под замком; после захвата замка
+    проверяем, что держим именно текущий файл, а не уже переименованный другим писателем."""
     path = path or events_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        if os.fstat(fd).st_size + len(line) > MAX_LOG_BYTES:
-            # Ротация под замком: старый журнал -> .1, пишем в новый файл.
-            os.replace(path, path + ".1")
-            new_fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-            fcntl.flock(new_fd, fcntl.LOCK_EX)
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
-            fd = new_fd
-        os.write(fd, line)
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+    ensure_capri_dir(os.path.dirname(path))
+    line = (dumps(record) + "\n").encode("ascii")
+    for _ in range(5):
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            if not lock(fd):
+                return False
+            try:
+                current = os.stat(path).st_ino
+            except FileNotFoundError:
+                continue
+            if current != os.fstat(fd).st_ino:
+                continue   # файл повернули, пока ждали замок — открываем заново
+            if os.fstat(fd).st_size + len(line) > MAX_LOG_BYTES:
+                os.replace(path, path + ".1")
+                continue   # держим замок старого файла; пишем в новый на следующем круге
+            os.write(fd, line)
+            return True
+        finally:
+            os.close(fd)   # закрытие снимает flock
+    return False
 
 
 def make_record(agent, source, payload, now=None):
     now = time.time() if now is None else now
-    payload = payload if isinstance(payload, dict) else {"raw": payload}
+    payload = payload if isinstance(payload, dict) else {}
     if source == "notify":
         event = payload.get("type") or "notify"
         session_id = payload.get("thread-id")
@@ -115,7 +188,8 @@ def make_record(agent, source, payload, now=None):
         event = payload.get("hook_event_name") or "unknown"
         session_id = payload.get("session_id")
     return {
-        "v": VERSION,
+        "v": PROTO,
+        "id": uuid.uuid4().hex,
         "ts": round(now, 3),
         "host": socket.gethostname(),
         "agent": agent,
@@ -124,7 +198,7 @@ def make_record(agent, source, payload, now=None):
         "session_id": session_id,
         "cwd": payload.get("cwd"),
         "tmux": tmux_info(),
-        "data": trim(payload),
+        "data": minimize(source, payload),
     }
 
 
@@ -165,7 +239,7 @@ def run_notify(argv):
 # ---------------------------------------------------------------- поток для Capri
 
 def emit(obj):
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+    sys.stdout.write(dumps(obj) + "\n")
     sys.stdout.flush()
 
 
@@ -186,7 +260,8 @@ def agent_of(args):
 def process_agents():
     """pid -> агент для всех потомков; один вызов ps на опрос."""
     try:
-        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True, text=True, timeout=3).stdout
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True, text=True,
+                             errors="replace", timeout=3).stdout
     except Exception:
         return {}, {}
     children, agents = {}, {}
@@ -218,7 +293,8 @@ def list_panes():
     fmt = "\t".join(["#{pane_id}", "#{session_name}", "#{window_index}", "#{pane_current_command}",
                      "#{pane_pid}", "#{pane_current_path}", "#{pane_title}", "#{pane_width}", "#{pane_height}"])
     try:
-        out = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt], capture_output=True, text=True, timeout=3)
+        out = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt], capture_output=True, text=True,
+                             errors="replace", timeout=3)
     except Exception:
         return None
     if out.returncode != 0:
@@ -241,7 +317,7 @@ def list_panes():
 def capture_screen(pane, lines=40):
     try:
         out = subprocess.run(["tmux", "capture-pane", "-p", "-e", "-t", pane, "-S", "-%d" % lines],
-                             capture_output=True, text=True, timeout=2)
+                             capture_output=True, text=True, errors="replace", timeout=2)
     except Exception:
         return None
     if out.returncode != 0:
@@ -260,19 +336,16 @@ class Follower:
         self.f = None
         self.buf = b""
 
-    def open_at_end_after_replay(self, replay):
-        records = []
+    def open_at_end(self):
+        """Открыть текущий файл и встать в конец; вернуть всё его содержимое (для снимка)."""
         try:
             self.f = open(self.path, "rb")
         except FileNotFoundError:
             self.f = None
-            return records
-        data = self.f.read()
-        lines = data.split(b"\n")
+            return []
+        lines = self.f.read().split(b"\n")
         self.buf = lines.pop()  # недописанная строка
-        for line in lines[-replay:] if replay > 0 else []:
-            records.append(line)
-        return records
+        return [l for l in lines if l.strip()]
 
     def poll(self):
         out = []
@@ -281,14 +354,17 @@ class Follower:
                 self.f = open(self.path, "rb")
             except FileNotFoundError:
                 return out
-        chunk = self.f.read()
-        if chunk:
-            out.extend(self._split(chunk))
+        out.extend(self._split(self.f.read()))
         try:
             st = os.stat(self.path)
             cur = os.fstat(self.f.fileno())
             if st.st_ino != cur.st_ino or st.st_size < self.f.tell():
-                # Файл повернули или усекли: дочитали старый, начинаем новый с начала.
+                # Повернули или усекли: дочитываем хвост старого файла (писатель мог успеть
+                # дописать после нашего read), потом начинаем новый с начала.
+                if st.st_ino != cur.st_ino:
+                    out.extend(self._split(self.f.read()))
+                    if self.buf.strip():
+                        out.append(self.buf)
                 self.f.close()
                 self.f = open(self.path, "rb")
                 self.buf = b""
@@ -304,22 +380,48 @@ class Follower:
         return [l for l in lines if l.strip()]
 
 
-def run_stream(replay=300, screen_interval=2.0, pane_interval=5.0, heartbeat=15.0, poll=0.2, once=False):
-    emit({"kind": "hello", "v": VERSION, "host": socket.gethostname(), "ts": round(time.time(), 3),
-          "events_path": events_path()})
+def snapshot_lines(current_lines, path, per_session=30, max_sessions=200):
+    """Снимок при (пере)подключении: последние события каждой сессии из .1 и текущего файла,
+    в хронологическом порядке. Так сессия, ждущая давно, не теряется за болтливыми соседями."""
+    lines = []
+    try:
+        with open(path + ".1", "rb") as f:
+            lines = [l for l in f.read().split(b"\n") if l.strip()]
+    except FileNotFoundError:
+        pass
+    lines += current_lines
+    by_session, order = {}, []
+    for line in lines:
+        try:
+            sid = json.loads(line).get("session_id") or "-"
+        except ValueError:
+            continue
+        if sid not in by_session:
+            order.append(sid)
+        by_session.setdefault(sid, []).append(line)
+    keep = set()
+    for sid in order[-max_sessions:]:
+        keep.update(id(l) for l in by_session[sid][-per_session:])
+    return [l for l in lines if id(l) in keep]
+
+
+def run_stream(screen_interval=2.0, screen_resend=10.0, pane_interval=5.0, heartbeat=15.0, poll=0.2,
+               once=False, replay=True):
+    emit({"kind": "hello", "proto": PROTO, "version": VERSION, "host": socket.gethostname(),
+          "now": round(time.time(), 3), "events_path": events_path()})
     follower = Follower(events_path())
-    for line in follower.open_at_end_after_replay(replay):
-        emit_event_line(line, replay=True)
+    current = follower.open_at_end()
+    if replay:
+        for line in snapshot_lines(current, events_path()):
+            emit_event_line(line, replay=True)
     panes = list_panes()
     emit({"kind": "panes", "ts": round(time.time(), 3), "panes": panes})
     screens = {}
-    send_screens(panes or [], screens)
-    emit({"kind": "snapshot-end", "ts": round(time.time(), 3)})
+    send_screens(panes or [], screens, screen_resend)
+    emit({"kind": "snapshot-end", "ts": round(time.time(), 3), "now": round(time.time(), 3)})
     if once:
         return 0
-    last_panes = time.time()
-    last_screens = time.time()
-    last_beat = time.time()
+    last_panes = last_screens = last_beat = time.time()
     while True:
         for line in follower.poll():
             emit_event_line(line, replay=False)
@@ -331,10 +433,10 @@ def run_stream(replay=300, screen_interval=2.0, pane_interval=5.0, heartbeat=15.
                 emit({"kind": "panes", "ts": round(now, 3), "panes": panes})
             last_panes = now
         if now - last_screens >= screen_interval:
-            send_screens(panes or [], screens)
+            send_screens(panes or [], screens, screen_resend)
             last_screens = now
         if now - last_beat >= heartbeat:
-            emit({"kind": "heartbeat", "ts": round(now, 3)})
+            emit({"kind": "heartbeat", "ts": round(now, 3), "now": round(now, 3)})
             last_beat = now
         time.sleep(poll)
 
@@ -347,8 +449,11 @@ def emit_event_line(line, replay):
     emit({"kind": "event", "replay": replay, "event": rec})
 
 
-def send_screens(panes, cache):
+def send_screens(panes, cache, resend):
+    """Экран панели агента — при изменении и повторно раз в `resend` секунд: неизменный экран
+    тоже нужен reducer'у (подтвердить «ждёт ввода», когда хука не было)."""
     alive = set()
+    now = time.time()
     for p in panes:
         if not p.get("agent"):
             continue
@@ -356,12 +461,13 @@ def send_screens(panes, cache):
         rows = capture_screen(p["pane"])
         if rows is None:
             continue
-        digest = hashlib.sha1("\n".join(rows).encode()).hexdigest()
-        if cache.get(p["pane"]) == digest:
+        digest = hashlib.sha1("\n".join(rows).encode("utf-8", "replace")).hexdigest()
+        prev = cache.get(p["pane"])
+        if prev and prev[0] == digest and now - prev[1] < resend:
             continue
-        cache[p["pane"]] = digest
-        emit({"kind": "screen", "ts": round(time.time(), 3), "pane": p["pane"], "session": p["session"],
-              "command": p["command"], "agent": p["agent"], "lines": rows})
+        cache[p["pane"]] = (digest, now)
+        emit({"kind": "screen", "ts": round(now, 3), "pane": p["pane"], "session": p["session"],
+              "command": p["command"], "agent": p["agent"], "pid": p["pid"], "lines": rows})
     for pane in list(cache):
         if pane not in alive:
             del cache[pane]
@@ -369,8 +475,16 @@ def send_screens(panes, cache):
 
 # ---------------------------------------------------------------- установщик
 
+class InstallError(Exception):
+    pass
+
+
 def is_ours(hook):
     return isinstance(hook, dict) and bool(OURS.search(str(hook.get("command", ""))))
+
+
+def group_is_ours(g):
+    return isinstance(g, dict) and isinstance(g.get("hooks"), list) and any(is_ours(h) for h in g["hooks"])
 
 
 def strip_ours(hooks_obj):
@@ -382,7 +496,7 @@ def strip_ours(hooks_obj):
             continue
         kept = []
         for g in groups:
-            if not isinstance(g, dict) or not isinstance(g.get("hooks"), list):
+            if not group_is_ours(g):
                 kept.append(g)
                 continue
             inner = [h for h in g["hooks"] if not is_ours(h)]
@@ -390,31 +504,68 @@ def strip_ours(hooks_obj):
                 ng = dict(g)
                 ng["hooks"] = inner
                 kept.append(ng)
-            elif not any(is_ours(h) for h in g["hooks"]):
-                kept.append(g)
         if kept or not groups:
             result[event] = kept
     return result
 
 
+def our_group(event, command):
+    group = {"hooks": [{"type": "command", "command": command, "timeout": 5}]}
+    return {"matcher": "*", "hooks": group["hooks"]} if event in MATCHER_EVENTS else group
+
+
 def merged_hooks(hooks_obj, events, command):
-    """Наши группы добавляются В КОНЕЦ массива события: индексы чужих хуков не меняются
-    (у Codex от них зависит ключ доверия)."""
-    result = strip_ours(hooks_obj or {})
+    """Наши группы добавляются В КОНЕЦ массива события, а уже стоящая наша запись остаётся на
+    своём месте: индексы чужих хуков не меняются (у Codex от них зависит ключ доверия)."""
+    result = {}
+    for event, groups in (hooks_obj or {}).items():
+        if not isinstance(groups, list):
+            result[event] = groups
+        elif event in events and [g for g in groups if group_is_ours(g)] == [our_group(event, command)]:
+            result[event] = groups   # ровно наша актуальная запись уже стоит — не двигаем
+        else:
+            stripped = strip_ours({event: groups})
+            if event in stripped:
+                result[event] = stripped[event]
     for event in events:
-        group = {"hooks": [{"type": "command", "command": command, "timeout": 5}]}
-        if event in MATCHER_EVENTS:
-            group = {"matcher": "*", "hooks": group["hooks"]}
-        result.setdefault(event, [])
-        result[event] = list(result[event]) + [group]
+        groups = result.get(event)
+        if groups is not None and not isinstance(groups, list):
+            raise InstallError("hooks.%s — не массив, не трогаю" % event)
+        if groups is None or our_group(event, command) not in groups:
+            result[event] = list(groups or []) + [our_group(event, command)]
     return result
+
+
+def hooks_after_ours(hooks_obj):
+    """События, где после нашей записи стоят чужие: удаление сдвинет их индексы."""
+    out = []
+    for event, groups in (hooks_obj or {}).items():
+        if not isinstance(groups, list):
+            continue
+        seen_ours = False
+        for g in groups:
+            if group_is_ours(g):
+                seen_ours = True
+            elif seen_ours:
+                out.append(event)
+                break
+    return out
 
 
 def load_json(path):
     if not os.path.exists(path):
         return None, ""
-    text = open(path, encoding="utf-8").read()
-    return (json.loads(text) if text.strip() else {}), text
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    if not text.strip():
+        return {}, text
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        raise InstallError("%s: не JSON (%s) — ничего не меняю" % (path, e))
+    if not isinstance(data, dict) or not isinstance(data.get("hooks", {}), dict):
+        raise InstallError("%s: неожиданная структура (нужен объект с объектом hooks) — ничего не меняю" % path)
+    return data, text
 
 
 def dump_json(obj):
@@ -422,12 +573,13 @@ def dump_json(obj):
 
 
 def plan_file(path, transform):
-    """Возвращает (старый текст, новый текст) для JSON-файла с хуками."""
+    """(старый текст, новый текст) для JSON-файла с хуками. Нечего менять — тексты равны."""
     data, old_text = load_json(path)
-    data = {} if data is None else data
-    new = transform(dict(data))
-    if new is None:
-        return old_text, old_text
+    new = transform(dict(data or {}))
+    if data is None and not new:
+        return old_text, old_text   # файла нет и создавать нечего (например, uninstall)
+    if data is not None and new == data:
+        return old_text, old_text   # не переформатируем файл без нужды
     return old_text, dump_json(new)
 
 
@@ -444,21 +596,34 @@ def hooks_transform(events, command, install):
     return t
 
 
+def atomic_write(real, text, mode):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix=".capri-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, real)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
 def write_with_backup(path, old_text, new_text, stamp):
     real = os.path.realpath(path)
     backup = None
     if os.path.exists(real):
+        with open(real, encoding="utf-8") as f:
+            if f.read() != old_text:
+                # Файл поменяли (например, сам Claude Code) между чтением и записью.
+                raise InstallError("%s изменился во время установки — запустите ещё раз" % path)
         backup = "%s.capri-bak-%s" % (real, stamp)
         shutil.copy2(real, backup)
         mode = os.stat(real).st_mode & 0o777
     else:
         os.makedirs(os.path.dirname(real), exist_ok=True)
         mode = 0o600
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix=".capri-")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(new_text)
-    os.chmod(tmp, mode)
-    os.replace(tmp, real)
+    atomic_write(real, new_text, mode)
     return backup
 
 
@@ -478,51 +643,79 @@ def find_codex():
 class AppServer:
     """Минимальный клиент `codex app-server` (stdio JSON-RPC): доверие хукам и notify пишет сам Codex."""
 
+    TIMEOUT = 30.0
+
     def __init__(self, codex, codex_home):
         env = dict(os.environ, CODEX_HOME=codex_home)
         self.p = subprocess.Popen([codex, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, text=True, env=env)
+                                  stderr=subprocess.DEVNULL, env=env)
         self.n = 0
-        self.call("initialize", {"clientInfo": {"name": "capri_hook", "title": None, "version": str(VERSION)},
-                                 "capabilities": {"experimentalApi": False, "requestAttestation": False}})
-        self.send({"method": "initialized"})
+        self.buf = b""
+        try:
+            self.call("initialize", {"clientInfo": {"name": "capri_hook", "title": None, "version": str(VERSION)},
+                                     "capabilities": {"experimentalApi": False, "requestAttestation": False}})
+            self.send({"method": "initialized"})
+        except BaseException:
+            self.close()
+            raise
 
     def send(self, msg):
-        self.p.stdin.write(json.dumps(msg) + "\n")
+        self.p.stdin.write((json.dumps(msg) + "\n").encode())
         self.p.stdin.flush()
+
+    def _lines(self, deadline):
+        fd = self.p.stdout.fileno()
+        while True:
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                yield line
+            left = deadline - time.time()
+            if left <= 0:
+                raise InstallError("codex app-server не ответил за %d с" % self.TIMEOUT)
+            ready, _, _ = select.select([fd], [], [], left)
+            if not ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                raise InstallError("codex app-server закрылся")
+            self.buf += chunk
 
     def call(self, method, params):
         self.n += 1
         self.send({"id": self.n, "method": method, "params": params})
-        for line in self.p.stdout:
+        for line in self._lines(time.time() + self.TIMEOUT):
             try:
                 msg = json.loads(line)
             except ValueError:
                 continue
             if msg.get("id") == self.n and "method" not in msg:
                 if "error" in msg:
-                    raise RuntimeError("%s: %s" % (method, msg["error"]))
+                    raise InstallError("%s: %s" % (method, msg["error"]))
                 return msg.get("result")
-        raise RuntimeError("app-server закрылся на %s" % method)
 
     def close(self):
         try:
             self.p.stdin.close()
+        except Exception:
+            pass
+        try:
             self.p.terminate()
             self.p.wait(timeout=5)
         except Exception:
-            pass
+            self.p.kill()
 
 
-def codex_trust_plan(server, home_dir):
-    """Ключи и хэши наших хуков, которым нужно доверие, + какие наши события Codex распознал."""
+def codex_trust_plan(server, home_dir, hooks_file, command):
+    """Ключи и хэши ИМЕННО наших записей в нашем hooks.json, которым нужно доверие,
+    + какие наши события Codex распознал."""
     result = server.call("hooks/list", {"cwds": [home_dir]})
+    real = os.path.realpath(hooks_file)
     todo, seen, notes = {}, set(), []
     for entry in result.get("data", []):
         notes.extend(entry.get("warnings") or [])
         notes.extend(str(e) for e in entry.get("errors") or [])
         for h in entry.get("hooks", []):
-            if not OURS.search(h.get("command") or ""):
+            if h.get("command") != command or os.path.realpath(h.get("sourcePath") or "") != real:
                 continue
             seen.add(h.get("eventName"))
             if h.get("trustStatus") != "trusted":
@@ -534,7 +727,19 @@ def camel(event):
     return event[0].lower() + event[1:]
 
 
+def hook_command(hook, agent):
+    return "%s %s" % (shlex.quote(hook), agent)
+
+
 def run_install(args, install=True):
+    try:
+        return _run_install(args, install)
+    except InstallError as e:
+        print("!! " + str(e))
+        return 1
+
+
+def _run_install(args, install):
     dry = "--dry-run" in args
     do_claude = "--no-claude" not in args
     do_codex = "--no-codex" not in args
@@ -544,24 +749,35 @@ def run_install(args, install=True):
     codex_home = option(args, "--codex-home") or os.environ.get("CODEX_HOME") or os.path.join(home, ".codex")
     hook = option(args, "--hook-path") or hook_path()
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    report = []
-
-    if do_claude:
-        old, new = plan_file(claude_settings, hooks_transform(CLAUDE_EVENTS, hook + " claude", install))
-        report.append(("claude", claude_settings, old, new))
     codex_hooks = os.path.join(codex_home, "hooks.json")
     codex_present = os.path.isdir(codex_home)
+    codex_cmd = hook_command(hook, "codex")
+
+    # Сначала всё планируем: если какой-то файл не разбирается, не пишем ни один.
+    report = []
+    if do_claude:
+        old, new = plan_file(claude_settings, hooks_transform(CLAUDE_EVENTS, hook_command(hook, "claude"), install))
+        report.append(("claude", claude_settings, old, new))
     if do_codex and codex_present:
-        old, new = plan_file(codex_hooks, hooks_transform(CODEX_EVENTS, hook + " codex", install))
+        data, _ = load_json(codex_hooks)
+        shifted = hooks_after_ours((data or {}).get("hooks"))
+        if shifted:
+            print("== codex: после наших записей стоят чужие хуки (%s): %s сдвинет их номера — "
+                  "Codex попросит заново подтвердить их в /hooks" % (", ".join(shifted), "удаление" if not install else "переустановка"))
+        old, new = plan_file(codex_hooks, hooks_transform(CODEX_EVENTS, codex_cmd, install))
         report.append(("codex", codex_hooks, old, new))
+
+    # Скрипт — раньше хуков: записанные хуки не должны указывать на несуществующий файл.
+    if install and not dry:
+        install_self(hook)
 
     for kind, path, old, new in report:
         print("== %s: %s" % (kind, path))
         if old == new:
             print("   без изменений")
-        else:
-            sys.stdout.write(diff_text(path, old, new) or "   (новый файл)\n")
-        if not dry and old != new:
+            continue
+        sys.stdout.write(diff_text(path, old, new) or "   (новый файл)\n")
+        if not dry:
             backup = write_with_backup(path, old, new, stamp)
             print("   записано%s" % ("; бэкап: " + backup if backup else ""))
 
@@ -572,13 +788,13 @@ def run_install(args, install=True):
         elif dry:
             print("== codex: после записи hooks.json доверие нашим хукам выставит сам Codex "
                   "(app-server hooks/list -> config/value/write hooks.state, бэкап config.toml)")
+            if want_notify:
+                print("== codex notify: будет обёрнут (исходная программа вызывается после записи события)")
         else:
-            config = os.path.join(codex_home, "config.toml")
-            if os.path.exists(config):
-                shutil.copy2(config, "%s.capri-bak-%s" % (config, stamp))
+            backup_config(codex_home, stamp)
             server = AppServer(codex, codex_home)
             try:
-                todo, seen, notes = codex_trust_plan(server, home)
+                todo, seen, notes = codex_trust_plan(server, home, codex_hooks, codex_cmd)
                 if todo:
                     server.call("config/value/write", {"keyPath": "hooks.state", "value": todo, "mergeStrategy": "upsert"})
                 print("== codex: доверие выставлено %d хукам" % len(todo))
@@ -592,14 +808,18 @@ def run_install(args, install=True):
             finally:
                 server.close()
     if do_codex and codex_present and not install and not dry:
-        restored = uninstall_notify(codex_home)
+        restored = uninstall_notify(codex_home, stamp)
         if restored:
             print("== codex notify: " + restored)
     if do_codex and not codex_present:
         print("== codex: %s нет, пропускаю" % codex_home)
-    if install and not dry:
-        install_self(hook)
     return 0
+
+
+def backup_config(codex_home, stamp):
+    config = os.path.join(codex_home, "config.toml")
+    if os.path.exists(config):
+        shutil.copy2(config, "%s.capri-bak-%s" % (config, stamp))
 
 
 def notify_original_path():
@@ -611,14 +831,15 @@ def install_notify(server, hook, codex_home):
     current = cfg.get("notify") or []
     if current and any(OURS.search(c) for c in current):
         return "уже обёрнут"
-    with open(notify_original_path(), "w") as f:
-        json.dump({"codex_home": codex_home, "notify": current}, f)
+    ensure_capri_dir(capri_dir())
+    atomic_write(notify_original_path(), json.dumps({"codex_home": codex_home, "notify": current}), 0o600)
     wrapped = [hook, "codex-notify"] + (["--"] + current if current else [])
     server.call("config/value/write", {"keyPath": "notify", "value": wrapped, "mergeStrategy": "replace"})
     return "обёрнут: %s" % wrapped
 
 
-def uninstall_notify(codex_home):
+def uninstall_notify(codex_home, stamp):
+    """Возвращаем исходный notify, только если сейчас там всё ещё наша обёртка."""
     path = notify_original_path()
     if not os.path.exists(path):
         return None
@@ -626,12 +847,14 @@ def uninstall_notify(codex_home):
     codex = find_codex()
     if not codex:
         return "исходный notify сохранён в %s — вернуть вручную" % path
+    backup_config(codex_home, stamp)
     server = AppServer(codex, codex_home)
     try:
-        if original:
-            server.call("config/value/write", {"keyPath": "notify", "value": original, "mergeStrategy": "replace"})
-        else:
-            server.call("config/value/write", {"keyPath": "notify", "value": None, "mergeStrategy": "replace"})
+        current = server.call("config/read", {"includeLayers": False}).get("config", {}).get("notify") or []
+        if not any(OURS.search(c) for c in current):
+            os.remove(path)
+            return "сейчас там не наша обёртка (%s) — не трогаю" % current
+        server.call("config/value/write", {"keyPath": "notify", "value": original or None, "mergeStrategy": "replace"})
     finally:
         server.close()
     os.remove(path)
@@ -640,11 +863,13 @@ def uninstall_notify(codex_home):
 
 def install_self(target):
     src = os.path.realpath(__file__)
+    if not os.path.exists(src):
+        raise InstallError("скрипт запущен не из файла — сначала скопируйте его в %s" % target)
     if os.path.realpath(target) == src:
         return
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    shutil.copy2(src, target)
-    os.chmod(target, 0o755)
+    ensure_capri_dir(os.path.dirname(target))
+    with open(src, encoding="utf-8") as f:
+        atomic_write(target, f.read(), 0o755)
 
 
 def run_status(args):
@@ -680,8 +905,7 @@ def main(argv):
     if mode == "stream":
         global SESSION_PREFIX
         SESSION_PREFIX = option(rest, "--only-sessions")
-        replay = int(option(rest, "--replay") or 300)
-        return run_stream(replay=replay, once="--once" in rest)
+        return run_stream(once="--once" in rest, replay="--no-replay" not in rest)
     if mode == "install":
         return run_install(rest, install=True)
     if mode == "uninstall":

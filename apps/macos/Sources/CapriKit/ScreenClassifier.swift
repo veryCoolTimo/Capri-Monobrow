@@ -43,7 +43,9 @@ public enum ScreenClassifier {
         let bottom = plain.suffix(4).joined(separator: "\n").lowercased()
 
         if let dialog = detectDialog(plain, bottom: bottom) { return .dialog(dialog) }
-        if bottom.contains("esc to interrupt") { return .running }
+        // У Codex строка «Working (… esc to interrupt)» стоит над строкой ввода, и очередь сообщений
+        // или многострочный черновик сдвигают её выше — смотрим шире, чем 4 строки.
+        if plain.suffix(8).joined(separator: "\n").lowercased().contains("esc to interrupt") { return .running }
         if let typed = promptInput(rows, agent: agent) { return .idle(typed: typed.isEmpty ? nil : typed) }
         return .unknown
     }
@@ -132,6 +134,10 @@ public enum ScreenClassifier {
                 } else if i + 4 < codes.count, codes[i + 1] == 2 {
                     i += 4
                 }
+            case 48, 58:
+                // Фон и цвет подчёркивания: их параметры не должны читаться как dim/серый.
+                if i + 2 < codes.count, codes[i + 1] == 5 { i += 2 }
+                else if i + 4 < codes.count, codes[i + 1] == 2 { i += 4 }
             default: break
             }
             i += 1

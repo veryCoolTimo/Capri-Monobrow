@@ -3,14 +3,14 @@
 // SessionReducer и печатает переходы статусов с задержкой «событие на хосте → состояние в Capri».
 //
 //   CapriCollect --ssh timoserver [--ssh-cmd 'python3 ~/x/capri-hook stream'] --local [--local-cmd '...']
-//   --state PATH   куда писать снимок состояния (JSON), по умолчанию /tmp/capri-state.json
+//   --state PATH   куда писать снимок состояния (JSON, права 0600), по умолчанию $TMPDIR/capri-state.json
 //   --seconds N    выйти через N секунд
 // Выход: Ctrl-C.
 import AppKit
 import CapriKit
 
 var sources: [HostSource] = []
-var statePath = "/tmp/capri-state.json"
+var statePath = (NSTemporaryDirectory() as NSString).appendingPathComponent("capri-state.json")
 var seconds: Double?
 var args = Array(CommandLine.arguments.dropFirst())
 while !args.isEmpty {
@@ -53,7 +53,10 @@ func dump() {
     struct Out: Encodable { var hosts: [String: HostState]; var sessions: [Session]; var waiting: [SessionKey] }
     let out = Out(hosts: state.hosts, sessions: state.sessions.values.sorted { $0.key.description < $1.key.description },
                   waiting: state.waiting.map(\.key))
-    if let d = try? enc.encode(out) { try? d.write(to: URL(fileURLWithPath: statePath)) }
+    // В состоянии команды и набранный текст — файл только для владельца.
+    if let d = try? enc.encode(out) {
+        FileManager.default.createFile(atPath: statePath, contents: d, attributes: [.posixPermissions: 0o600])
+    }
 }
 
 func feed(_ input: CapriInput) {
@@ -74,22 +77,15 @@ func feed(_ input: CapriInput) {
     dump()
 }
 
-let collectors = sources.map(HostCollector.init(source:))
-for c in collectors {
-    c.onInput = feed
-    c.onLog = { print("\(stamp()) \($0)") }
-    c.start()
-}
+let supervisor = CollectorSupervisor(sources: sources, onInput: feed)
+supervisor.onLog = { print("\(stamp()) \($0)") }
+supervisor.start()
 Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in feed(.tick(Date().timeIntervalSince1970)) }
-NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
-    print("\(stamp()) пробуждение — переподключаюсь")
-    collectors.forEach { $0.reconnectNow() }
-}
 if let seconds {
-    DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { collectors.forEach { $0.stop() }; exit(0) }
+    DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { supervisor.stop(); exit(0) }
 }
 signal(SIGINT, SIG_IGN)
 let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-sigint.setEventHandler { collectors.forEach { $0.stop() }; exit(0) }
+sigint.setEventHandler { supervisor.stop(); exit(0) }
 sigint.resume()
 RunLoop.main.run()

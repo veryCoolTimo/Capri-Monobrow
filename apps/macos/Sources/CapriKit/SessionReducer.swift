@@ -92,6 +92,10 @@ public enum SessionReducer {
     public static let screenLag: Double = 1.0
     static let titlePromptPrefix = "Generate a concise, single-line task title"
     static let seenLimit = 5000
+    /// Закрытые сессии убираем из состояния через час.
+    public static let endedTTL: Double = 3600
+    /// Сессия без tmux (её не закроет пропажа панели) без событий 6 часов считается закрытой.
+    public static let untrackedTTL: Double = 6 * 3600
 
     @discardableResult
     public static func reduce(_ state: inout CapriState, _ input: CapriInput) -> [CapriEffect] {
@@ -165,13 +169,24 @@ public enum SessionReducer {
             break
         }
         s.confidence = .hook
-        state.pendingIdle[key] = nil
+        // Ожидание подтверждения по экрану отменяет только событие, сменившее статус: например,
+        // Notification после уже записанного запроса не должна залипить needs_input после отказа.
+        if s.status != before { state.pendingIdle[key] = nil }
         state.sessions[key] = s
-        // Хуки пришли из панели, где раньше видели сессию только по экрану, — она та же.
         if let pane = s.tmux?.pane {
+            // Хуки пришли из панели, где раньше видели сессию только по экрану, — она та же.
             let inferred = SessionKey(host: host, agent: e.agent, id: "pane:\(pane)")
             state.sessions[inferred] = nil
             state.pendingIdle[inferred] = nil
+            // В панели новая сессия — прежняя (убитая без SessionEnd) закончилась.
+            for (other, o) in state.sessions where other != key && other.host == host && o.tmux?.pane == pane
+                && o.status != .ended && o.lastEventAt < e.ts && !other.id.hasPrefix("pane:") {
+                var ended = o
+                set(&ended, .ended, e.ts)
+                ended.request = nil
+                state.sessions[other] = ended
+                state.pendingIdle[other] = nil
+            }
         }
         return transitionEffects(key: key, before: before, after: s.status, replay: replay)
     }
@@ -216,8 +231,10 @@ public enum SessionReducer {
             switch screen {
             case .idle(let typed):
                 s.typedInput = typed
-                if (s.status == .running || s.status == .needsInput) && ts >= s.statusSince + screenLag {
-                    if state.pendingIdle[key] == nil { state.pendingIdle[key] = ts }
+                if (s.status == .running || s.status == .needsInput) && ts >= s.statusSince + screenLag
+                    && ts >= s.lastEventAt {
+                    // Ожидание, начатое до последнего события, устарело — считаем заново от этого снимка.
+                    if let since = state.pendingIdle[key], since >= s.lastEventAt {} else { state.pendingIdle[key] = ts }
                 }
             case .dialog(let d):
                 state.pendingIdle[key] = nil
@@ -262,6 +279,16 @@ public enum SessionReducer {
     }
 
     static func applyTick(_ state: inout CapriState, now: Double) -> [CapriEffect] {
+        for (key, s) in state.sessions {
+            if s.status == .ended, now - s.statusSince > endedTTL {
+                state.sessions[key] = nil
+            } else if s.tmux == nil, s.status != .ended, now - s.lastEventAt > untrackedTTL {
+                var e = s
+                set(&e, .ended, now)
+                e.request = nil
+                state.sessions[key] = e
+            }
+        }
         for (key, since) in state.pendingIdle where now - since >= screenIdleGrace {
             state.pendingIdle[key] = nil
             guard var s = state.sessions[key], s.status == .running || s.status == .needsInput,

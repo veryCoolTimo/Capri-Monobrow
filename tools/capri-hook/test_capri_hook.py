@@ -56,7 +56,10 @@ class Base(unittest.TestCase):
 
     def events(self):
         path = os.path.join(self.env["CAPRI_HOME"], "events.jsonl")
-        return [json.loads(l) for l in open(path)] if os.path.exists(path) else []
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [json.loads(l) for l in f]
 
 
 class HookModeTests(Base):
@@ -73,18 +76,67 @@ class HookModeTests(Base):
         self.assertEqual(ev["data"]["tool_input"]["command"], "date > stamp.txt && echo done")
         self.assertIsNone(ev["tmux"])
 
-    def test_large_fields_are_dropped_or_trimmed(self):
-        payload = {"hook_event_name": "PostToolUse", "session_id": "s", "tool_response": {"stdout": "x" * 10_000},
-                   "tool_input": {"command": "y" * 5000}}
-        self.run_hook(["claude"], json.dumps(payload))
-        [ev] = self.events()
-        self.assertNotIn("tool_response", ev["data"])
-        self.assertLessEqual(len(ev["data"]["tool_input"]["command"]), ch.MAX_STRING + 1)
+    def test_only_whitelisted_fields_are_kept(self):
+        post = {"hook_event_name": "PostToolUse", "session_id": "s", "tool_name": "Write",
+                "tool_response": {"stdout": "x" * 10_000}, "tool_input": {"content": "SECRET"}}
+        prompt = {"hook_event_name": "UserPromptSubmit", "session_id": "s", "prompt": "мой токен sk-123"}
+        perm = {"hook_event_name": "PermissionRequest", "session_id": "s", "tool_name": "Bash",
+                "tool_input": {"command": "y" * 5000, "env": "SECRET"}}
+        for p in (post, prompt, perm):
+            self.run_hook(["claude"], json.dumps(p))
+        post_ev, prompt_ev, perm_ev = self.events()
+        self.assertEqual(post_ev["data"], {"hook_event_name": "PostToolUse", "session_id": "s", "tool_name": "Write"})
+        self.assertNotIn("prompt", prompt_ev["data"])
+        self.assertEqual(set(perm_ev["data"]["tool_input"]), {"command"})
+        self.assertLessEqual(len(perm_ev["data"]["tool_input"]["command"]), 2001)
+        self.assertNotIn("SECRET", open(os.path.join(self.env["CAPRI_HOME"], "events.jsonl")).read())
+        self.assertEqual(len(post_ev["id"]), 32)
+        self.assertEqual(os.stat(self.env["CAPRI_HOME"]).st_mode & 0o777, 0o700)
+
+    def test_log_lines_are_ascii(self):
+        self.run_hook(["claude"], json.dumps({"hook_event_name": "Stop", "session_id": "s",
+                                              "last_assistant_message": "привет \ud800"}))
+        raw = open(os.path.join(self.env["CAPRI_HOME"], "events.jsonl"), "rb").read()
+        raw.decode("ascii")
+        self.assertTrue(self.events()[0]["data"]["last_assistant_message"].startswith("привет"))
 
     def test_garbage_stdin_never_fails(self):
         out = self.run_hook(["codex"], "{not json")
         self.assertEqual(out.returncode, 0)
         self.assertEqual(out.stdout, "")
+
+    def test_concurrent_writers_lose_nothing_across_rotation(self):
+        import threading
+        path = os.path.join(self.tmp, "events.jsonl")
+        archive = []
+        real_replace = os.replace
+
+        def recording_replace(src, dst):
+            if src == path:
+                with open(src) as f:
+                    archive.append(f.read())
+            real_replace(src, dst)
+
+        old_limit, ch.MAX_LOG_BYTES = ch.MAX_LOG_BYTES, 4096
+        ch.os.replace = recording_replace
+        results = []
+        try:
+            def writer(n):
+                for i in range(60):
+                    results.append(ch.append_event({"w": n, "i": i, "pad": "x" * 40}, path))
+            # Потоки делят процесс, но flock берётся на разных fd — как у разных процессов.
+            ts = [threading.Thread(target=writer, args=(n,)) for n in range(6)]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+        finally:
+            ch.MAX_LOG_BYTES = old_limit
+            ch.os.replace = real_replace
+        self.assertTrue(all(results))
+        text = "".join(archive) + open(path).read()
+        records = [json.loads(l) for l in text.splitlines() if l.strip()]
+        self.assertEqual(len(records), 360)
+        self.assertEqual({(r["w"], r["i"]) for r in records}, {(n, i) for n in range(6) for i in range(60)})
+        self.assertGreater(len(archive), 3)
 
     def test_rotation_keeps_previous_log(self):
         path = os.path.join(self.env["CAPRI_HOME"], "events.jsonl")
@@ -136,6 +188,25 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(once, twice)
         self.assertEqual(ch.strip_ours(twice), USER_SETTINGS["hooks"])
 
+    def test_reinstall_keeps_our_entry_in_place(self):
+        once = ch.merged_hooks(USER_SETTINGS["hooks"], ch.CLAUDE_EVENTS, self.CMD)
+        once["SessionStart"].append({"hooks": [{"type": "command", "command": "~/later.sh"}]})
+        again = ch.merged_hooks(once, ch.CLAUDE_EVENTS, self.CMD)
+        self.assertEqual(again["SessionStart"], once["SessionStart"])
+        self.assertEqual(ch.hooks_after_ours(again), ["SessionStart"])
+
+    def test_changed_command_replaces_old_entry(self):
+        once = ch.merged_hooks(USER_SETTINGS["hooks"], ch.CLAUDE_EVENTS, "/old/capri-hook claude")
+        again = ch.merged_hooks(once, ch.CLAUDE_EVENTS, self.CMD)
+        self.assertEqual(sum(ch.group_is_ours(g) for g in again["Stop"]), 1)
+        self.assertEqual(again["Stop"][-1]["hooks"][0]["command"], self.CMD)
+
+    def test_quoted_path_with_space_is_ours(self):
+        cmd = ch.hook_command("/Users/u/My Dir/.capri/bin/capri-hook", "claude")
+        self.assertEqual(cmd, "'/Users/u/My Dir/.capri/bin/capri-hook' claude")
+        self.assertTrue(ch.is_ours({"command": cmd}))
+        self.assertFalse(ch.is_ours({"command": "~/bin/capri-hooks-backup.sh"}))
+
     def test_uninstall_keeps_user_hook_sharing_a_group(self):
         mixed = {"Stop": [{"hooks": [{"type": "command", "command": "~/mine.sh"},
                                      {"type": "command", "command": self.CMD}]}]}
@@ -173,6 +244,24 @@ class InstallerTests(Base):
         self.assertIn("без изменений", self.install().stdout)
         self.run_hook(["uninstall", "--no-codex", "--claude-settings", self.settings])
         self.assertEqual(json.load(open(self.settings)), USER_SETTINGS)
+
+    def test_invalid_json_is_refused_without_writing(self):
+        open(self.settings, "w").write('{"hooks": {} // comment\n}')
+        out = self.install()
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("не JSON", out.stdout)
+        self.assertNotIn("Traceback", out.stderr)
+        self.assertEqual(open(self.settings).read(), '{"hooks": {} // comment\n}')
+
+    def test_concurrent_change_aborts_write(self):
+        with self.assertRaises(ch.InstallError):
+            ch.write_with_backup(self.settings, "{}", "{\"x\": 1}", "t")
+        self.assertEqual(open(self.settings).read(), self.original)
+
+    def test_uninstall_without_file_creates_nothing(self):
+        os.remove(self.settings)
+        self.run_hook(["uninstall", "--no-codex", "--claude-settings", self.settings])
+        self.assertFalse(os.path.exists(self.settings))
 
     def test_missing_settings_file_is_created(self):
         os.remove(self.settings)
@@ -243,7 +332,7 @@ class FollowerTests(Base):
         path = os.path.join(self.tmp, "events.jsonl")
         open(path, "w").write('{"a":1}\n{"a":2}\n')
         f = ch.Follower(path)
-        self.assertEqual(f.open_at_end_after_replay(1), [b'{"a":2}'])
+        self.assertEqual(f.open_at_end(), [b'{"a":1}', b'{"a":2}'])
         open(path, "a").write('{"a":3}\n')
         self.assertEqual(f.poll(), [b'{"a":3}'])
         os.replace(path, path + ".1")
@@ -254,11 +343,35 @@ class FollowerTests(Base):
         open(path, "a").write('}\n')
         self.assertEqual(f.poll(), [b'{"a":5}'])
 
+    def test_tail_written_just_before_rotation_is_not_lost(self):
+        path = os.path.join(self.tmp, "events.jsonl")
+        open(path, "w").write('{"a":1}\n')
+        f = ch.Follower(path)
+        f.open_at_end()
+        open(path, "a").write('{"a":2}\n')
+        os.replace(path, path + ".1")
+        open(path, "w").write('{"a":3}\n')
+        self.assertEqual(f.poll(), [b'{"a":2}', b'{"a":3}'])
+
+    def test_snapshot_keeps_last_events_per_session_including_rotated(self):
+        path = os.path.join(self.tmp, "events.jsonl")
+        with open(path + ".1", "w") as f:
+            f.write(json.dumps({"session_id": "old", "event": "PermissionRequest"}) + "\n")
+        current = [json.dumps({"session_id": "busy", "i": i}).encode() for i in range(100)]
+        snap = [json.loads(l) for l in ch.snapshot_lines(current, path, per_session=30)]
+        self.assertEqual(snap[0]["session_id"], "old")
+        self.assertEqual(len(snap), 31)
+        self.assertEqual(snap[-1]["i"], 99)
+
     def test_stream_once_emits_snapshot(self):
         self.run_hook(["claude"], json.dumps({"hook_event_name": "Stop", "session_id": "s"}))
-        out = self.run_hook(["stream", "--once", "--replay", "10"])
-        kinds = [json.loads(l)["kind"] for l in out.stdout.splitlines()]
-        self.assertEqual(kinds, ["hello", "event", "panes", "snapshot-end"])
+        out = self.run_hook(["stream", "--once"])
+        msgs = [json.loads(l) for l in out.stdout.splitlines()]
+        self.assertEqual([m["kind"] for m in msgs], ["hello", "event", "panes", "snapshot-end"])
+        self.assertEqual(msgs[0]["proto"], ch.PROTO)
+        self.assertIn("now", msgs[0])
+        out = self.run_hook(["stream", "--once", "--no-replay"])
+        self.assertEqual([json.loads(l)["kind"] for l in out.stdout.splitlines()], ["hello", "panes", "snapshot-end"])
 
 
 if __name__ == "__main__":

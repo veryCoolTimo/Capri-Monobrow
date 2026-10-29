@@ -37,7 +37,10 @@ final class EventDecodingTests: XCTestCase {
     }
 
     func testStreamMessages() {
-        XCTAssertEqual(StreamMessage.decode(line: #"{"kind":"snapshot-end","ts":1}"#), .snapshotEnd)
+        XCTAssertEqual(StreamMessage.decode(line: #"{"kind":"snapshot-end","ts":1,"now":7}"#), .snapshotEnd(now: 7))
+        XCTAssertEqual(StreamMessage.decode(line: #"{"kind":"hello","proto":1,"version":2,"host":"h","now":5}"#),
+                       .hello(host: "h", proto: 1, now: 5))
+        XCTAssertEqual(StreamMessage.decode(line: #"{"kind":"hello","host":"h"}"#), .hello(host: "h", proto: 0, now: nil))
         XCTAssertEqual(StreamMessage.decode(line: #"{"kind":"panes","ts":1,"panes":null}"#), .panes(nil))
         let screen = StreamMessage.decode(line: #"{"kind":"screen","ts":5,"pane":"%3","session":"s","command":"bash","agent":"claude","lines":["a"]}"#)
         XCTAssertEqual(screen, .screen(pane: "%3", agent: .claude, lines: ["a"], ts: 5))
@@ -91,6 +94,20 @@ final class ScreenClassifierTests: XCTestCase {
         XCTAssertEqual(classify("claude-interrupted", .claude), .idle(typed: nil))
         XCTAssertEqual(classify("codex-denied", .codex), .idle(typed: nil))
         XCTAssertEqual(classify("codex-interrupted", .codex), .idle(typed: nil))
+    }
+
+    func testCodexWorkingLinePushedUpByQueuedMessagesIsStillRunning() {
+        var lines = Fixtures.screen("codex-running")
+        let composer = lines.lastIndex { $0.contains("›") }!
+        lines.insert(contentsOf: ["  ↳ queued: second message", "  ↳ queued: third message", "", "› draft line 1", "  draft line 2"], at: composer)
+        XCTAssertEqual(ScreenClassifier.classify(lines: lines, agent: .codex), .running)
+    }
+
+    func testBackgroundColourIsNotDim() {
+        let l = ScreenClassifier.parseANSI("\u{1B}[48;5;2mtyped\u{1B}[0m")
+        XCTAssertEqual(l.dim, [false, false, false, false, false])
+        let g = ScreenClassifier.parseANSI("\u{1B}[48;5;90mx")
+        XCTAssertEqual(g.dim, [false])
     }
 
     func testDimAndGreyParsing() {
@@ -194,6 +211,56 @@ final class SessionReducerTests: XCTestCase {
                                               lines: Fixtures.screen("claude-idle-suggestion"), ts: s.statusSince + 0.3))
         SessionReducer.reduce(&state, .tick(s.statusSince + 10))
         XCTAssertEqual(session(state, .claude).status, .running)
+    }
+
+    func testLateNotificationDoesNotPinNeedsInputAfterDenial() {
+        var state = CapriState()
+        let claude = live.filter { $0.agent == .claude }
+        _ = run(Array(claude.prefix(3)), into: &state)          // PermissionRequest
+        let s = session(state, .claude)
+        let pane = s.tmux!.pane
+        let screen = Fixtures.screen("claude-denied")
+        SessionReducer.reduce(&state, .screen(host: "server", pane: pane, agent: .claude, lines: screen, ts: s.statusSince + 2))
+        var late = claude[3]                                     // Notification permission_prompt, на 6 с позже
+        late.ts = s.statusSince + 6
+        _ = run([late], into: &state)
+        SessionReducer.reduce(&state, .tick(s.statusSince + 7))
+        XCTAssertEqual(session(state, .claude).status, .needsInput)
+        // Неизменный экран переслан повторно — ожидание начинается заново и подтверждается.
+        SessionReducer.reduce(&state, .screen(host: "server", pane: pane, agent: .claude, lines: screen, ts: s.statusSince + 12))
+        SessionReducer.reduce(&state, .tick(s.statusSince + 12 + SessionReducer.screenIdleGrace))
+        XCTAssertEqual(session(state, .claude).status, .idle)
+    }
+
+    func testNewSessionInSamePaneEndsPreviousOne() {
+        var state = CapriState()
+        let claude = live.filter { $0.agent == .claude }
+        _ = run(Array(claude.prefix(3)), into: &state)
+        var next = claude[0]
+        next.sessionId = "new-session"
+        next.id = "new-id"
+        next.ts = claude[2].ts + 100
+        _ = run([next], into: &state)
+        let old = state.sessions.values.first { $0.key.id == claude[0].sessionId }!
+        XCTAssertEqual(old.status, .ended)
+        XCTAssertTrue(state.waiting.isEmpty)
+    }
+
+    func testSameMillisecondEventsWithDifferentIdsBothApply() {
+        var state = CapriState()
+        var a = live[1]; a.id = "a"
+        var b = live[2]; b.id = "b"; b.ts = a.ts
+        _ = run([a, b], into: &state)
+        XCTAssertEqual(session(state, .claude).status, .needsInput)
+    }
+
+    func testEndedSessionsExpire() {
+        var state = CapriState()
+        _ = run(Array(live.filter { $0.agent == .claude }.prefix(3)), into: &state)
+        let s = session(state, .claude)
+        SessionReducer.reduce(&state, .panes(host: "server", [], ts: s.lastEventAt + 1))
+        SessionReducer.reduce(&state, .tick(s.lastEventAt + SessionReducer.endedTTL + 10))
+        XCTAssertTrue(state.sessions.isEmpty)
     }
 
     func testCodexInterruptIsIdle() {

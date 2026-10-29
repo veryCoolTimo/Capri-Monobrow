@@ -44,15 +44,19 @@ public struct TmuxRef: Codable, Equatable {
     public var pane: String
     public var session: String?
     public var window: String?
+    /// pid процесса панели: tmux переиспользует `%N` после перезапуска сервера.
+    public var pid: String?
 
-    public init(pane: String, session: String? = nil, window: String? = nil) {
-        self.pane = pane; self.session = session; self.window = window
+    public init(pane: String, session: String? = nil, window: String? = nil, pid: String? = nil) {
+        self.pane = pane; self.session = session; self.window = window; self.pid = pid
     }
 }
 
 /// Одна строка `~/.capri/events.jsonl`, как её пишет capri-hook.
 public struct CapriEvent: Codable, Equatable {
     public var v: Int
+    /// Уникальный id строки (capri-hook ≥2); у старых записей нет.
+    public var id: String?
     public var ts: Double
     public var host: String
     public var agent: Agent
@@ -64,7 +68,7 @@ public struct CapriEvent: Codable, Equatable {
     public var data: JSONValue
 
     enum CodingKeys: String, CodingKey {
-        case v, ts, host, agent, source, event, cwd, tmux, data
+        case v, id, ts, host, agent, source, event, cwd, tmux, data
         case sessionId = "session_id"
     }
 
@@ -74,7 +78,7 @@ public struct CapriEvent: Codable, Equatable {
     }
 
     /// Отпечаток для дедупликации при повторной отдаче журнала после переподключения.
-    public var fingerprint: String { "\(sessionId ?? "-")|\(event)|\(ts)" }
+    public var fingerprint: String { id ?? "\(sessionId ?? "-")|\(event)|\(ts)" }
 }
 
 public struct PaneInfo: Codable, Equatable {
@@ -95,14 +99,17 @@ public struct PaneInfo: Codable, Equatable {
     }
 }
 
-/// Сообщение `capri-hook stream`.
+/// Сообщение `capri-hook stream`. `now` — часы хоста: по ним считаем сдвиг относительно Мака.
 public enum StreamMessage: Equatable {
-    case hello(host: String)
+    /// Версия протокола, которую понимает этот Capri.
+    public static let proto = 1
+
+    case hello(host: String, proto: Int, now: Double?)
     case event(CapriEvent, replay: Bool)
     case panes([PaneInfo]?)
     case screen(pane: String, agent: Agent?, lines: [String], ts: Double)
-    case snapshotEnd
-    case heartbeat
+    case snapshotEnd(now: Double?)
+    case heartbeat(now: Double?)
 
     private struct Raw: Decodable {
         var kind: String
@@ -114,19 +121,21 @@ public enum StreamMessage: Equatable {
         var agent: Agent?
         var lines: [String]?
         var ts: Double?
+        var proto: Int?
+        var now: Double?
     }
 
     public static func decode(line: String) -> StreamMessage? {
         guard let d = line.data(using: .utf8), let raw = try? JSONDecoder().decode(Raw.self, from: d) else { return nil }
         switch raw.kind {
-        case "hello": return .hello(host: raw.host ?? "")
+        case "hello": return .hello(host: raw.host ?? "", proto: raw.proto ?? 0, now: raw.now)
         case "event": return raw.event.map { .event($0, replay: raw.replay ?? false) }
         case "panes": return .panes(raw.panes)
         case "screen":
             guard let pane = raw.pane, let lines = raw.lines else { return nil }
             return .screen(pane: pane, agent: raw.agent, lines: lines, ts: raw.ts ?? 0)
-        case "snapshot-end": return .snapshotEnd
-        case "heartbeat": return .heartbeat
+        case "snapshot-end": return .snapshotEnd(now: raw.now)
+        case "heartbeat": return .heartbeat(now: raw.now)
         default: return nil
         }
     }

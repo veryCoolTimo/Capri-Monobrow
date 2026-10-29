@@ -10,6 +10,9 @@ HOOK="$ROOT/tools/capri-hook/capri-hook"
 TARGET=${1:?хост: mac | timoserver | quiz}
 MODE=${2:---dry-run}
 shift $(( $# >= 2 ? 2 : 1 ))
+# Доп. опции capri-hook — каждая в кавычках для удалённой оболочки.
+EXTRA=""
+for a in "$@"; do EXTRA+=" $(printf '%q' "$a")"; done
 
 # Как попасть на хост отсюда (timoserver): quiz доступен только через Мак.
 case "$TARGET" in
@@ -20,11 +23,11 @@ case "$TARGET" in
 esac
 
 case "$MODE" in
-  --dry-run)   run "python3 - install --dry-run $*" < "$HOOK" ;;
+  --dry-run)   run "python3 - install --dry-run$EXTRA" < "$HOOK" ;;
   --apply)
     run 'mkdir -p ~/.capri/bin && cat > ~/.capri/bin/capri-hook.new && chmod 755 ~/.capri/bin/capri-hook.new && mv ~/.capri/bin/capri-hook.new ~/.capri/bin/capri-hook' < "$HOOK"
-    run "python3 ~/.capri/bin/capri-hook install $*" ;;
-  --uninstall) run "python3 ~/.capri/bin/capri-hook uninstall $*" ;;
+    run "python3 ~/.capri/bin/capri-hook install$EXTRA" ;;
+  --uninstall) run "python3 ~/.capri/bin/capri-hook uninstall$EXTRA" ;;
   --status)    run "python3 ~/.capri/bin/capri-hook status" ;;
   *) echo "режим: --dry-run | --apply | --uninstall | --status" >&2; exit 2 ;;
 esac

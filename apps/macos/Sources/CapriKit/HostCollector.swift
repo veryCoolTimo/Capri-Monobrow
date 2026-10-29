@@ -41,21 +41,29 @@ public struct HostSource: Equatable {
     public static func ssh(_ host: String, name: String? = nil, remoteCommand: String = defaultRemoteCommand) -> HostSource {
         HostSource(name: name ?? host, command: [
             "/usr/bin/ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", host, remoteCommand,
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "--", host, remoteCommand,
         ])
     }
 }
 
 /// Держит одно соединение `capri-hook stream` и превращает его вывод во входы reducer'а.
-/// Переподключается с backoff; молчание дольше `staleAfter` (нет heartbeat) — тоже обрыв.
-/// Колбэки вызываются на главной очереди.
+///
+/// - Переподключается с backoff; молчание дольше `staleAfter` (нет heartbeat) — тоже обрыв.
+/// - Время хоста переводит в часы Мака по сдвигу из hello/heartbeat, чтобы reducer сравнивал
+///   события, экраны и tick в одной шкале.
+/// - События из снимка после **пере**подключения, случившиеся пока связи не было, отдаёт как живые —
+///   иначе запрос разрешения, пришедший во время сна Мака, остался бы без уведомления.
+/// Работает на главной очереди: создавать и вызывать с главного потока.
 public final class HostCollector {
     public let source: HostSource
     public var onInput: ((CapriInput) -> Void)?
     public var onLog: ((String) -> Void)?
 
     public private(set) var connected = false
+    /// Сдвиг «часы Мака − часы хоста», секунды.
+    public private(set) var clockOffset: Double = 0
     private var process: Process?
+    private var generation = 0
     private var buffer = Data()
     private var backoff = Backoff()
     private var startedAt = Date()
@@ -64,6 +72,9 @@ public final class HostCollector {
     private var watchdog: Timer?
     private var stopped = true
     private var lastStderr = ""
+    /// Когда связь пропала (часы Мака); nil — ещё ни разу не были подключены.
+    private var disconnectedAt: Double?
+    private var everConnected = false
     private let staleAfter: TimeInterval = 45
 
     public init(source: HostSource) { self.source = source }
@@ -90,11 +101,14 @@ public final class HostCollector {
         retryWork?.cancel()
         backoff.reset()
         terminate()
+        setConnected(false)
         launch()
     }
 
     private func launch() {
         guard !stopped, process == nil else { return }
+        generation += 1
+        let gen = generation
         let p = Process()
         p.executableURL = URL(fileURLWithPath: source.command[0])
         p.arguments = Array(source.command.dropFirst())
@@ -104,17 +118,24 @@ public final class HostCollector {
         p.standardInput = FileHandle.nullDevice
         out.fileHandleForReading.readabilityHandler = { [weak self] h in
             let d = h.availableData
-            DispatchQueue.main.async { self?.receive(d) }
+            // Пустые данные — EOF: снимаем обработчик, иначе он крутится вхолостую.
+            if d.isEmpty { h.readabilityHandler = nil; return }
+            DispatchQueue.main.async { self?.receive(d, generation: gen) }
         }
         err.fileHandleForReading.readabilityHandler = { [weak self] h in
             let d = h.availableData
-            guard !d.isEmpty, let s = String(data: d, encoding: .utf8) else { return }
-            DispatchQueue.main.async { self?.lastStderr = s.trimmingCharacters(in: .whitespacesAndNewlines) }
+            if d.isEmpty { h.readabilityHandler = nil; return }
+            guard let s = String(data: d, encoding: .utf8) else { return }
+            DispatchQueue.main.async {
+                guard let self, self.generation == gen else { return }
+                self.lastStderr = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
         }
         p.terminationHandler = { [weak self] proc in
-            DispatchQueue.main.async { self?.exited(proc) }
+            DispatchQueue.main.async { self?.exited(proc, generation: gen) }
         }
         buffer = Data()
+        lastStderr = ""
         startedAt = Date()
         lastData = Date()
         do {
@@ -123,22 +144,31 @@ public final class HostCollector {
             log("запуск: \(source.command.joined(separator: " "))")
         } catch {
             log("не запустился: \(error)")
+            detach(p)
             scheduleRetry()
         }
+    }
+
+    private func detach(_ p: Process) {
+        for pipe in [p.standardOutput, p.standardError].compactMap({ $0 as? Pipe }) {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            try? pipe.fileHandleForReading.close()
+        }
+        p.terminationHandler = nil
     }
 
     private func terminate() {
         guard let p = process else { return }
         process = nil
-        (p.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
-        (p.standardError as? Pipe)?.fileHandleForReading.readabilityHandler = nil
-        p.terminationHandler = nil
+        generation += 1          // данные старого процесса, ещё стоящие в очереди, отбросятся
+        detach(p)
         if p.isRunning { p.terminate() }
     }
 
-    private func exited(_ p: Process) {
-        guard p === process else { return }
+    private func exited(_ p: Process, generation gen: Int) {
+        guard gen == generation, p === process else { return }
         process = nil
+        detach(p)
         log("поток закрылся (код \(p.terminationStatus))\(lastStderr.isEmpty ? "" : ": " + lastStderr)")
         setConnected(false)
         scheduleRetry()
@@ -161,8 +191,8 @@ public final class HostCollector {
         scheduleRetry()
     }
 
-    private func receive(_ data: Data) {
-        guard !data.isEmpty else { return }
+    private func receive(_ data: Data, generation gen: Int) {
+        guard gen == generation, !data.isEmpty else { return }
         lastData = Date()
         buffer.append(data)
         while let nl = buffer.firstIndex(of: 0x0A) {
@@ -170,30 +200,50 @@ public final class HostCollector {
             buffer.removeSubrange(buffer.startIndex...nl)
             guard let line = String(data: lineData, encoding: .utf8), let msg = StreamMessage.decode(line: line) else { continue }
             handle(msg)
+            if gen != generation { return }   // handle мог оборвать соединение
         }
+    }
+
+    private func syncClock(_ hostNow: Double?) {
+        guard let hostNow else { return }
+        clockOffset = Date().timeIntervalSince1970 - hostNow
     }
 
     private func handle(_ msg: StreamMessage) {
         let now = Date().timeIntervalSince1970
         switch msg {
-        case .hello:
-            break
-        case .snapshotEnd:
+        case let .hello(_, proto, hostNow):
+            guard proto == StreamMessage.proto else {
+                log("capri-hook на хосте говорит на протоколе \(proto), Capri ждёт \(StreamMessage.proto) — обновите хук (scripts/install-hooks.sh)")
+                terminate()
+                setConnected(false)
+                scheduleRetry()
+                return
+            }
+            syncClock(hostNow)
+            if abs(clockOffset) > 2 { log(String(format: "часы хоста расходятся с Маком на %.1f с — учитываю", clockOffset)) }
+        case let .snapshotEnd(hostNow):
+            syncClock(hostNow)
             setConnected(true)
-        case .heartbeat:
-            break
+        case let .heartbeat(hostNow):
+            syncClock(hostNow)
         case let .event(e, replay):
-            onInput?(.event(host: source.name, e, replay: replay))
+            var e = e
+            e.ts += clockOffset
+            // Повтор снимка подавляет уведомления, кроме событий, случившихся пока связи не было.
+            let missedWhileAway = replay && everConnected && e.ts > (disconnectedAt ?? .infinity)
+            onInput?(.event(host: source.name, e, replay: replay && !missedWhileAway))
         case let .panes(panes):
             onInput?(.panes(host: source.name, panes, ts: now))
         case let .screen(pane, agent, lines, ts):
-            onInput?(.screen(host: source.name, pane: pane, agent: agent, lines: lines, ts: ts))
+            onInput?(.screen(host: source.name, pane: pane, agent: agent, lines: lines, ts: ts + clockOffset))
         }
     }
 
     private func setConnected(_ value: Bool) {
         guard connected != value else { return }
         connected = value
+        if value { everConnected = true } else { disconnectedAt = Date().timeIntervalSince1970 }
         onInput?(.connection(host: source.name, connected: value, ts: Date().timeIntervalSince1970))
         log(value ? "подключено" : "отключено")
     }
