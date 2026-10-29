@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var store: SessionStore!
     private var notch: NotchController!
     private var codex: CodexService!
+    private var attention: AttentionCenter!
     private var window: NSWindow?
     private let windowUI = WindowUI()
     private let settings = Settings()
@@ -33,7 +34,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if on { self.codex.start() } else { self.codex.stop() }
         }
         notch.makeMenu = { [weak self] in self?.makeMenu() ?? NSMenu() }
-        notch.soundEnabled = { [weak self] in self?.settings.sound ?? false }
         notch.onDetails = { [weak self] key, draft in
             self?.openWindow(select: key)
             // Набранное в notch не теряется при переходе в окно.
@@ -43,13 +43,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         characterBridge.show = { [weak self] in self?.ensureCharacter().show() }
         characterBridge.hide = { [weak self] in self?.character?.hide() }
         characterBridge.isVisible = { [weak self] in self?.character.map { !$0.isHidden } ?? false }
+        attention = AttentionCenter(store: store, notch: notch, settings: settings) { [weak self] key in self?.openWindow(select: key) }
+        attention.onPauseChange = { [weak self] in self?.updateStatusIcon() }
+        settings.onFullscreenChange = { [weak self] in self?.attention.checkFullscreen() }
         notch.start()
+        attention.start()
+        LoginItem.setUpOnFirstRun()
         store.start()
         if settings.codexEnabled { codex.start() }
         if CommandLine.arguments.contains("--debug-control") { notch.startDebugControl() }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "sparkle", accessibilityDescription: "Capri")
+        updateStatusIcon()
         statusItem.button?.imagePosition = .imageLeading
         let menu = NSMenu()
         menu.delegate = self
@@ -67,6 +72,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             exportDiagnostics(to: URL(fileURLWithPath: CommandLine.arguments[index + 1], isDirectory: true))
         }
         SingleInstance.observe { [weak self] in self?.openWindow() }
+        // После сна: сборщики хостов переподключает CollectorSupervisor; здесь — лимиты Codex и полноэкранный режим.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.codex.refreshLimits()
+            self?.attention.wake()
+        }
         NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { [weak self] n in
             if (n.object as? NSWindow) === self?.window { NSApp.setActivationPolicy(.accessory) }
         }
@@ -100,7 +110,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var launchedQuietly: Bool {
         let args = CommandLine.arguments
-        return launchedAsLoginItem || args.contains("--background") || args.contains("--debug-control")
+        // keyAELaunchedAsLogInItem у SMAppService приходит не всегда: запуск в первые 5 минут после загрузки
+        // при включённом автозапуске тоже считаем тихим.
+        let earlyAfterBoot = LoginItem.enabled && ProcessInfo.processInfo.systemUptime < 300
+        return launchedAsLoginItem || earlyAfterBoot || args.contains("--background") || args.contains("--debug-control")
             || args.contains("--export-diagnostics")
     }
 
@@ -177,6 +190,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         menu.addItem(.separator())
+        if let attention, attention.isPaused, let until = settings.pausedUntil {
+            item("Снять паузу уведомлений (до \(Self.clock.string(from: Date(timeIntervalSince1970: until))))", #selector(resumeAlerts))
+        } else {
+            item("Пауза уведомлений на 1 час", #selector(pauseAlerts))
+        }
         item("Открыть Capri", #selector(openDashboard), key: "o")
         item("Показать notch-панель", #selector(showNotch))
         menu.addItem(.separator())
@@ -191,6 +209,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func showNotch() { notch.go(.expanded, reason: "menu") }
     @objc private func toggleSound() { settings.sound.toggle() }
     @objc private func codexSignIn() { codex.signIn() }
+    @objc private func pauseAlerts() { attention.pause(hours: 1) }
+    @objc private func resumeAlerts() { attention.resume() }
+
+    private static let clock: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f
+    }()
+
+    /// ✦ — обычный режим, луна — пауза уведомлений.
+    private func updateStatusIcon() {
+        let paused = attention?.isPaused ?? false
+        statusItem?.button?.image = NSImage(systemSymbolName: paused ? "moon.zzz" : "sparkle",
+                                            accessibilityDescription: paused ? "Capri — пауза" : "Capri")
+    }
     @objc private func openSettings() { openWindow(); windowUI.settings = true }
     @objc private func quit() { NSApplication.shared.terminate(nil) }
 

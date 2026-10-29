@@ -76,3 +76,44 @@ final class SessionFilterTests: XCTestCase {
         XCTAssertEqual(all.filter(SessionFilter.all.matches).count, 3)
     }
 }
+
+final class AttentionTests: XCTestCase {
+    let screen = CGRect(x: 0, y: 0, width: 1512, height: 982)
+    let menuBar = WindowInfo(pid: 100, layer: Fullscreen.menuBarLayer, bounds: CGRect(x: 0, y: 0, width: 1512, height: 37))
+
+    func testFullscreenNeedsHiddenMenuBarAndCoveringWindow() {
+        let full = WindowInfo(pid: 7, layer: 0, bounds: CGRect(x: 0, y: 37, width: 1512, height: 945))
+        XCTAssertTrue(Fullscreen.isActive(windows: [full], screen: screen, safeAreaTop: 37, frontmost: 7, ownPid: 1))
+        // Развёрнутое окно при видимой строке меню — не полноэкранный режим.
+        XCTAssertFalse(Fullscreen.isActive(windows: [menuBar, full], screen: screen, safeAreaTop: 37, frontmost: 7, ownPid: 1))
+        // Строка меню есть в списке, но прозрачная — её не видно.
+        var hidden = menuBar; hidden.alpha = 0
+        XCTAssertTrue(Fullscreen.isActive(windows: [hidden, full], screen: screen, safeAreaTop: 37, frontmost: 7, ownPid: 1))
+        // Окно не переднего приложения, маленькое окно, сам Capri — нет.
+        XCTAssertFalse(Fullscreen.isActive(windows: [full], screen: screen, safeAreaTop: 37, frontmost: 8, ownPid: 1))
+        let small = WindowInfo(pid: 7, layer: 0, bounds: CGRect(x: 100, y: 100, width: 800, height: 600))
+        XCTAssertFalse(Fullscreen.isActive(windows: [small], screen: screen, safeAreaTop: 37, frontmost: 7, ownPid: 1))
+        XCTAssertFalse(Fullscreen.isActive(windows: [full], screen: screen, safeAreaTop: 37, frontmost: 1, ownPid: 1))
+        // Внешний монитор без выреза: окно с самого верха.
+        let ext = CGRect(x: 1512, y: -200, width: 2560, height: 1440)
+        let extFull = WindowInfo(pid: 7, layer: 0, bounds: ext)
+        XCTAssertTrue(Fullscreen.isActive(windows: [menuBar, extFull], screen: ext, safeAreaTop: 0, frontmost: 7, ownPid: 1))
+    }
+
+    func testWindowInfoFromDictionary() {
+        let d: [String: Any] = ["kCGWindowOwnerPID": 42, "kCGWindowLayer": 0,
+                                "kCGWindowBounds": ["X": 0, "Y": 37, "Width": 100, "Height": 50]]
+        XCTAssertEqual(WindowInfo.from(d), WindowInfo(pid: 42, layer: 0, bounds: CGRect(x: 0, y: 37, width: 100, height: 50)))
+    }
+
+    func testPolicy() {
+        var p = AttentionPolicy(sound: true, system: .whenHidden)
+        XCTAssertEqual(p.decide(now: 0, notchHidden: false), .init(peek: true, sound: true, systemNotification: false))
+        XCTAssertEqual(p.decide(now: 0, notchHidden: true), .init(peek: true, sound: true, systemNotification: true))
+        p.pausedUntil = 3600
+        XCTAssertEqual(p.decide(now: 10, notchHidden: true), .init(peek: false, sound: false, systemNotification: false))
+        XCTAssertEqual(p.decide(now: 3601, notchHidden: false).peek, true)
+        p.system = .off
+        XCTAssertFalse(p.decide(now: 4000, notchHidden: true).systemNotification)
+    }
+}

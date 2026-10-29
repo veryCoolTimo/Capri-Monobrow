@@ -18,10 +18,28 @@ final class Settings: ObservableObject {
     }
     var codexPrivateHosts: Set<String> { Set(Self.parseHosts(codexPrivateText).hosts) }
     var onCodexChange: ((Bool) -> Void)?
+    /// Пауза уведомлений до этого времени (unix). nil — без паузы.
+    @Published var pausedUntil: Double? { didSet { d.set(pausedUntil, forKey: "capri.pausedUntil") } }
+    @Published var systemNotifications: AttentionPolicy.SystemNotifications {
+        didSet { d.set(systemNotifications.rawValue, forKey: "capri.systemNotifications") }
+    }
+    @Published var fullscreenQuiet: Bool { didSet { d.set(fullscreenQuiet, forKey: "capri.fullscreenQuiet"); onFullscreenChange?() } }
+    var onFullscreenChange: (() -> Void)?
+    @Published var loginItemError: String?
+    /// Текст запроса в уведомлениях macOS (видно на экране блокировки). По умолчанию — только проект и хост.
+    @Published var notificationText: Bool { didSet { d.set(notificationText, forKey: "capri.notificationText") } }
+    var loginItem: Bool {
+        get { LoginItem.enabled }
+        set { loginItemError = LoginItem.set(newValue); objectWillChange.send() }
+    }
 
     init() {
         Self.migrateFromPrototype()
         sound = d.object(forKey: "capri.sound") as? Bool ?? true
+        pausedUntil = d.object(forKey: "capri.pausedUntil") as? Double
+        systemNotifications = AttentionPolicy.SystemNotifications(rawValue: d.string(forKey: "capri.systemNotifications") ?? "") ?? .whenHidden
+        fullscreenQuiet = d.object(forKey: "capri.fullscreenQuiet") as? Bool ?? true
+        notificationText = d.object(forKey: "capri.notificationText") as? Bool ?? false
         codexEnabled = d.object(forKey: "capri.codex") as? Bool ?? true
         // Сводки отправляют экраны сессий в OpenAI — только по явному включению.
         codexSummaries = d.object(forKey: "capri.codexSummaries") as? Bool ?? false
@@ -107,6 +125,27 @@ struct SettingsView: View {
             }
             section("уведомления") {
                 Toggle("Звук при «ждёт меня»", isOn: $settings.sound)
+                Picker("Уведомления macOS", selection: $settings.systemNotifications) {
+                    Text("Нет").tag(AttentionPolicy.SystemNotifications.off)
+                    Text("Когда notch не видно (экран спит, заблокирован, вы на другом мониторе)").tag(AttentionPolicy.SystemNotifications.whenHidden)
+                    Text("Всегда").tag(AttentionPolicy.SystemNotifications.always)
+                }
+                Toggle("Текст запроса в уведомлениях (виден на экране блокировки)", isOn: $settings.notificationText)
+                    .disabled(settings.systemNotifications == .off)
+                Toggle("В полноэкранных приложениях прятать notch (всплывает только на «ждёт меня»)", isOn: $settings.fullscreenQuiet)
+            }
+            section("запуск") {
+                Toggle("Запускать Capri при входе в систему", isOn: Binding(get: { settings.loginItem }, set: { settings.loginItem = $0 }))
+                    .disabled(!LoginItem.available)
+                if let e = settings.loginItemError ?? (LoginItem.available ? nil : "Доступно для Capri из /Applications (scripts/install-macos.sh).") {
+                    Text(e).font(.system(size: 10.5)).foregroundColor(Palette.dim)
+                }
+                if LoginItem.needsApproval {
+                    HStack {
+                        Text("macOS ждёт разрешения на автозапуск.").font(.system(size: 10.5)).foregroundColor(Palette.crimson)
+                        Button("Открыть Настройки") { LoginItem.openSystemSettings() }
+                    }
+                }
             }
             section("codex") {
                 Toggle("Codex в Capri (вход через аккаунт ChatGPT)", isOn: $settings.codexEnabled)

@@ -91,7 +91,6 @@ final class NotchController: NSObject {
     let ui = NotchUI()
     /// Меню по правому клику (с «Выйти») — его даёт AppDelegate.
     var makeMenu: (() -> NSMenu)?
-    var soundEnabled: () -> Bool = { true }
     /// «Подробнее» в карточке — открыть основное окно.
     var onDetails: ((SessionKey, String) -> Void)?
     /// Отладочные команды, которые обрабатывает не notch (окно и т.п.).
@@ -120,6 +119,10 @@ final class NotchController: NSObject {
     private var cancellables: Set<AnyCancellable> = []
     private var hovering = false
     private var lastSound: Date = .distantPast
+    /// Экран, на котором живёт notch.
+    var notchScreen: NSScreen? { screen }
+    /// Полноэкранное приложение на экране notch: свёрнутый notch спрятан, всплывает только на «ждёт меня».
+    private(set) var suppressed = false
 
     init(store: SessionStore) {
         self.store = store
@@ -199,7 +202,6 @@ final class NotchController: NSObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in self?.storeChanged() }
             .store(in: &cancellables)
-        store.onNeedsInput = { [weak self] s in self?.alert(s) }
         store.onDelivered = { [weak self] key in self?.delivered(key) }
     }
 
@@ -301,6 +303,17 @@ final class NotchController: NSObject {
         let from = state
         let growing = NotchState.allCases.firstIndex(of: target)! > NotchState.allCases.firstIndex(of: from)!
         state = target
+        if suppressed {
+            if target != .collapsed { setPanelVisible(true) }   // кликабельность — updateMouseThrough() в конце go()
+            else {
+                // Дать капле свернуться, потом спрятать.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+                    guard let self, self.suppressed, self.state == .collapsed else { return }
+                    self.hovering = false
+                    self.setPanelVisible(false)
+                }
+            }
+        }
         collapseWork?.cancel()
         panel.allowKey = target == .expanded
         if target != .peek { ui.alertKey = nil }
@@ -405,10 +418,27 @@ final class NotchController: NSObject {
         go(state == .expanded ? (hovering ? .peek : .collapsed) : .expanded, reason: "click")
     }
 
-    /// Новое «ждёт меня»: peek на 3 с с этой сессией, звук, glitch.
-    func alert(_ s: Session) {
+    /// Спрятать свёрнутый notch (полноэкранное приложение) или вернуть. Раскрытый и peek не трогаем —
+    /// они спрячутся, когда свернутся.
+    func setSuppressed(_ value: Bool) {
+        guard value != suppressed else { return }
+        suppressed = value
+        if !value { setPanelVisible(true); updateMouseThrough() }
+        else if state == .collapsed { hovering = false; collapseWork?.cancel(); setPanelVisible(false) }
+    }
+
+    private func setPanelVisible(_ visible: Bool) {
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = visible ? 0.12 : 0.25
+            panel.animator().alphaValue = visible ? 1 : 0
+        }
+        if !visible { panel.ignoresMouseEvents = true }
+    }
+
+    /// Новое «ждёт меня»: peek на 3 с с этой сессией, звук, glitch. Что из этого играть — решает AttentionPolicy.
+    func alert(_ s: Session, sound: Bool) {
         // Несколько «ждёт меня» разом (например, при запуске) — один звук.
-        if soundEnabled(), Date().timeIntervalSince(lastSound) > 2 {
+        if sound, Date().timeIntervalSince(lastSound) > 2 {
             lastSound = Date()
             NSSound(named: "Tink")?.play()
         }
@@ -523,10 +553,17 @@ final class NotchController: NSObject {
     }
 
     private func updateMouseThrough() {
+        if suppressed && state == .collapsed { panel.ignoresMouseEvents = true; return }
         panel.ignoresMouseEvents = !shapeContains(NSEvent.mouseLocation)
     }
 
     private func mouseMoved() {
+        // Спрятанный notch не раскрывается наведением: в полноэкранном режиме там всплывает строка меню.
+        if suppressed && state == .collapsed {
+            hovering = false
+            collapseWork?.cancel()
+            return
+        }
         let inside = shapeContains(NSEvent.mouseLocation)
         panel.ignoresMouseEvents = !inside
         guard inside != hovering else { return }
@@ -579,7 +616,7 @@ final class NotchController: NSObject {
         let handlers: [(Int32, () -> Void)] = [
             (SIGUSR1, { [weak self] in
                 guard let self else { return }
-                if let s = self.store.waiting.first { self.alert(s) } else if self.state == .collapsed { self.go(.peek, reason: "signal") }
+                if let s = self.store.waiting.first { self.alert(s, sound: false) } else if self.state == .collapsed { self.go(.peek, reason: "signal") }
             }),
             (SIGUSR2, { [weak self] in self?.clickNotch() }),
             (SIGINFO, { [weak self] in self?.snapshot() }),
