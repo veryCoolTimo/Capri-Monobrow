@@ -1,0 +1,38 @@
+# Capri — правила для этого проекта
+
+Нативное macOS-приложение (Swift/AppKit): notch + окно сессий, которое показывает все
+сессии Claude Code / Codex на машинах Тимофея и сообщает, когда им нужен ответ.
+
+**Текущий план — `docs/plans/2026-10-29-capri-core-plan.md`. Работаем строго по нему,
+по этапам.** `docs/MVP_SPEC.md` — исходная большая спецификация, только как справка.
+
+## Где что лежит
+
+- Источник правды — этот git-репозиторий `~/capri` на **timoserver** (Linux). Код
+  пишем здесь, коммитим здесь.
+- Собирать и запускать можно **только на Маке**: `ssh timomac` (macOS arm64, Swift 6.1,
+  Xcode в /Applications). Копия на Маке: `~/capri` — она перезаписывается синхронизацией,
+  там ничего не править.
+- `scripts/mac.sh "<команда>"` — rsync на Мак и выполнение команды там, например:
+  - `scripts/mac.sh "npm test"`
+  - `scripts/mac.sh "npm run test:macos"`
+  - `scripts/mac.sh "npm run build:macos"`
+  - `scripts/mac.sh sync` — только синхронизировать.
+- Запуск GUI на Маке: `scripts/mac.sh "open 'dist/Capri Prototype.app'"`. Перед новым
+  запуском закрыть старый экземпляр. Что видно на экране — проверять скриншотом
+  (`screencapture -x /tmp/capri.png` на Маке, забрать `scp`) или спросить Тимофея.
+
+## Машины для событий
+С Мака доступны по ssh: `timoserver` (эта машина) и `quiz` (= apod03, прод!).
+На них работают живые Claude-сессии Тимофея в tmux. **Не устанавливать хуки и не писать в
+чужие сессии без явного «да» Тимофея.** Для экспериментов — свои тестовые tmux-сессии
+с префиксом `capri-test-`, после — убрать.
+
+## Особенности окружения
+- На Маке `/opt/homebrew/bin/claude` падает (Node 25), рабочий — `~/.local/bin/claude`.
+- `notify` в `~/.codex/config.toml` на Маке занят Codex Computer Use — не затирать.
+- На timoserver в `~/.claude/settings.json` уже есть хуки — только сливать, с бэкапом.
+- Мак — ноутбук: бывает спит/оффлайн. Если `ssh timomac` не отвечает — сообщить, не ждать.
+
+## Git
+Коммиты: `<Action> <what changed>`, без "Generated with Claude Code" и без Co-Authored-By.
