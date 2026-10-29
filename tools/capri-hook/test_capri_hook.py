@@ -233,11 +233,15 @@ class InstallerTests(Base):
         self.assertFalse(os.path.exists(os.path.join(self.env["CAPRI_HOME"], "bin", "capri-hook")))
 
     def test_install_backs_up_copies_itself_and_uninstall_restores(self):
+        os.makedirs(self.env["CAPRI_HOME"], exist_ok=True)
+        os.chmod(self.env["CAPRI_HOME"], 0o775)      # каталог от старой версии
         out = self.install()
         self.assertEqual(out.returncode, 0, out.stderr)
         backups = [f for f in os.listdir(os.path.dirname(self.settings)) if ".capri-bak-" in f]
         self.assertEqual(len(backups), 1)
         self.assertTrue(os.access(os.path.join(self.env["CAPRI_HOME"], "bin", "capri-hook"), os.X_OK))
+        for d in [self.env["CAPRI_HOME"], os.path.join(self.env["CAPRI_HOME"], "bin")]:
+            self.assertEqual(os.stat(d).st_mode & 0o777, 0o700, d)
         data = json.load(open(self.settings))
         self.assertEqual(data["model"], "opus[1m]")
         self.assertEqual(sorted(json.loads(self.run_hook(["status"]).stdout)["claude"]), sorted(ch.CLAUDE_EVENTS))

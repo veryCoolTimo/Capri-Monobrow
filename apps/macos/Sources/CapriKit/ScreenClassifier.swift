@@ -52,14 +52,34 @@ public enum ScreenClassifier {
 
     static func detectDialog(_ plain: [String], bottom: String) -> DialogInfo? {
         let claudeDialog = bottom.contains("esc to cancel") && plain.contains(where: { isOption($0) })
+        // Меню без номеров (доверие к папке при первом запуске): «❯ No, exit / Yes, I trust…».
+        let claudeMenu = bottom.contains("enter to confirm") && bottom.contains("esc to cancel")
         let codexDialog = bottom.contains("press enter to confirm or esc to cancel")
-        guard claudeDialog || codexDialog else { return nil }
+        guard claudeDialog || claudeMenu || codexDialog else { return nil }
         let kind: DialogInfo.Kind = bottom.contains("enter to select") ? .question : .permission
-        let options = plain.compactMap(option)
+        var options = plain.compactMap(option)
+        if options.isEmpty { options = menuOptions(plain) }
         let titleMarkers = ["Do you want", "Would you like", "?"]
         let title = plain.last(where: { line in titleMarkers.contains(where: { line.contains($0) }) && !isOption(line) })?
             .trimmingCharacters(in: .whitespaces)
         return DialogInfo(kind: kind, title: title, options: options)
+    }
+
+    /// Пункты меню без номеров: строка с курсором `❯` и соседние строки с тем же отступом до подсказки «Enter to confirm».
+    static func menuOptions(_ plain: [String]) -> [DialogOption] {
+        guard let end = plain.lastIndex(where: { $0.lowercased().contains("enter to confirm") }),
+              let cursor = plain[..<end].lastIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("❯") })
+        else { return [] }
+        func label(_ line: String) -> String {
+            line.trimmingCharacters(in: .whitespaces).drop { $0 == "❯" || $0.isWhitespace }.description
+        }
+        let indent = { (l: String) in l.prefix { $0 == " " }.count }
+        let column = indent(plain[cursor]) + 2          // «❯ » — два символа
+        var first = cursor
+        while first > 0, indent(plain[first - 1]) == column { first -= 1 }
+        var last = cursor
+        while last + 1 < end, indent(plain[last + 1]) == column { last += 1 }
+        return (first...last).enumerated().map { DialogOption(key: String($0.offset + 1), label: label(plain[$0.element])) }
     }
 
     static let optionRegex = try! NSRegularExpression(pattern: #"^\s*(?:[❯›>]\s*)?(\d)\.\s+(.+?)\s*$"#)

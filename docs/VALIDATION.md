@@ -112,6 +112,31 @@ notify-обёртка на реальном конфиге (по умолчан�
 - `pkill -f` с шаблоном из собственной команды убивает свою же оболочку — в скриптах искать
   процессы точнее.
 
+### Установка на timoserver · 2026-10-29 (с «да» Тимофея)
+
+`scripts/install-hooks.sh timoserver --apply`: свежий dry-run совпал с показанным заранее.
+- `~/.claude/settings.json`: свои PreToolUse/PostToolUse/PostToolUseFailure/SessionStart остались
+  первыми, наши записи — после них, плюс 6 новых событий. Бэкап `settings.json.capri-bak-*`.
+- `~/.codex/hooks.json` — новый файл, 7 событий; доверие всем 7 (`hooks/list` → `trusted`).
+- Повторный `--apply` ничего не меняет и бэкапов не плодит.
+
+По ходу исправлено:
+- `~/.capri` остался 0775 от ранних тестов (`makedirs(mode=)` действует только при создании) —
+  установщик теперь ужесточает `~/.capri` и `bin/` до 0700.
+- Codex урезает timeout `SessionEnd`/`Interrupt` до 3 с и ругается — timeout наших хуков 3 с
+  (хуку хватает миллисекунд).
+- Бэкап `config.toml` делался и тогда, когда доверие не менялось — теперь только перед записью.
+- Окно «Accessing workspace» (доверие к новой папке) экран-классификатор принимал за idle с
+  «набрано: No, exit». Меню без номеров с «Enter to confirm · Esc to cancel» теперь диалог;
+  фикстура `claude-trust-folder.ansi`.
+
+Живая проверка (CapriCollect на Маке → ssh timoserver, сессия `capri-test-e2e`, глобальные хуки):
+- AskUserQuestion → `needs_input (hook)` с вариантами Red / Green, задержка 0.00 с, 🔔.
+- Esc в вопросе → `idle (inferred)` по экрану через ~5 с.
+- Окно доверия к папке (хуков ещё нет) → `needs_input (inferred)`, варианты «No, exit / Yes, I trust this folder».
+- Живые сессии Тимофея тоже шлют события (`running`/`idle` по хукам) — запись идёт.
+- Запрос разрешения Bash не воспроизвести: в Claude на timoserver включён auto mode.
+
 ---
 
 ## Этап 0 — спайки · 2026-10-29

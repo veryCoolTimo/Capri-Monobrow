@@ -89,6 +89,14 @@ final class ScreenClassifierTests: XCTestCase {
         XCTAssertEqual(q.options.prefix(2).map(\.label), ["Red", "Blue"])
     }
 
+    func testFolderTrustMenuWithoutNumbersIsDialog() {
+        // Первый запуск в новой папке: хуков ещё нет, а «❯ No, exit» нельзя принять за набранный текст.
+        guard case .dialog(let d) = classify("claude-trust-folder", .claude) else { return XCTFail() }
+        XCTAssertEqual(d.kind, .permission)
+        XCTAssertEqual(d.options.map(\.label), ["No, exit", "Yes, I trust this folder"])
+        XCTAssertEqual(d.options.map(\.key), ["1", "2"])
+    }
+
     func testAfterDenialOrEscItIsIdle() {
         XCTAssertEqual(classify("claude-denied", .claude), .idle(typed: nil))
         XCTAssertEqual(classify("claude-interrupted", .claude), .idle(typed: nil))

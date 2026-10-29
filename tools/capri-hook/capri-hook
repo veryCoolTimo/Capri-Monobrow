@@ -81,6 +81,13 @@ def ensure_capri_dir(path):
     os.makedirs(path, mode=0o700, exist_ok=True)
 
 
+def tighten_capri_dir():
+    """mode у makedirs действует только при создании — каталог от старой версии мог остаться 0775."""
+    for d in [capri_dir(), os.path.dirname(hook_path())]:
+        if os.path.isdir(d) and os.stat(d).st_mode & 0o077:
+            os.chmod(d, 0o700)
+
+
 def dumps(obj):
     # ensure_ascii: строка всегда ASCII — переживает любую локаль ssh и одиночные суррогаты.
     return json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
@@ -510,7 +517,8 @@ def strip_ours(hooks_obj):
 
 
 def our_group(event, command):
-    group = {"hooks": [{"type": "command", "command": command, "timeout": 5}]}
+    # 3 с — потолок Codex для SessionEnd/Interrupt; самому хуку хватает миллисекунд (flock ждёт ≤1 с).
+    group = {"hooks": [{"type": "command", "command": command, "timeout": 3}]}
     return {"matcher": "*", "hooks": group["hooks"]} if event in MATCHER_EVENTS else group
 
 
@@ -770,6 +778,7 @@ def _run_install(args, install):
     # Скрипт — раньше хуков: записанные хуки не должны указывать на несуществующий файл.
     if install and not dry:
         install_self(hook)
+        tighten_capri_dir()
 
     for kind, path, old, new in report:
         print("== %s: %s" % (kind, path))
@@ -791,10 +800,11 @@ def _run_install(args, install):
             if want_notify:
                 print("== codex notify: будет обёрнут (исходная программа вызывается после записи события)")
         else:
-            backup_config(codex_home, stamp)
             server = AppServer(codex, codex_home)
             try:
                 todo, seen, notes = codex_trust_plan(server, home, codex_hooks, codex_cmd)
+                if todo or want_notify:
+                    backup_config(codex_home, stamp)
                 if todo:
                     server.call("config/value/write", {"keyPath": "hooks.state", "value": todo, "mergeStrategy": "upsert"})
                 print("== codex: доверие выставлено %d хукам" % len(todo))
