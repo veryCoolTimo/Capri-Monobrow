@@ -34,7 +34,8 @@ public struct HostSource: Equatable {
 
     public static func local(name: String = "local", hookCommand: String? = nil) -> HostSource {
         let cmd = hookCommand ?? "/usr/bin/python3 \"$HOME/.capri/bin/capri-hook\" stream"
-        return HostSource(name: name, command: ["/bin/sh", "-c", "exec " + cmd])
+        // `exec env …` — чтобы работали префиксы `VAR=… cmd` и процесс-потомок не пережил остановку.
+        return HostSource(name: name, command: ["/bin/sh", "-c", "exec /usr/bin/env " + cmd])
     }
 
     public static func ssh(_ host: String, name: String? = nil, remoteCommand: String = defaultRemoteCommand) -> HostSource {
