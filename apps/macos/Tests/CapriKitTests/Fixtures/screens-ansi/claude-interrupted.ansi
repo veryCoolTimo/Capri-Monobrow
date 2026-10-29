@@ -1,0 +1,48 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.295[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 5.5 · Claude Max[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m~/capri-test-stage1/work[39m
+
+
+[38;5;246m[48;5;237m❯ [38;5;231mRun this exact bash command: date > stamp.txt[39m
+
+[49m  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+
+[38;5;231m●[39m I ran [38;5;153mdate > stamp.txt[39m as requested. The command finished with no output, as expected, so [38;5;153mstamp.txt[39m in the current working directory now holds the current date and time.
+
+[38;5;246m✻[39m [38;5;246mBrewed for 3s · done 11:07 AM[39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mUse the AskUserQuestion tool to ask me: red or blue?[39m
+
+[38;5;246m[49m● [39mUser declined to answer questions
+[38;5;246m  ⎿  · Red or blue? (Red / Blue)[39m
+
+[38;5;246m✻[39m [38;5;246mChurned for 1s · done 11:08 AM[39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mRun this exact bash command: touch denied.txt[39m
+[49m
+  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+[38;5;246m  ⎿  Interrupted · What should Claude do instead?[39m
+
+[38;5;246m✻[39m [38;5;246mBrewed for 1s · done 11:08 AM[39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mWrite a 500-word story about a goat.[39m
+
+[38;5;231m[49m●[39m [1mThe Goat Who Counted Stars[0m
+
+  Halvard was not a clever goat, but he was a stubborn one, and on the hillside above the village of Ostrey, stubbornness counted for a great deal.
+
+  He lived with the Brennan sisters, who kept eleven goats, three cows, and a temper that could curdle milk faster than the weather. Every morning the sisters led the herd up the narrow
+  path to the high pasture, and every evening they brought them back down before the light failed. Halvard, however, had discovered that the light did not fail all at once. It drained
+  slowly, like honey from a spoon, and in the last minutes before dark the sky turned a color he had
+[38;5;246m  ⎿  Interrupted · What should Claude do instead?[39m
+
+
+
+
+
+                                                                                                                                                                      [38;5;246m◐ medium · /effort[39m
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m⏸ manual mode on · ? for shortcuts · ← for agents[39m
