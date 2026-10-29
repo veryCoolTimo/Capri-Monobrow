@@ -472,24 +472,31 @@ class SendTests(Base):
         with open(self.prog, "w") as f:
             f.write(PANE_PROGRAM)
         self.log = os.path.join(self.tmp, "keys.log")
+        # Панель должна выглядеть как агент: send ищет claude/codex в дереве процессов панели.
+        self.fake_claude = os.path.join(self.tmp, "bin", "claude")
+        os.makedirs(os.path.dirname(self.fake_claude), exist_ok=True)
+        os.symlink(sys.executable, self.fake_claude)
 
     def tearDown(self):
         if "TMUX" not in self.env:
             subprocess.run(["tmux", "kill-server"], env=self.env, capture_output=True)
         Base.tearDown(self)
 
-    def pane(self, screen_text):
-        path = os.path.join(self.tmp, "screen.txt")
+    def pane(self, screen_text, program=None):
+        path = os.path.join(self.tmp, "screen-%d.txt" % len(os.listdir(self.tmp)))
         with open(path, "w") as f:
             f.write(screen_text)
-        out = subprocess.run(["tmux", "new-session", "-d", "-x", "200", "-y", "50", "-P", "-F", "#{pane_id}\t#{pane_pid}",
-                              sys.executable, self.prog, path, self.log], env=self.env, capture_output=True, text=True)
+        cmd = program or [self.fake_claude, self.prog, path, self.log]
+        out = subprocess.run(["tmux", "new-session", "-d", "-x", "200", "-y", "50", "-P", "-F", "#{pane_id}\t#{pane_pid}"]
+                             + cmd, env=self.env, capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, out.stderr)
         import time
         time.sleep(0.6)
         return out.stdout.strip().split("\t")
 
     def send(self, args, stdin=b""):
+        if isinstance(stdin, dict):
+            stdin = json.dumps(stdin).encode()
         out = subprocess.run([sys.executable, SCRIPT, "send"] + args, env=self.env, input=stdin, capture_output=True)
         return json.loads(out.stdout.decode())
 
@@ -503,9 +510,11 @@ class SendTests(Base):
 
     def test_text_is_pasted_and_submitted(self):
         pane, pid = self.pane("history\n❯ \x1b[2mTry \"fix lint\"\x1b[0m\n")
-        r = self.send(["--pane", pane, "--pid", pid, "--text-stdin"], "Привет, $HOME и \"кавычки\"\nвторая строка\n".encode())
+        r = self.send(["--pane", pane, "--pid", pid, "--agent", "claude", "--text-stdin"],
+                      "Привет, $HOME и \"кавычки\"\x1b[201~\nвторая строка\n".encode())
         self.assertTrue(r["ok"], r)
-        self.assertEqual(self.received(), "\x1b[200~Привет, $HOME и \"кавычки\"\rвторая строка\x1b[201~\r".encode())
+        # ESC вырезан: вставка не закончится раньше времени и остаток не уйдёт нажатиями.
+        self.assertEqual(self.received(), "\x1b[200~Привет, $HOME и \"кавычки\"[201~\rвторая строка\x1b[201~\r".encode())
 
     def test_refuses_typed_running_dialog_and_wrong_pane(self):
         pane, pid = self.pane("❯ my draft\n")
@@ -523,10 +532,32 @@ class SendTests(Base):
             screen = f.read()
         pane, pid = self.pane(screen)
         self.assertEqual(self.send(["--pane", pane, "--text-stdin"], b"x")["reason"], "dialog")
-        r = self.send(["--pane", pane, "--pid", pid, "--choose", "4"])
-        self.assertTrue(r["ok"], r)
-        self.assertEqual((r["moves"], r["label"]), (3, "No"))
+        self.assertEqual(self.send(["--pane", pane, "--choose", "4", "--expect-stdin"],
+                                   {"text": "rm -rf build", "label": "No"})["reason"], "dialog-changed")
+        self.assertEqual(self.send(["--pane", pane, "--choose", "4", "--expect-stdin"],
+                                   {"text": "date > stamp.txt", "label": "Yes"})["reason"], "dialog-changed")
+        self.assertEqual(self.received(), b"")
+        r = self.send(["--pane", pane, "--pid", pid, "--choose", "4", "--expect-stdin"],
+                      {"text": "date > stamp.txt", "label": "No"})
+        # Панель-заглушка не двигает курсор в ответ на стрелки — send замечает и не жмёт Enter.
+        self.assertEqual(r["reason"], "cursor", r)
         keys = self.received()
         self.assertEqual(keys.count(b"B"), 3, keys)
-        self.assertTrue(keys.endswith(b"\r"), keys)
+        self.assertFalse(keys.endswith(b"\r"), keys)
+        r = self.send(["--pane", pane, "--pid", pid, "--choose", "1", "--expect-stdin"],
+                      {"text": "date > stamp.txt", "label": "Yes"})
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((r["moves"], r["label"]), (0, "Yes"))
+        self.assertTrue(self.received().endswith(b"\r"))
         self.assertEqual(self.send(["--pane", pane, "--choose", "9"])["reason"], "no-option")
+
+    def test_refuses_pane_without_agent(self):
+        # Агент вышел, в панели shell с приглашением «❯» (pure/starship) — текст ушёл бы командой.
+        pane, pid = self.pane("", program=["sh", "-c", "printf '\\342\\235\\257 \\n'; sleep 30"])
+        r = self.send(["--pane", pane, "--pid", pid, "--text-stdin"], b"rm -rf ~")
+        self.assertEqual(r["reason"], "no-agent")
+        self.assertEqual(self.send(["--pane", pane, "--agent", "codex", "--text-stdin"], b"x")["reason"], "no-agent")
+
+    def test_old_input_box_high_above_is_not_the_prompt(self):
+        pane, _ = self.pane("\u276f \n" + "line\n" * 10)
+        self.assertEqual(self.send(["--pane", pane, "--text-stdin"], b"x")["reason"], "no-prompt")

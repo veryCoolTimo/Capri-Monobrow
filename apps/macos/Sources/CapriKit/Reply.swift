@@ -40,8 +40,14 @@ public enum ReplyRefusal: Equatable, Error {
     case noOption
     case paneGone
     case paneChanged
+    case noAgent
+    case dialogChanged
+    case cursor
+    case pastedNotSubmitted
     case busy
     case empty
+    /// ssh не ответил вовремя: ввод мог и дойти — повторять вслепую нельзя.
+    case unknown
     case failed(String)
 
     public var message: String {
@@ -57,6 +63,11 @@ public enum ReplyRefusal: Equatable, Error {
         case .noOption: return "такого варианта на экране нет"
         case .paneGone: return "панель tmux закрыта"
         case .paneChanged: return "в панели уже другой процесс"
+        case .noAgent: return "в панели больше нет агента — не пишу в оболочку"
+        case .dialogChanged: return "на экране уже другой диалог — обновлю, проверьте и выберите снова"
+        case .cursor: return "курсор не встал на вариант — Enter не нажат, проверьте сессию"
+        case .pastedNotSubmitted: return "текст вставлен, но Enter не нажат — проверьте сессию"
+        case .unknown: return "хост не ответил вовремя — ответ мог дойти, проверьте сессию"
         case .busy: return "в эту сессию уже идёт отправка"
         case .empty: return "пустой ответ"
         case .failed(let s): return "не отправлено: \(s)"
@@ -66,7 +77,7 @@ public enum ReplyRefusal: Equatable, Error {
 
 public enum Reply {
     /// Минимальная версия capri-hook с режимом send.
-    public static let minHookVersion = 3
+    public static let minHookVersion = 4
 
     /// Проверка по состоянию Capri, до похода на хост. Хост проверит экран ещё раз прямо перед вводом.
     public static func check(_ s: Session, _ action: ReplyAction, hostConnected: Bool, hookVersion: Int) -> ReplyRefusal? {
@@ -86,21 +97,33 @@ public enum Reply {
         return nil
     }
 
-    /// Аргументы `capri-hook send` (текст идёт через stdin, не в командной строке).
+    /// Аргументы `capri-hook send`. Текст и ожидания по экрану идут через stdin, не в командной строке.
     public static func arguments(_ s: Session, _ action: ReplyAction) -> [String]? {
         guard let t = s.tmux, isPaneId(t.pane) else { return nil }
-        var args = ["send", "--pane", t.pane]
+        var args = ["send", "--pane", t.pane, "--agent", s.key.agent.rawValue]
         if let pid = t.pid, !pid.isEmpty, pid.allSatisfy(\.isNumber) { args += ["--pid", pid] }
         switch action {
         case .text: args.append("--text-stdin")
-        case .choose(let n): args += ["--choose", String(n)]
+        case .choose(let n): args += ["--choose", String(n), "--expect-stdin"]
         }
         return args
     }
 
-    public static func stdin(_ action: ReplyAction) -> Data? {
-        if case .text(let t) = action { return Data(t.utf8) }
-        return nil
+    /// stdin для `send`: текст ответа или JSON «какой диалог видел пользователь» — хост сверит его
+    /// с экраном и откажет, если там уже другой запрос.
+    public static func stdin(_ s: Session, _ action: ReplyAction) -> Data {
+        switch action {
+        case .text(let t):
+            return Data(t.utf8)
+        case .choose(let n):
+            var expect: [String: String] = [:]
+            if let r = s.request {
+                if let label = r.choices.first(where: { $0.index == n })?.label { expect["label"] = label }
+                let first = r.summary.split(separator: "\n").first.map(String.init) ?? r.summary
+                if r.kind != .notification, !first.isEmpty { expect["text"] = String(first.prefix(60)) }
+            }
+            return (try? JSONSerialization.data(withJSONObject: expect, options: [.sortedKeys])) ?? Data("{}".utf8)
+        }
     }
 
     static func isPaneId(_ p: String) -> Bool {
@@ -109,7 +132,7 @@ public enum Reply {
 
     /// Разбор ответа `capri-hook send`: nil — отправлено.
     public static func parseResult(_ out: HostCommand.Output) -> ReplyRefusal? {
-        if out.timedOut { return .failed("хост не ответил") }
+        if out.timedOut { return .unknown }
         let line = out.stdout.split(separator: "\n").last.map(String.init) ?? ""
         guard let data = line.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -126,6 +149,10 @@ public enum Reply {
         case "no-option": return .noOption
         case "pane-gone": return .paneGone
         case "pane-changed": return .paneChanged
+        case "no-agent": return .noAgent
+        case "dialog-changed": return .dialogChanged
+        case "cursor": return .cursor
+        case "pasted-not-submitted": return .pastedNotSubmitted
         case "busy": return .busy
         case "empty": return .empty
         case let r: return .failed(detail.isEmpty ? r : "\(r): \(detail)")

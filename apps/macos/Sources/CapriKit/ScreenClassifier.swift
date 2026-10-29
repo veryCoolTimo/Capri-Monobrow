@@ -59,12 +59,28 @@ public enum ScreenClassifier {
             || (bottom.contains("press enter to continue") && plain.contains(where: { isOption($0) }))
         guard claudeDialog || claudeMenu || codexDialog else { return nil }
         let kind: DialogInfo.Kind = bottom.contains("enter to select") ? .question : .permission
-        var options = plain.compactMap(option)
+        var options = numberedOptions(plain)
         if options.isEmpty { options = menuOptions(plain) }
         let titleMarkers = ["Do you want", "Would you like", "?", "!"]
         let title = plain.last(where: { line in titleMarkers.contains(where: { line.contains($0) }) && !isOption(line) })?
             .trimmingCharacters(in: .whitespaces)
         return DialogInfo(kind: kind, title: title, options: options)
+    }
+
+    /// Варианты текущего диалога: последняя серия 1…k снизу вверх. Выше могут быть нумерованные
+    /// списки из ответа агента — они не варианты (так же считает `capri-hook send`).
+    static func numberedOptions(_ plain: [String]) -> [DialogOption] {
+        var picked: [DialogOption] = []
+        var want: Int?
+        for line in plain.reversed() {
+            guard let o = option(line), let n = Int(o.key) else { continue }
+            if want == nil || n == want {
+                picked.append(o)
+                want = n - 1
+                if n == 1 { break }
+            }
+        }
+        return picked.last?.key == "1" ? picked.reversed() : []
     }
 
     /// Пункты меню без номеров: строка с курсором `❯` и соседние строки с тем же отступом до подсказки «Enter to confirm».

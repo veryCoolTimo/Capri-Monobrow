@@ -38,6 +38,21 @@ extension Session {
     }
 }
 
+/// «Сколько ждёт» — подписан только на часы, тик не перерисовывает остальную панель.
+struct AgoLabel: View {
+    @ObservedObject var clock: Clock
+    var since: Double
+    var color: Color
+    var body: some View { Caps(agoText(clock.now - since), size: 8, color: color, weight: .bold) }
+}
+
+struct WaitBar: View {
+    @ObservedObject var clock: Clock
+    var since: Double
+    var color: Color
+    var body: some View { SegmentBar(fraction: min(1, (clock.now - since) / 600), color: color) }
+}
+
 // MARK: - Свёрнутый вид
 
 struct TopRowView: View {
@@ -103,9 +118,12 @@ struct ExpandedView: View {
     var actions: NotchActions
     @FocusState private var replyFocused: Bool
 
+    /// Выбранная сессия. Если выбор задан, но сессия закрылась — nil (карточка скажет об этом),
+    /// а не тихая подмена: иначе набранный ответ ушёл бы в другую сессию.
     var selected: Session? {
-        if let k = ui.selected, let r = store.resolve(k), let s = store.sessions.first(where: { $0.key == r }) { return s }
-        return store.sessions.first
+        guard let k = ui.selected else { return store.sessions.first }
+        guard let r = store.resolve(k) else { return nil }
+        return store.sessions.first { $0.key == r }
     }
 
     var body: some View {
@@ -117,7 +135,13 @@ struct ExpandedView: View {
                 Spacer()
             } else {
                 list
-                if let s = selected { card(s) }
+                if let s = selected {
+                    card(s)
+                } else {
+                    Caps("выбранная сессия закрылась — выберите другую", size: 8.5, color: Palette.crimson)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                        .hud(stroke: Palette.line, fill: Palette.fill, cut: 9)
+                }
             }
         }
         .foregroundColor(Palette.text)
@@ -181,7 +205,7 @@ struct ExpandedView: View {
                 Caps(s.hostLabel, size: 7).fixedSize()
                 Text(s.headline).font(.system(size: 10)).foregroundColor(Palette.text.opacity(0.75)).lineLimit(1)
                 Spacer(minLength: 4)
-                Caps(agoText(store.now - s.statusSince), size: 8, color: color(s), weight: .bold)
+                AgoLabel(clock: store.clock, since: s.statusSince, color: color(s))
             }
             .padding(.horizontal, 6).padding(.vertical, 3)
             .background(isSelected ? Palette.crimson.opacity(0.14) : Color.clear)
@@ -200,7 +224,7 @@ struct ExpandedView: View {
                      size: 8, color: accent, weight: .bold).fixedSize()
                 Caps(kindLabel(s), size: 8).fixedSize()
                 Spacer(minLength: 4)
-                if waiting { SegmentBar(fraction: min(1, (store.now - s.statusSince) / 600), color: accent) }
+                if waiting { WaitBar(clock: store.clock, since: s.statusSince, color: accent) }
                 hudButton("открыть ↗", accent: Palette.crimson, enabled: s.tmux != nil) { actions.open(s.key) }
                     .help(s.tmux == nil ? "сессия не в tmux" : "Terminal с tmux attach на эту панель")
             }
@@ -216,15 +240,16 @@ struct ExpandedView: View {
                     .background(Color.black.opacity(0.55))
             }
             if !choices.isEmpty {
-                HStack(spacing: 5) {
-                    ForEach(choices.prefix(4)) { c in
-                        hudButton("\(c.index) \(short(c.label))", accent: c.index == 1 ? Palette.acid : Palette.crimson,
-                                  enabled: store.deliveries[s.key] != .sending) {
-                            actions.send(s.key, .choose(c.index))
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 5) {
+                        ForEach(choices) { c in
+                            hudButton("\(c.index) \(short(c.label))", accent: c.index == 1 ? Palette.acid : Palette.crimson,
+                                      enabled: !store.deliveries.isBusy(s.key)) {
+                                actions.send(s.key, .choose(c.index))
+                            }
+                            .help(c.label)
                         }
-                        .help(c.label)
                     }
-                    Spacer(minLength: 0)
                 }
             } else {
                 replyRow(s)

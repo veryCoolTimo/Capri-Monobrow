@@ -23,9 +23,7 @@ enum TerminalOpener {
     static func open(pane: String, transport: HostSource.Transport) -> Bool {
         guard let cmd = command(pane: pane, transport: transport) else { return false }
         CapriPaths.ensureDir()
-        let dir = CapriPaths.dir.appendingPathComponent("tmp")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let file = dir.appendingPathComponent("open-\(UUID().uuidString.prefix(8)).command")
+        let file = CapriPaths.tmp.appendingPathComponent("open-\(UUID().uuidString.prefix(8)).command")
         let script = "#!/bin/zsh\nrm -f \"$0\"\n\(cmd)\n"
         guard FileManager.default.createFile(atPath: file.path, contents: Data(script.utf8),
                                              attributes: [.posixPermissions: 0o700]) else { return false }

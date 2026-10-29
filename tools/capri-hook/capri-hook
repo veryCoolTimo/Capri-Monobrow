@@ -8,9 +8,10 @@
                                       для Capri: снимок (последние события, панели tmux, экраны)
                                       и дальше поток новых строк; JSON по строке в stdout.
                                       --only-sessions — только tmux-сессии с этим префиксом (тесты)
-  capri-hook send --pane %N [--pid PID] (--text-stdin | --choose N)
+  capri-hook send --pane %N [--pid PID] [--agent claude|codex] (--text-stdin | --choose N)
                                       ответ из Capri: текст из stdin + Enter или вариант диалога N
-                                      (стрелками от курсора + Enter). Проверяет панель и экран прямо
+                                      (стрелками от курсора + Enter; в stdin JSON {"label","text"} —
+                                      чего ждём на экране). Проверяет панель, агента и экран прямо
                                       перед вводом; результат — одна строка JSON
   capri-hook install|uninstall|status [--dry-run] [--no-claude] [--no-codex] [--codex-notify]
 
@@ -33,7 +34,7 @@ import time
 import uuid
 import shlex
 
-VERSION = 3          # версия скрипта; 3 — режим send
+VERSION = 4          # версия скрипта; 3 — режим send, 4 — send сверяет агента и диалог
 PROTO = 1            # версия протокола stream и формата строки журнала
 # Наша запись — команда, где исполняемый файл называется capri-hook (путь может быть любым,
 # в том числе в кавычках shlex.quote).
@@ -994,9 +995,13 @@ def screen_mode(plain):
     return "prompt"
 
 
+INPUT_ROWS = 6
+
+
 def typed_text(rows):
-    """Набранный в строке ввода текст без серой подсказки; None — строки ввода не видно."""
-    for text, mask in reversed(rows):
+    """Набранный в строке ввода текст без серой подсказки; None — строки ввода не видно.
+    Строку ввода ищем только у самого низа: выше — история, в том числе старое поле ввода агента."""
+    for text, mask in reversed(rows[-INPUT_ROWS:]):
         stripped = text.lstrip()
         if stripped[:1] in CURSORS:
             start = len(text) - len(stripped)
@@ -1047,6 +1052,29 @@ def tmux_ok(*args, **kw):
         raise SendError("tmux", (out.stderr or b"").decode("utf-8", "replace").strip()[:200])
 
 
+CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def norm(text):
+    """Для сравнения текста с экраном: без пробелов и переносов (длинные строки на экране переносятся)."""
+    return re.sub(r"\s+", "", text or "")
+
+
+def option_label(line):
+    m = OPTION_RE.match(line)
+    label = m.group(2) if m else line.strip().lstrip("".join(CURSORS)).strip()
+    return label.rstrip("…").strip()
+
+
+def same_label(screen, expected):
+    """Подпись на экране может быть обрезана по ширине панели — сравниваем по общему началу."""
+    a, b = norm(screen), norm(expected).rstrip("…")
+    if not a or not b:
+        return False
+    n = min(len(a), len(b))
+    return n >= min(4, len(b)) and a[:n] == b[:n]
+
+
 class SendError(Exception):
     def __init__(self, reason, detail=""):
         Exception.__init__(self, reason)
@@ -1068,14 +1096,23 @@ def run_send(args):
 def _run_send(args):
     pane = option(args, "--pane") or ""
     pid = option(args, "--pid")
+    agent = option(args, "--agent")
     choose = option(args, "--choose")
     text = None
+    expect = {}
     if "--text-stdin" in args:
-        text = sys.stdin.buffer.read().decode("utf-8", "replace").rstrip()
+        # Управляющие символы (ESC[201~ закончил бы bracketed paste раньше времени) — вон.
+        text = CONTROL_RE.sub("", sys.stdin.buffer.read().decode("utf-8", "replace")).rstrip()
         if not text:
             raise SendError("empty")
-    if not PANE_RE.match(pane) or (pid is not None and not pid.isdigit()) \
-            or (text is None) == (choose is None) or (choose is not None and not choose.isdigit()):
+    elif choose is not None and "--expect-stdin" in args:
+        try:
+            expect = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
+        except ValueError:
+            raise SendError("usage")
+    if not PANE_RE.match(pane) or (pid is not None and not pid.isdigit()) or agent not in (None, "claude", "codex") \
+            or (text is None) == (choose is None) or (choose is not None and not choose.isdigit()) \
+            or not isinstance(expect, dict):
         raise SendError("usage")
     try:
         info = subprocess.run([tmux_bin(), "display", "-p", "-t", pane, "#{pane_id}\t#{pane_pid}\t#{pane_dead}"],
@@ -1088,10 +1125,16 @@ def _run_send(args):
     # tmux переиспользует %N после перезапуска сервера: pid отличает «ту же» панель.
     if pid and parts[1] != pid:
         raise SendError("pane-changed")
+    # pane_pid — обычно оболочка: агент мог выйти, и тогда ввод ушёл бы в shell как команда.
+    children, agents = process_agents()
+    running = pane_agent(parts[1], children, agents)
+    if running is None or (agent and running != agent):
+        raise SendError("no-agent", running or "")
 
     ensure_capri_dir(capri_dir())
-    with open(os.path.join(capri_dir(), "send.lock"), "a") as lf:
-        # Один писатель: два ответа подряд в одну панель не должны перемешаться.
+    lock_path = os.path.join(capri_dir(), "send-%s.lock" % pane[1:])
+    with open(lock_path, "a") as lf:
+        # Один писатель на панель: два ответа подряд не должны перемешаться.
         if not lock(lf.fileno(), SEND_LOCK_TIMEOUT):
             raise SendError("busy")
         rows = screen_rows(pane)
@@ -1102,19 +1145,7 @@ def _run_send(args):
         if mode == "running":
             raise SendError("running")
         if choose is not None:
-            if mode != "dialog":
-                raise SendError("no-dialog")
-            options, cursor = dialog_options(plain)
-            target = int(choose) - 1
-            if cursor is None or not 0 <= target < len(options):
-                raise SendError("no-option", "%d вариантов" % len(options))
-            delta = target - cursor
-            for _ in range(abs(delta)):
-                tmux_ok("send-keys", "-t", pane, "Down" if delta > 0 else "Up")
-                time.sleep(KEY_PAUSE)
-            tmux_ok("send-keys", "-t", pane, "Enter")
-            return {"ok": True, "sent": "choose", "moves": delta,
-                    "label": OPTION_RE.sub(r"\2", plain[options[target]]).lstrip("".join(CURSORS) + " ")[:80]}
+            return choose_option(pane, plain, mode, int(choose), expect)
         if mode == "dialog":
             raise SendError("dialog")
         typed = typed_text(rows)
@@ -1124,11 +1155,47 @@ def _run_send(args):
             raise SendError("typed", typed[:80])
         buf = "capri-%d" % os.getpid()
         tmux_ok("load-buffer", "-b", buf, "-", input=text.encode("utf-8"))
-        # -p: bracketed paste — многострочный текст не отправится по частям; -d: удалить буфер.
-        tmux_ok("paste-buffer", "-p", "-d", "-b", buf, "-t", pane)
+        try:
+            # -p: bracketed paste — многострочный текст не отправится по частям; -d: удалить буфер.
+            tmux_ok("paste-buffer", "-p", "-d", "-b", buf, "-t", pane)
+        except SendError:
+            subprocess.run([tmux_bin(), "delete-buffer", "-b", buf], capture_output=True, timeout=2)
+            raise
         time.sleep(0.15)
-        tmux_ok("send-keys", "-t", pane, "Enter")
+        try:
+            tmux_ok("send-keys", "-t", pane, "Enter")
+        except SendError as e:
+            raise SendError("pasted-not-submitted", e.detail)
         return {"ok": True, "sent": "text", "chars": len(text)}
+
+
+def choose_option(pane, plain, mode, choice, expect):
+    """Вариант `choice` того диалога, что видел пользователь: сверяем текст запроса и подпись варианта,
+    ведём курсор стрелками и перед Enter проверяем, что он на нужной строке."""
+    if mode != "dialog":
+        raise SendError("no-dialog")
+    options, cursor = dialog_options(plain)
+    target = choice - 1
+    if cursor is None or not 0 <= target < len(options):
+        raise SendError("no-option", "%d вариантов" % len(options))
+    want_text = norm(expect.get("text"))[:60]
+    if want_text and want_text not in norm("".join(plain)):
+        raise SendError("dialog-changed")
+    if expect.get("label") and not same_label(option_label(plain[options[target]]), expect["label"]):
+        raise SendError("dialog-changed", option_label(plain[options[target]])[:80])
+    delta = target - cursor
+    for _ in range(abs(delta)):
+        tmux_ok("send-keys", "-t", pane, "Down" if delta > 0 else "Up")
+        time.sleep(KEY_PAUSE)
+    if delta:
+        time.sleep(0.1)
+        rows = screen_rows(pane) or []
+        now_plain = [r[0] for r in rows]
+        now_options, now_cursor = dialog_options(now_plain)
+        if now_cursor != target or len(now_options) != len(options):
+            raise SendError("cursor", "курсор на %s, нужен %d" % (now_cursor, target))
+    tmux_ok("send-keys", "-t", pane, "Enter")
+    return {"ok": True, "sent": "choose", "moves": delta, "label": option_label(plain[options[target]])[:80]}
 
 
 def main(argv):

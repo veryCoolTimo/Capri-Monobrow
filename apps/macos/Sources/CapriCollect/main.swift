@@ -36,6 +36,7 @@ if sources.isEmpty { sources = [.local()] }
 if let onlySessions { for i in sources.indices { sources[i].streamArgs = ["--only-sessions", onlySessions] } }
 
 setvbuf(stdout, nil, _IOLBF, 0)
+signal(SIGPIPE, SIG_IGN)
 var state = CapriState()
 let started = Date()
 

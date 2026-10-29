@@ -97,6 +97,13 @@ final class ScreenClassifierTests: XCTestCase {
         XCTAssertEqual(d.options.map(\.key), ["1", "2"])
     }
 
+    func testNumberedListAboveDialogIsNotAnOption() {
+        let lines = ["1. first step from the answer", "2. second step", "Do you want to proceed?",
+                     "❯ 1. Yes", "  2. No", "Esc to cancel"]
+        guard case .dialog(let d) = ScreenClassifier.classify(lines: lines, agent: .claude) else { return XCTFail() }
+        XCTAssertEqual(d.options.map(\.label), ["Yes", "No"])
+    }
+
     func testCodexUpdateMenuIsDialog() {
         guard case .dialog(let d) = classify("codex-update", .codex) else { return XCTFail() }
         XCTAssertEqual(d.options.map(\.key), ["1", "2", "3"])
@@ -401,28 +408,31 @@ final class ReplyTests: XCTestCase {
 
     func testGuard() {
         let ok = waiting()
-        XCTAssertNil(Reply.check(ok, .choose(2), hostConnected: true, hookVersion: 3))
-        XCTAssertEqual(Reply.check(ok, .choose(3), hostConnected: true, hookVersion: 3), .noOption)
-        XCTAssertEqual(Reply.check(ok, .text("hi"), hostConnected: true, hookVersion: 3), .dialogOpen)
-        XCTAssertEqual(Reply.check(ok, .choose(1), hostConnected: false, hookVersion: 3), .hostOffline)
-        XCTAssertEqual(Reply.check(ok, .choose(1), hostConnected: true, hookVersion: 2), .hookOutdated)
-        XCTAssertEqual(Reply.check(waiting(status: .running), .text("hi"), hostConnected: true, hookVersion: 3), .running)
-        XCTAssertEqual(Reply.check(waiting(status: .idle), .choose(1), hostConnected: true, hookVersion: 3), .notWaiting)
-        XCTAssertEqual(Reply.check(waiting(typed: "draft", status: .idle), .text("hi"), hostConnected: true, hookVersion: 3), .typed("draft"))
-        XCTAssertEqual(Reply.check(waiting(status: .idle), .text("  \n"), hostConnected: true, hookVersion: 3), .empty)
-        XCTAssertNil(Reply.check(waiting(status: .idle), .text("сделай X"), hostConnected: true, hookVersion: 3))
+        XCTAssertNil(Reply.check(ok, .choose(2), hostConnected: true, hookVersion: 4))
+        XCTAssertEqual(Reply.check(ok, .choose(3), hostConnected: true, hookVersion: 4), .noOption)
+        XCTAssertEqual(Reply.check(ok, .text("hi"), hostConnected: true, hookVersion: 4), .dialogOpen)
+        XCTAssertEqual(Reply.check(ok, .choose(1), hostConnected: false, hookVersion: 4), .hostOffline)
+        XCTAssertEqual(Reply.check(ok, .choose(1), hostConnected: true, hookVersion: 3), .hookOutdated)
+        XCTAssertEqual(Reply.check(waiting(status: .running), .text("hi"), hostConnected: true, hookVersion: 4), .running)
+        XCTAssertEqual(Reply.check(waiting(status: .idle), .choose(1), hostConnected: true, hookVersion: 4), .notWaiting)
+        XCTAssertEqual(Reply.check(waiting(typed: "draft", status: .idle), .text("hi"), hostConnected: true, hookVersion: 4), .typed("draft"))
+        XCTAssertEqual(Reply.check(waiting(status: .idle), .text("  \n"), hostConnected: true, hookVersion: 4), .empty)
+        XCTAssertNil(Reply.check(waiting(status: .idle), .text("сделай X"), hostConnected: true, hookVersion: 4))
         var noTmux = waiting(); noTmux.tmux = nil
-        XCTAssertEqual(Reply.check(noTmux, .choose(1), hostConnected: true, hookVersion: 3), .noTmux)
+        XCTAssertEqual(Reply.check(noTmux, .choose(1), hostConnected: true, hookVersion: 4), .noTmux)
     }
 
     func testCommandKeepsTextOutOfArgv() {
         let s = waiting(status: .idle)
-        XCTAssertEqual(Reply.arguments(s, .text("rm -rf '$HOME'")), ["send", "--pane", "%5", "--pid", "42", "--text-stdin"])
-        XCTAssertEqual(Reply.arguments(s, .choose(2)), ["send", "--pane", "%5", "--pid", "42", "--choose", "2"])
+        XCTAssertEqual(Reply.arguments(s, .text("rm -rf '$HOME'")),
+                       ["send", "--pane", "%5", "--agent", "claude", "--pid", "42", "--text-stdin"])
+        XCTAssertEqual(Reply.arguments(s, .choose(2)),
+                       ["send", "--pane", "%5", "--agent", "claude", "--pid", "42", "--choose", "2", "--expect-stdin"])
+        XCTAssertEqual(String(decoding: Reply.stdin(waiting(), .choose(2)), as: UTF8.self), #"{"label":"No","text":"rm x"}"#)
         var bad = s; bad.tmux = TmuxRef(pane: "%5; rm -rf ~")
         XCTAssertNil(Reply.arguments(bad, .choose(1)))
         let ssh = HostSource.ssh("timoserver").command(Reply.arguments(s, .choose(2))!)
-        XCTAssertEqual(ssh.last, "python3 ~/.capri/bin/capri-hook send --pane %5 --pid 42 --choose 2")
+        XCTAssertEqual(ssh.last, "python3 ~/.capri/bin/capri-hook send --pane %5 --agent claude --pid 42 --choose 2 --expect-stdin")
         XCTAssertEqual(shellQuote("it's"), "'it'\\''s'")
     }
 
@@ -443,5 +453,104 @@ final class ReplyTests: XCTestCase {
             done.fulfill()
         }
         wait(for: [done], timeout: 5)
+    }
+
+    func testHostCommandFinishesWhenChildKeepsPipeOpen() {
+        // Как мастер-соединение ssh: процесс вышел, а его потомок ещё держит stderr.
+        let done = expectation(description: "run")
+        let started = Date()
+        HostCommand.run(["/bin/sh", "-c", "(sleep 5 >&2 &); echo ok"], timeout: 10) { out in
+            XCTAssertEqual(out.stdout, "ok\n")
+            XCTAssertFalse(out.timedOut)
+            XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
+    }
+
+    func testHostCommandSurvivesChildThatIgnoresStdin() {
+        signal(SIGPIPE, SIG_IGN)       // как в Capri и CapriCollect
+        let done = expectation(description: "run")
+        HostCommand.run(["/bin/sh", "-c", "exit 3"], stdin: Data(count: 1 << 20)) { out in
+            XCTAssertEqual(out.status, 3)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
+    }
+
+    func testHostCommandTimeout() {
+        let done = expectation(description: "run")
+        HostCommand.run(["/bin/sleep", "5"], timeout: 0.5) { out in
+            XCTAssertTrue(out.timedOut)
+            XCTAssertEqual(Reply.parseResult(out), .unknown)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 3)
+    }
+}
+
+final class DeliveryTests: XCTestCase {
+    let key = SessionKey(host: "h", agent: .claude, id: "s")
+
+    func session(_ status: SessionStatus, request: PendingRequest? = nil, key: SessionKey? = nil, pane: String = "%5") -> Session {
+        Session(key: key ?? self.key, tmux: TmuxRef(pane: pane), cwd: "/p", status: status, confidence: .hook,
+                statusSince: 0, lastEventAt: 0, request: request, lastMessage: nil, typedInput: nil)
+    }
+
+    func state(_ sessions: [Session]) -> CapriState {
+        var st = CapriState()
+        for s in sessions { st.sessions[s.key] = s }
+        return st
+    }
+
+    func testTextConfirmedOnlyWhenSessionRuns() {
+        var t = DeliveryTracker()
+        t.sending(key)
+        XCTAssertTrue(t.isBusy(key))
+        t.sent(key, before: session(.idle), action: .text("go"), at: 100)
+        XCTAssertTrue(t.isBusy(key))
+        // Новый снимок экрана с той же «ждёт задачу» — ещё не доставлено.
+        var st = state([session(.idle)])
+        XCTAssertEqual(t.update(st.sessions, resolve: st.resolve), [])
+        st = state([session(.running)])
+        XCTAssertEqual(t.update(st.sessions, resolve: st.resolve), [key])
+        XCTAssertEqual(t[key], .delivered)
+        t.dropDelivered(key)
+        XCTAssertNil(t[key])
+    }
+
+    func testChooseConfirmedWhenDialogGoneOrReplaced() {
+        let ask = PendingRequest(kind: .permission, summary: "rm x", options: ["1 Yes", "2 No"])
+        var t = DeliveryTracker()
+        t.sent(key, before: session(.needsInput, request: ask), action: .choose(1), at: 100)
+        var st = state([session(.needsInput, request: ask)])
+        XCTAssertEqual(t.update(st.sessions, resolve: st.resolve), [])
+        st = state([session(.needsInput, request: PendingRequest(kind: .permission, summary: "ls", options: ["1 Yes"]))])
+        XCTAssertEqual(t.update(st.sessions, resolve: st.resolve), [key])
+    }
+
+    func testTimeoutAndVanishedSessionAreNotDelivered() {
+        var t = DeliveryTracker()
+        t.sent(key, before: session(.idle), action: .text("go"), at: 100)
+        XCTAssertEqual(t.expire(now: 104), [])
+        XCTAssertEqual(t.expire(now: 106), [key])
+        XCTAssertEqual(t[key], .notDelivered)
+        XCTAssertFalse(t.isBusy(key))
+
+        t.sent(key, before: session(.idle), action: .text("go"), at: 200)
+        let st = state([session(.ended)])
+        XCTAssertEqual(t.update(st.sessions, resolve: st.resolve), [])
+        XCTAssertEqual(t[key], .notDelivered)
+    }
+
+    func testPaneSessionMergedIntoHookedOne() {
+        let paneKey = SessionKey(host: "h", agent: .claude, id: "pane:%5")
+        var t = DeliveryTracker()
+        t.sent(paneKey, before: session(.idle, key: paneKey), action: .text("go"), at: 100)
+        let st = state([session(.running)])           // хуки пришли из той же панели
+        XCTAssertEqual(st.resolve(paneKey), key)
+        XCTAssertNil(st.resolve(SessionKey(host: "other", agent: .claude, id: "pane:%5")))
+        XCTAssertEqual(t.update(st.sessions, resolve: st.resolve), [key])
+        XCTAssertNil(t[paneKey])
     }
 }

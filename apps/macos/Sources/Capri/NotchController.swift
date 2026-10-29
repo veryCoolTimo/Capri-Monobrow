@@ -7,7 +7,7 @@ import CapriKit
 // Notch-капля над строкой меню: свёрнутый → (наведение или новое «ждёт меня») → peek → (клик) → expanded.
 // Панель фиксированного размера и прозрачная; капля — CAShapeLayer, её путь анимируется пружиной в
 // render server. Отработано в NotchSpike (Этап 0), здесь — на живых сессиях.
-// Проверка без мыши: SIGUSR1 — peek, SIGUSR2 — клик, SIGINFO — снимок окна в /tmp/capri-notch-<state>.png.
+// Проверка без мыши: SIGUSR1 — peek, SIGUSR2 — клик, SIGINFO — снимок окна в ~/.capri/tmp/notch-<state>.png.
 
 /// Пружина как SwiftUI `.spring(response: 0.45, dampingFraction: 0.8)`.
 private let springResponse: CGFloat = 0.45
@@ -172,6 +172,8 @@ final class NotchController: NSObject {
         }
 
         quiet = !store.active
+        CapriPaths.ensureDir()
+        CapriPaths.cleanTmp()
         pickScreen()
         panel.orderFrontRegardless()
         installMonitors()
@@ -271,6 +273,8 @@ final class NotchController: NSObject {
         // objectWillChange приходит до изменения — смотрим после.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            // Выбранная сессия закрылась — черновик ответа не должен достаться другой.
+            if let k = self.ui.selected, self.store.resolve(k) == nil, !self.ui.reply.isEmpty { self.ui.reply = "" }
             let q = !self.store.active
             guard q != self.quiet else { return }
             self.quiet = q
@@ -290,6 +294,10 @@ final class NotchController: NSObject {
         collapseWork?.cancel()
         panel.allowKey = target == .expanded
         if target != .peek { ui.alertKey = nil }
+        // Карточка не должна переключаться сама при пересортировке списка — закрепляем выбор.
+        if target == .expanded, ui.selected.flatMap(store.resolve) == nil {
+            ui.selected = store.waiting.first?.key ?? store.sessions.first?.key
+        }
 
         if from == .peek { peekLine.set(shown: false, delay: 0, duration: 0.1, lift: 6) }
         if from == .expanded { expandedHost.set(shown: false, delay: 0, duration: 0.12, lift: 8) }
@@ -428,9 +436,9 @@ final class NotchController: NSObject {
 
     /// Ответ дошёл: если больше никто не ждёт — свернуть через секунду, иначе перейти к следующему.
     private func delivered(_ key: SessionKey) {
-        guard state == .expanded, ui.selected.flatMap(store.resolve) == key || ui.selected == key else { return }
+        guard state == .expanded, ui.selected.flatMap(store.resolve) == key else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            guard let self, self.state == .expanded, self.ui.selected == key else { return }
+            guard let self, self.state == .expanded, self.ui.selected.flatMap(self.store.resolve) == key else { return }
             if let next = self.store.waiting.first(where: { $0.key != key }) {
                 self.ui.selected = next.key
             } else if !self.hovering {
@@ -440,8 +448,7 @@ final class NotchController: NSObject {
     }
 
     private func open(_ key: SessionKey) {
-        guard let s = store.session(key), let pane = s.tmux?.pane else { return }
-        let transport: HostSource.Transport = key.host == "local" ? .local : .ssh(key.host)
+        guard let s = store.session(key), let pane = s.tmux?.pane, let transport = store.transport(key.host) else { return }
         if TerminalOpener.open(pane: pane, transport: transport) { go(.collapsed, reason: "open") }
     }
 
@@ -450,13 +457,15 @@ final class NotchController: NSObject {
     /// Только с `--debug-control`: команды из `~/.capri/tmp/control` идут по тем же путям, что клики, —
     /// для сквозной проверки без мыши. Файл в каталоге 0700, читается и удаляется раз в 0.3 с.
     func startDebugControl() {
-        let file = CapriPaths.dir.appendingPathComponent("tmp/control")
+        let file = CapriPaths.tmp.appendingPathComponent("control")
         CapriPaths.ensureDir()
-        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
-                                                 attributes: [.posixPermissions: 0o700])
         Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
-            guard let data = FileManager.default.contents(atPath: file.path) else { return }
-            try? FileManager.default.removeItem(at: file)
+            // Только обычный файл владельца, не ссылка.
+            var st = stat()
+            guard lstat(file.path, &st) == 0 else { return }
+            defer { try? FileManager.default.removeItem(at: file) }
+            guard (st.st_mode & S_IFMT) == S_IFREG, st.st_uid == getuid(),
+                  let data = FileManager.default.contents(atPath: file.path) else { return }
             for line in String(decoding: data, as: UTF8.self).split(separator: "\n") { self?.debugCommand(String(line)) }
         }
         NSLog("[Capri] отладочное управление: %@", file.path)
@@ -493,7 +502,7 @@ final class NotchController: NSObject {
         let out: [String: Any] = ["state": state.rawValue, "selected": ui.selected?.description ?? "", "sessions": rows,
                                   "hosts": store.hosts.map { "\($0.name)=\($0.connected)" }]
         if let d = try? JSONSerialization.data(withJSONObject: out, options: [.prettyPrinted, .sortedKeys]) {
-            try? d.write(to: CapriPaths.dir.appendingPathComponent("tmp/state.json"))
+            try? d.write(to: CapriPaths.tmp.appendingPathComponent("state.json"))
         }
     }
 
@@ -588,6 +597,7 @@ final class NotchController: NSObject {
         container.layer?.render(in: ctx)
         guard let image = ctx.makeImage() else { return }
         let rep = NSBitmapImageRep(cgImage: image)
-        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "/tmp/capri-notch-\(state.rawValue).png"))
+        CapriPaths.ensureDir()
+        try? rep.representation(using: .png, properties: [:])?.write(to: CapriPaths.tmp.appendingPathComponent("notch-\(state.rawValue).png"))
     }
 }

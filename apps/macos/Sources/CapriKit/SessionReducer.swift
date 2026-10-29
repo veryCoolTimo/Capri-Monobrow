@@ -65,6 +65,15 @@ public struct CapriState: Equatable {
 
     public init() {}
 
+    /// Ключ сессии с учётом склейки: `pane:%N` (видели только по экрану) заменяется сессией из хуков
+    /// в той же панели. nil — сессии нет или она закрыта.
+    public func resolve(_ key: SessionKey) -> SessionKey? {
+        if let s = sessions[key], s.status != .ended { return key }
+        guard key.id.hasPrefix("pane:") else { return nil }
+        let pane = String(key.id.dropFirst("pane:".count))
+        return sessions.values.first { $0.key.host == key.host && $0.status != .ended && $0.tmux?.pane == pane }?.key
+    }
+
     /// «Ждут меня» для notch: сверху самые старые.
     public var waiting: [Session] {
         sessions.values.filter { $0.status == .needsInput }.sorted { $0.statusSince < $1.statusSince }
@@ -243,7 +252,12 @@ public enum SessionReducer {
                     s.request = screenRequest(d)
                 } else if s.status == .needsInput, ts >= s.statusSince, var r = s.request, r.options.isEmpty {
                     // Хук PermissionRequest не даёт вариантов — берём их с экрана, текст запроса оставляем из хука.
+                    // У Notification текст общий («Claude needs your permission…») — его тоже берём с экрана.
                     r.options = d.options.map { "\($0.key) \($0.label)" }
+                    if r.kind == .notification {
+                        r.kind = d.kind == .question ? .question : .permission
+                        r.summary = d.title ?? r.summary
+                    }
                     s.request = r
                 }
             case .running:

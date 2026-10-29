@@ -1,6 +1,11 @@
 import AppKit
 import CapriKit
 
+/// Секундные часы для таймеров «сколько ждёт» — отдельно, чтобы тик не перерисовывал всю панель.
+final class Clock: ObservableObject {
+    @Published var now = Date().timeIntervalSince1970
+}
+
 /// Живое состояние для интерфейса: сборщики хостов → SessionReducer → сессии для notch;
 /// отправка ответов с проверкой доставки. Всё на главном потоке.
 final class SessionStore: ObservableObject {
@@ -10,21 +15,11 @@ final class SessionStore: ObservableObject {
         var id: String { name }
     }
 
-    /// Судьба последнего ответа в сессию.
-    enum Delivery: Equatable {
-        case sending
-        /// Хост принял ввод; ждём подтверждения по событию или экрану.
-        case sent(at: Double, status: SessionStatus, lastEvent: Double, timeout: Double)
-        case delivered
-        case refused(String)
-        case notDelivered
-    }
-
     /// Не закрытые сессии: сначала ждущие (самые старые сверху), потом остальные по свежести.
     @Published private(set) var sessions: [Session] = []
     @Published private(set) var hosts: [HostRow] = []
-    @Published private(set) var deliveries: [SessionKey: Delivery] = [:]
-    @Published private(set) var now = Date().timeIntervalSince1970
+    @Published private(set) var deliveries = DeliveryTracker()
+    let clock = Clock()
 
     var waiting: [Session] { sessions.filter { $0.status == .needsInput } }
     var runningCount: Int { sessions.filter { $0.status == .running }.count }
@@ -38,10 +33,6 @@ final class SessionStore: ObservableObject {
     private var supervisor: CollectorSupervisor!
     private var timer: Timer?
     private let journal = CapriPaths.dir.appendingPathComponent("replies.jsonl")
-
-    static let textTimeout: Double = 5
-    /// Отказ в Claude хука не даёт: подтверждение приходит по экрану (снимок раз в 2 с + пауза 3 с).
-    static let chooseTimeout: Double = 8
 
     init(sources: [HostSource]) {
         supervisor = CollectorSupervisor(sources: sources) { [weak self] in self?.feed($0) }
@@ -62,13 +53,10 @@ final class SessionStore: ObservableObject {
     }
 
     func session(_ key: SessionKey) -> Session? { resolve(key).flatMap { state.sessions[$0] } }
+    func resolve(_ key: SessionKey) -> SessionKey? { state.resolve(key) }
 
-    /// Ключ сессии с учётом склейки: `pane:%N` (видели по экрану) заменяется сессией из хуков в той же панели.
-    func resolve(_ key: SessionKey) -> SessionKey? {
-        if let s = state.sessions[key], s.status != .ended { return key }
-        guard key.id.hasPrefix("pane:") else { return nil }
-        return state.sessions.values.first { $0.key.host == key.host && $0.status != .ended && "pane:" + ($0.tmux?.pane ?? "") == key.id }?.key
-    }
+    /// Как достучаться до хоста сессии (для «Открыть»).
+    func transport(_ host: String) -> HostSource.Transport? { collector(host)?.source.transport }
 
     static func displayHost(_ name: String) -> String { name == "local" ? "mac" : name }
 
@@ -77,8 +65,14 @@ final class SessionStore: ObservableObject {
     private func feed(_ input: CapriInput) {
         let before = state
         let effects = SessionReducer.reduce(&state, input)
-        if case .tick(let t) = input { now = t; expireDeliveries() }
-        if state.sessions != before.sessions { publishSessions() }
+        if case .tick(let t) = input {
+            clock.now = t
+            for key in deliveries.expire(now: t) { record(key, nil, result: "not-confirmed") }
+        }
+        if state.sessions != before.sessions {
+            publishSessions()
+            confirmDeliveries()
+        }
         if state.hosts != before.hosts {
             hosts = supervisor.collectors.map { c in HostRow(name: c.source.name, connected: state.hosts[c.source.name]?.connected ?? false) }
         }
@@ -96,14 +90,13 @@ final class SessionStore: ObservableObject {
                 if wa { return a.statusSince < b.statusSince }
                 return a.lastEventAt > b.lastEventAt
             }
-        confirmDeliveries()
     }
 
     // MARK: ответ
 
     func check(_ key: SessionKey, _ action: ReplyAction) -> ReplyRefusal? {
         guard let key = resolve(key), let s = state.sessions[key] else { return .paneGone }
-        if deliveries[key] == .sending { return .busy }
+        if deliveries.isBusy(key) { return .busy }
         let c = collector(key.host)
         return Reply.check(s, action, hostConnected: c?.connected ?? false, hookVersion: c?.hookVersion ?? 0)
     }
@@ -111,7 +104,7 @@ final class SessionStore: ObservableObject {
     func send(_ key: SessionKey, _ action: ReplyAction, completion: ((Bool) -> Void)? = nil) {
         let key = resolve(key) ?? key
         if let r = check(key, action) {
-            deliveries[key] = .refused(r.message)
+            deliveries.refused(key, r.message)
             record(key, action, result: "refused:\(r)")
             completion?(false)
             return
@@ -120,56 +113,33 @@ final class SessionStore: ObservableObject {
             completion?(false)
             return
         }
-        deliveries[key] = .sending
-        HostCommand.run(c.source.command(args), stdin: Reply.stdin(action), timeout: 15) { [weak self] out in
+        deliveries.sending(key)
+        HostCommand.run(c.source.command(args), stdin: Reply.stdin(s, action), timeout: 15) { [weak self] out in
             guard let self else { return }
             if let r = Reply.parseResult(out) {
-                self.deliveries[key] = .refused(r.message)
+                self.deliveries.refused(key, r.message)
                 self.record(key, action, result: "refused:\(r)")
                 completion?(false)
                 return
             }
-            let timeout: Double
-            if case .choose = action { timeout = Self.chooseTimeout } else { timeout = Self.textTimeout }
-            // Точка отсчёта — состояние до отправки: хук может прийти раньше, чем ssh вернёт ответ.
-            self.deliveries[key] = .sent(at: Date().timeIntervalSince1970, status: s.status,
-                                         lastEvent: s.lastEventAt, timeout: timeout)
+            // Точка отсчёта — сессия до отправки: хук может прийти раньше, чем ssh вернёт ответ.
+            self.deliveries.sent(key, before: s, action: action, at: Date().timeIntervalSince1970)
             self.record(key, action, result: "sent")
             self.confirmDeliveries()
             completion?(true)
         }
     }
 
-    func clearDelivery(_ key: SessionKey) {
-        if case .sending = deliveries[key] { return }
-        deliveries[key] = nil
-    }
+    func clearDelivery(_ key: SessionKey) { deliveries.clear(key) }
 
     private func collector(_ host: String) -> HostCollector? {
         supervisor.collectors.first { $0.source.name == host }
     }
 
-    /// Доставлено, когда сессия сменила статус или пришло новое событие хука.
     private func confirmDeliveries() {
-        for (key, d) in deliveries {
-            guard case let .sent(_, status, lastEvent, _) = d else { continue }
-            guard let s = state.sessions[key] else { deliveries[key] = .delivered; continue }
-            if s.status != status || s.lastEventAt > lastEvent {
-                deliveries[key] = .delivered
-                onDelivered?(key)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-                    if self?.deliveries[key] == .delivered { self?.deliveries[key] = nil }
-                }
-            }
-        }
-    }
-
-    private func expireDeliveries() {
-        for (key, d) in deliveries {
-            if case let .sent(at, _, _, timeout) = d, now - at > timeout {
-                deliveries[key] = .notDelivered
-                record(key, nil, result: "not-confirmed")
-            }
+        for key in deliveries.update(state.sessions, resolve: state.resolve) {
+            onDelivered?(key)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in self?.deliveries.dropDelivered(key) }
         }
     }
 
@@ -199,8 +169,27 @@ final class SessionStore: ObservableObject {
 /// `~/.capri` на Маке — только для владельца.
 enum CapriPaths {
     static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".capri")
+    static let tmp = dir.appendingPathComponent("tmp")
 
+    /// Создаёт `~/.capri` и `~/.capri/tmp` с 0700 и ужесточает права, если каталоги остались от старой версии.
     static func ensureDir() {
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        for d in [dir, tmp] {
+            try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            if let mode = (try? FileManager.default.attributesOfItem(atPath: d.path))?[.posixPermissions] as? Int, mode & 0o077 != 0 {
+                try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: d.path)
+            }
+        }
+    }
+
+    /// Неиспользованные `.command` от «Открыть» (Terminal не запустил) — убрать старше часа.
+    static func cleanTmp() {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: tmp.path) else { return }
+        for name in names where name.hasSuffix(".command") {
+            let path = tmp.appendingPathComponent(name).path
+            if let date = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date, Date().timeIntervalSince(date) > 3600 {
+                try? fm.removeItem(atPath: path)
+            }
+        }
     }
 }
