@@ -25,6 +25,8 @@ final class DetailStore: ObservableObject {
         s.tmux.flatMap { screens[Self.screenKey(host: s.key.host, pane: $0.pane)] }
     }
 
+    func rawScreen(_ s: Session) -> [String]? { screen(s)?.raw }
+
     func lines(_ s: Session) -> [ScreenLine]? {
         guard let pane = s.tmux?.pane else { return nil }
         let key = Self.screenKey(host: s.key.host, pane: pane)
@@ -67,6 +69,8 @@ final class SessionStore: ObservableObject {
     @Published private(set) var sessions: [Session] = []
     @Published private(set) var hosts: [HostRow] = []
     @Published private(set) var deliveries = DeliveryTracker()
+    /// Сводки Codex «что спрашивает сессия» — действуют, пока запрос сессии тот же (отпечаток).
+    @Published private(set) var summaries: [SessionKey: (fingerprint: String, text: String)] = [:]
     let clock = Clock()
     let details = DetailStore()
 
@@ -209,6 +213,17 @@ final class SessionStore: ObservableObject {
             let label = s.request?.choices.first { $0.index == n }?.label
             return "выбран вариант \(n)" + (label.map { " \($0)" } ?? "")
         }
+    }
+
+    func summary(_ s: Session) -> String? {
+        guard s.status == .needsInput, let v = summaries[s.key], v.fingerprint == s.requestFingerprint else { return nil }
+        return v.text
+    }
+
+    func setSummary(_ key: SessionKey, fingerprint: String, text: String) {
+        summaries[key] = (fingerprint, text)
+        // Сводки закрытых сессий не копим.
+        for k in summaries.keys where state.sessions[k] == nil { summaries[k] = nil }
     }
 
     func clearDelivery(_ key: SessionKey) { deliveries.clear(key) }

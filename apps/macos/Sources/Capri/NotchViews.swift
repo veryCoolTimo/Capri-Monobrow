@@ -25,6 +25,19 @@ func agoText(_ seconds: Double) -> String {
     return String(format: "%02d:%02d", s / 60, s % 60)
 }
 
+/// Сводка Codex под запросом: что спрашивает сессия, по-человечески.
+struct CodexSummaryLine: View {
+    var text: String
+    var size: CGFloat = 10.5
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            Caps("codex", size: size * 0.72, color: Palette.codex, weight: .bold).fixedSize()
+            Text(text).font(.system(size: size)).foregroundColor(Palette.text.opacity(0.9)).lineLimit(2)
+        }
+        .help("Сводка от Codex по запросу и экрану сессии (секреты вырезаны)")
+    }
+}
+
 /// «Сколько ждёт» — подписан только на часы, тик не перерисовывает остальную панель.
 struct AgoLabel: View {
     @ObservedObject var clock: Clock
@@ -82,7 +95,7 @@ struct PeekLineView: View {
                 Image(systemName: "triangle.fill").font(.system(size: 7, weight: .bold)).foregroundColor(Palette.acid)
                 Caps(s.project, size: 10, color: Palette.acid, weight: .bold)
                 Rectangle().fill(Palette.line).frame(width: 1, height: 11)
-                Text(s.headline).font(.system(size: 12, weight: .medium)).foregroundColor(Palette.text).lineLimit(1)
+                Text(store.summary(s) ?? s.headline).font(.system(size: 12, weight: .medium)).foregroundColor(Palette.text).lineLimit(1)
                 Spacer(minLength: 0)
                 if waiting.count > 1 { Caps("+\(waiting.count - 1)", size: 9, color: Palette.dim) }
             } else {
@@ -228,6 +241,7 @@ struct ExpandedView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.black.opacity(0.55))
             }
+            if let summary = store.summary(s) { CodexSummaryLine(text: summary) }
             if !choices.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 5) {

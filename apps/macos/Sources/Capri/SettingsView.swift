@@ -9,10 +9,24 @@ final class Settings: ObservableObject {
 
     @Published var sound: Bool { didSet { d.set(sound, forKey: "capri.sound") } }
     @Published var hostsText: String
+    @Published var codexEnabled: Bool { didSet { d.set(codexEnabled, forKey: "capri.codex"); onCodexChange?(codexEnabled) } }
+    @Published var codexSummaries: Bool { didSet { d.set(codexSummaries, forKey: "capri.codexSummaries") } }
+    @Published var codexPath: String { didSet { d.set(codexPath.isEmpty ? nil : codexPath, forKey: "capri.codexPath") } }
+    /// Хосты, содержимое сессий которых в Codex не уходит (по умолчанию прод).
+    @Published var codexPrivateText: String {
+        didSet { d.set(Self.parseHosts(codexPrivateText).hosts, forKey: "capri.codexPrivateHosts") }
+    }
+    var codexPrivateHosts: Set<String> { Set(Self.parseHosts(codexPrivateText).hosts) }
+    var onCodexChange: ((Bool) -> Void)?
 
     init() {
         Self.migrateFromPrototype()
         sound = d.object(forKey: "capri.sound") as? Bool ?? true
+        codexEnabled = d.object(forKey: "capri.codex") as? Bool ?? true
+        // Сводки отправляют экраны сессий в OpenAI — только по явному включению.
+        codexSummaries = d.object(forKey: "capri.codexSummaries") as? Bool ?? false
+        codexPrivateText = (d.stringArray(forKey: "capri.codexPrivateHosts") ?? ["quiz"]).joined(separator: ", ")
+        codexPath = d.string(forKey: "capri.codexPath") ?? ""
         hostsText = (d.stringArray(forKey: "capri.hosts") ?? Self.defaultHosts).joined(separator: ", ")
     }
 
@@ -93,6 +107,20 @@ struct SettingsView: View {
             }
             section("уведомления") {
                 Toggle("Звук при «ждёт меня»", isOn: $settings.sound)
+            }
+            section("codex") {
+                Toggle("Codex в Capri (вход через аккаунт ChatGPT)", isOn: $settings.codexEnabled)
+                Toggle("Сводки «что спрашивает сессия» в notch (автоматически)", isOn: $settings.codexSummaries)
+                    .disabled(!settings.codexEnabled)
+                Text("Сводки, чат и черновики отправляют в OpenAI запрос сессии и низ её экрана. Токены, ключи, пароли и email вырезаются; инструменты у Codex выключены — он только читает текст.")
+                    .font(.system(size: 10.5)).foregroundColor(Palette.dim).fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Text("Не отправлять в Codex:").font(.system(size: 11))
+                    TextField("quiz", text: $settings.codexPrivateText).textFieldStyle(.roundedBorder).font(.mono(11))
+                }
+                TextField("путь к codex (пусто — найти самому)", text: $settings.codexPath)
+                    .textFieldStyle(.roundedBorder).font(.mono(11))
+                    .onSubmit { settings.onCodexChange?(false); if settings.codexEnabled { settings.onCodexChange?(true) } }
             }
             section("персонаж") {
                 Toggle("Показывать бродящего персонажа", isOn: $character.visible)

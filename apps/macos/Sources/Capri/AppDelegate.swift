@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var store: SessionStore!
     private var notch: NotchController!
+    private var codex: CodexService!
     private var window: NSWindow?
     private let windowUI = WindowUI()
     private let settings = Settings()
@@ -24,6 +25,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         installMainMenu()
         store = SessionStore(sources: Self.sources())
         notch = NotchController(store: store)
+        codex = CodexService(store: store)
+        codex.summariesEnabled = { [weak self] in self?.settings.codexSummaries ?? false }
+        codex.privateHosts = { [weak self] in self?.settings.codexPrivateHosts ?? [] }
+        settings.onCodexChange = { [weak self] on in
+            guard let self else { return }
+            if on { self.codex.start() } else { self.codex.stop() }
+        }
         notch.makeMenu = { [weak self] in self?.makeMenu() ?? NSMenu() }
         notch.soundEnabled = { [weak self] in self?.settings.sound ?? false }
         notch.onDetails = { [weak self] key, draft in
@@ -37,6 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         characterBridge.isVisible = { [weak self] in self?.character.map { !$0.isHidden } ?? false }
         notch.start()
         store.start()
+        if settings.codexEnabled { codex.start() }
         if CommandLine.arguments.contains("--debug-control") { notch.startDebugControl() }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -67,6 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        codex?.stop()
         store?.stop()
     }
 
@@ -149,6 +159,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for h in store?.hosts ?? [] {
             item("   \(SessionStore.displayHost(h.name)): \(h.connected ? "на связи" : "нет связи")", nil)
         }
+        if let codex {
+            switch codex.state {
+            case .ready(let a):
+                var line = "Codex: \(a.plan ?? a.type)"
+                if let l = codex.limits {
+                    if let p = l.primary { line += " · \(LimitsView.title(p, fallback: "5 ч")) \(Int(p.usedPercent.rounded()))%" }
+                    if let w = l.secondary { line += " · \(LimitsView.title(w, fallback: "неделя")) \(Int(w.usedPercent.rounded()))%" }
+                }
+                item(line, nil)
+            case .signedOut: item("Войти в Codex через ChatGPT…", #selector(codexSignIn))
+            case .signingIn: item("Codex: вход в браузере…", nil)
+            case .noBinary: item("Codex: не найден", nil)
+            case .failed: item("Codex: ошибка (см. окно)", nil)
+            case .starting: item("Codex: запуск…", nil)
+            case .off: break
+            }
+        }
         menu.addItem(.separator())
         item("Открыть Capri", #selector(openDashboard), key: "o")
         item("Показать notch-панель", #selector(showNotch))
@@ -163,6 +190,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func showNotch() { notch.go(.expanded, reason: "menu") }
     @objc private func toggleSound() { settings.sound.toggle() }
+    @objc private func codexSignIn() { codex.signIn() }
     @objc private func openSettings() { openWindow(); windowUI.settings = true }
     @objc private func quit() { NSApplication.shared.terminate(nil) }
 
@@ -219,7 +247,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             open: { [weak self] key in self?.store.openTerminal(key) })
         let settings = settings, bridge = characterBridge, ui = windowUI
         let active = store.hosts.map(\.name).filter { $0 != "local" }
-        let view = MainWindowView(store: store, ui: windowUI, actions: actions) {
+        let view = MainWindowView(store: store, ui: windowUI, codex: codex, actions: actions) {
             AnyView(SettingsView(settings: settings, character: bridge, active: active) { ui.settings = false })
         }
         let hostingView = NSHostingView(rootView: view)

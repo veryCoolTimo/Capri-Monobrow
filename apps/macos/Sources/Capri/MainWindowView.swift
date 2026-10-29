@@ -8,7 +8,11 @@ final class WindowUI: ObservableObject {
     /// nil — все хосты.
     @Published var host: String?
     @Published var drafts: [SessionKey: String] = [:]
+    /// Почему черновик от Codex не получился.
+    @Published var draftError: [SessionKey: String] = [:]
     @Published var settings = false
+    /// Справа чат с Codex вместо выбранной сессии.
+    @Published var chatOpen = false
 }
 
 /// Действия окна → AppDelegate (те же пути, что у notch).
@@ -22,6 +26,7 @@ struct WindowActions {
 struct MainWindowView: View {
     @ObservedObject var store: SessionStore
     @ObservedObject var ui: WindowUI
+    var codex: CodexService
     var actions: WindowActions
     var settings: () -> AnyView
 
@@ -41,8 +46,10 @@ struct MainWindowView: View {
             list.frame(width: 300)
             Rectangle().fill(Palette.line.opacity(0.5)).frame(width: 1)
             Group {
-                if let s = selected {
-                    SessionDetailView(store: store, details: store.details, ui: ui, session: s, actions: actions)
+                if ui.chatOpen {
+                    CodexChatView(codex: codex, store: store)
+                } else if let s = selected {
+                    SessionDetailView(store: store, details: store.details, codex: codex, ui: ui, session: s, actions: actions)
                         .id(s.key)
                 } else {
                     VStack(spacing: 10) {
@@ -80,6 +87,7 @@ struct MainWindowView: View {
             ForEach(store.hosts) { h in hostRow(h) }
 
             Spacer()
+            CodexPanel(codex: codex, ui: ui).padding(.bottom, 12)
             Button { ui.settings = true } label: {
                 HStack {
                     Image(systemName: "slider.horizontal.3")
@@ -99,7 +107,7 @@ struct MainWindowView: View {
 
     private func filterRow(_ f: SessionFilter, _ title: String, count: Int, color: Color) -> some View {
         let on = ui.filter == f
-        return Button { ui.filter = f } label: {
+        return Button { ui.filter = f; ui.chatOpen = false } label: {
             HStack {
                 Rectangle().fill(on ? color : Color.clear).frame(width: 2, height: 12)
                 Caps(title, size: 9.5, color: on ? Palette.text : Palette.dim, weight: on ? .bold : .semibold)
@@ -183,6 +191,7 @@ struct MainWindowView: View {
         let color = s.statusColor
         return Button {
             ui.selected = s.key
+            ui.chatOpen = false
             store.clearDelivery(s.key)
         } label: {
             VStack(alignment: .leading, spacing: 3) {
@@ -198,8 +207,8 @@ struct MainWindowView: View {
                     if s.tmux == nil { Caps("без tmux", size: 7.5) }
                 }
                 .padding(.leading, 15)
-                if s.headline != s.statusLabel {
-                    Text(s.headline).font(.system(size: 10.5)).foregroundColor(Palette.text.opacity(0.7))
+                if let line = store.summary(s) ?? (s.headline != s.statusLabel ? s.headline : nil) {
+                    Text(line).font(.system(size: 10.5)).foregroundColor(Palette.text.opacity(0.7))
                         .lineLimit(2).padding(.leading, 15)
                 }
             }
@@ -233,6 +242,7 @@ struct SessionDetailView: View {
     @ObservedObject var store: SessionStore
     /// Не @ObservedObject: экран и историю перерисовывают свои вложенные виды, а не вся карточка.
     var details: DetailStore
+    @ObservedObject var codex: CodexService
     @ObservedObject var ui: WindowUI
     var session: Session
     var actions: WindowActions
@@ -291,6 +301,7 @@ struct SessionDetailView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 8).padding(.vertical, 5)
                 .background(Color.black.opacity(0.55))
+            if let summary = store.summary(s) { CodexSummaryLine(text: summary, size: 11.5) }
             if !choices.isEmpty {
                 FlowButtons(choices: choices, enabled: !store.deliveries.isBusy(s.key)) { n in
                     actions.send(s.key, .choose(n))
@@ -318,10 +329,31 @@ struct SessionDetailView: View {
                 }
                 .padding(.horizontal, 9).padding(.vertical, 7)
                 .hud(fill: Color.black.opacity(0.5), cut: 7)
+                button(codex.drafting == s.key ? "codex думает…" : "черновик ✦", enabled: codex.isReady && codex.drafting == nil) {
+                    makeDraft()
+                }
+                .help(codex.isReady ? "Codex предложит ответ в поле — отправляете вы" : "Codex не подключён")
                 button("отправить ⏎", enabled: refusal == nil && !text.isEmpty) { submit(text) }
             }
             if let h = store.hint(s) {
                 Text(h.text).font(.system(size: 10)).foregroundColor(h.color).lineLimit(2)
+            }
+            if let e = ui.draftError[s.key] {
+                Text(e).font(.system(size: 10)).foregroundColor(Palette.crimson).lineLimit(2)
+            }
+        }
+    }
+
+    private func makeDraft() {
+        let key = s.key
+        ui.draftError[key] = nil
+        codex.draft(key) { [ui] r in
+            switch r {
+            case .success(let t) where !t.isEmpty:
+                // Не затираем то, что человек успел набрать сам.
+                if (ui.drafts[key] ?? "").isEmpty { ui.drafts[key] = t } else { ui.drafts[key] = (ui.drafts[key] ?? "") + "\n" + t }
+            case .failure(let e): ui.draftError[key] = "черновик: " + CodexService.message(e)
+            default: break
             }
         }
     }
@@ -346,7 +378,7 @@ struct SessionDetailView: View {
         switch kind {
         case .attention: return Palette.acid
         case .problem: return Palette.crimson
-        case .reply: return Color(red: 0.68, green: 0.6, blue: 1.0)
+        case .reply: return Palette.text
         case .tools: return Palette.dim
         case .info: return Palette.text.opacity(0.8)
         }
