@@ -380,3 +380,136 @@ class FollowerTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SCREENS = os.path.join(HERE, "..", "..", "apps", "macos", "Tests", "CapriKitTests", "Fixtures", "screens-ansi")
+
+
+def screen_fixture(name):
+    with open(os.path.join(SCREENS, name + ".ansi"), encoding="utf-8") as f:
+        return [ch.styled(l) for l in f.read().split("\n") if ch.styled(l)[0].strip()][-22:]
+
+
+class ScreenParseTests(unittest.TestCase):
+    """Разбор экрана в send должен совпадать с ScreenClassifier в Capri (те же фикстуры)."""
+
+    def plain(self, name):
+        return [r[0] for r in screen_fixture(name)]
+
+    def test_modes(self):
+        for name in ["claude-permission", "claude-ask-question", "claude-trust-folder", "codex-permission"]:
+            self.assertEqual(ch.screen_mode(self.plain(name)), "dialog", name)
+        for name in ["claude-running", "codex-running"]:
+            self.assertEqual(ch.screen_mode(self.plain(name)), "running", name)
+        for name in ["claude-idle-suggestion", "claude-typed", "codex-typed", "claude-denied", "codex-idle"]:
+            self.assertEqual(ch.screen_mode(self.plain(name)), "prompt", name)
+
+    def test_typed_text_ignores_grey_suggestion(self):
+        self.assertEqual(ch.typed_text(screen_fixture("claude-typed")), "hello typed text")
+        self.assertEqual(ch.typed_text(screen_fixture("claude-idle-suggestion")), "")
+        self.assertEqual(ch.typed_text(screen_fixture("claude-fresh-placeholder")), "")
+        self.assertEqual(ch.typed_text(screen_fixture("codex-fresh-placeholder")), "")
+        self.assertTrue(ch.typed_text(screen_fixture("codex-typed")))
+
+    def test_dialog_options_and_cursor(self):
+        for name, count in [("claude-permission", 4), ("codex-permission", 3), ("claude-ask-question", 4),
+                            ("claude-trust-folder", 2)]:
+            rows, cursor = ch.dialog_options(self.plain(name))
+            self.assertEqual((len(rows), cursor), (count, 0), name)
+
+    def test_numbered_list_above_dialog_is_not_an_option(self):
+        plain = ["1. first step from the answer", "2. second step", "Do you want to proceed?",
+                 "❯ 1. Yes", "  2. No", "Esc to cancel"]
+        rows, cursor = ch.dialog_options(plain)
+        self.assertEqual(rows, [3, 4])
+        self.assertEqual(cursor, 0)
+
+
+PANE_PROGRAM = r"""
+import os, sys, tty
+with open(sys.argv[1]) as f:
+    sys.stdout.write(f.read())
+sys.stdout.write("\x1b[?2004h")    # как Claude/Codex: включить bracketed paste
+sys.stdout.flush()
+tty.setraw(0)
+with open(sys.argv[2], "ab", buffering=0) as f:
+    while True:
+        b = os.read(0, 1024)
+        if not b:
+            break
+        f.write(b)
+"""
+
+
+@unittest.skipUnless(shutil.which("tmux"), "нужен tmux")
+class SendTests(Base):
+    """send в настоящем tmux (свой сервер в TMUX_TMPDIR): панель показывает экран и пишет полученные байты."""
+
+    def setUp(self):
+        Base.setUp(self)
+        # Иначе tmux возьмёт сокет из $TMUX — настоящий сервер, в котором запущены тесты.
+        self.env.pop("TMUX", None)
+        self.env.pop("TMUX_PANE", None)
+        os.makedirs(self.env["TMUX_TMPDIR"], exist_ok=True)
+        self.prog = os.path.join(self.tmp, "pane.py")
+        with open(self.prog, "w") as f:
+            f.write(PANE_PROGRAM)
+        self.log = os.path.join(self.tmp, "keys.log")
+
+    def tearDown(self):
+        if "TMUX" not in self.env:
+            subprocess.run(["tmux", "kill-server"], env=self.env, capture_output=True)
+        Base.tearDown(self)
+
+    def pane(self, screen_text):
+        path = os.path.join(self.tmp, "screen.txt")
+        with open(path, "w") as f:
+            f.write(screen_text)
+        out = subprocess.run(["tmux", "new-session", "-d", "-x", "200", "-y", "50", "-P", "-F", "#{pane_id}\t#{pane_pid}",
+                              sys.executable, self.prog, path, self.log], env=self.env, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        import time
+        time.sleep(0.6)
+        return out.stdout.strip().split("\t")
+
+    def send(self, args, stdin=b""):
+        out = subprocess.run([sys.executable, SCRIPT, "send"] + args, env=self.env, input=stdin, capture_output=True)
+        return json.loads(out.stdout.decode())
+
+    def received(self):
+        import time
+        time.sleep(0.3)
+        if not os.path.exists(self.log):
+            return b""
+        with open(self.log, "rb") as f:
+            return f.read()
+
+    def test_text_is_pasted_and_submitted(self):
+        pane, pid = self.pane("history\n❯ \x1b[2mTry \"fix lint\"\x1b[0m\n")
+        r = self.send(["--pane", pane, "--pid", pid, "--text-stdin"], "Привет, $HOME и \"кавычки\"\nвторая строка\n".encode())
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.received(), "\x1b[200~Привет, $HOME и \"кавычки\"\rвторая строка\x1b[201~\r".encode())
+
+    def test_refuses_typed_running_dialog_and_wrong_pane(self):
+        pane, pid = self.pane("❯ my draft\n")
+        self.assertEqual(self.send(["--pane", pane, "--text-stdin"], b"x")["reason"], "typed")
+        self.assertEqual(self.send(["--pane", pane, "--pid", "1", "--text-stdin"], b"x")["reason"], "pane-changed")
+        self.assertEqual(self.send(["--pane", "%999", "--text-stdin"], b"x")["reason"], "pane-gone")
+        self.assertEqual(self.send(["--pane", "%1;rm", "--text-stdin"], b"x")["reason"], "usage")
+        self.assertEqual(self.send(["--pane", pane, "--choose", "1"])["reason"], "no-dialog")
+        pane2, _ = self.pane("✻ Working… (3s · esc to interrupt)\n❯ \n")
+        self.assertEqual(self.send(["--pane", pane2, "--text-stdin"], b"x")["reason"], "running")
+        self.assertEqual(self.received(), b"")
+
+    def test_choose_moves_cursor_then_enter(self):
+        with open(os.path.join(SCREENS, "claude-permission.ansi"), encoding="utf-8") as f:
+            screen = f.read()
+        pane, pid = self.pane(screen)
+        self.assertEqual(self.send(["--pane", pane, "--text-stdin"], b"x")["reason"], "dialog")
+        r = self.send(["--pane", pane, "--pid", pid, "--choose", "4"])
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((r["moves"], r["label"]), (3, "No"))
+        keys = self.received()
+        self.assertEqual(keys.count(b"B"), 3, keys)
+        self.assertTrue(keys.endswith(b"\r"), keys)
+        self.assertEqual(self.send(["--pane", pane, "--choose", "9"])["reason"], "no-option")

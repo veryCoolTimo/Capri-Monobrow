@@ -39,8 +39,8 @@ final class EventDecodingTests: XCTestCase {
     func testStreamMessages() {
         XCTAssertEqual(StreamMessage.decode(line: #"{"kind":"snapshot-end","ts":1,"now":7}"#), .snapshotEnd(now: 7))
         XCTAssertEqual(StreamMessage.decode(line: #"{"kind":"hello","proto":1,"version":2,"host":"h","now":5}"#),
-                       .hello(host: "h", proto: 1, now: 5))
-        XCTAssertEqual(StreamMessage.decode(line: #"{"kind":"hello","host":"h"}"#), .hello(host: "h", proto: 0, now: nil))
+                       .hello(host: "h", proto: 1, version: 2, now: 5))
+        XCTAssertEqual(StreamMessage.decode(line: #"{"kind":"hello","host":"h"}"#), .hello(host: "h", proto: 0, version: 0, now: nil))
         XCTAssertEqual(StreamMessage.decode(line: #"{"kind":"panes","ts":1,"panes":null}"#), .panes(nil))
         let screen = StreamMessage.decode(line: #"{"kind":"screen","ts":5,"pane":"%3","session":"s","command":"bash","agent":"claude","lines":["a"]}"#)
         XCTAssertEqual(screen, .screen(pane: "%3", agent: .claude, lines: ["a"], ts: 5))
@@ -149,6 +149,21 @@ final class SessionReducerTests: XCTestCase {
         XCTAssertEqual(s.request?.summary, "date > stamp.txt")
         XCTAssertEqual(effects, [.notifyNeedsInput(s.key)])
         XCTAssertEqual(state.waiting.map(\.key), [s.key])
+    }
+
+    func testHookPermissionGetsOptionsFromScreen() {
+        var state = CapriState()
+        let claude = live.filter { $0.agent == .claude }
+        _ = run(Array(claude.prefix(3)), into: &state)
+        var s = session(state, .claude)
+        let effects = SessionReducer.reduce(&state, .screen(host: "server", pane: s.tmux!.pane, agent: .claude,
+                                                            lines: Fixtures.screen("claude-permission"), ts: s.statusSince + 2))
+        s = session(state, .claude)
+        XCTAssertEqual(s.request?.summary, "date > stamp.txt")      // текст из хука остаётся
+        XCTAssertEqual(s.request?.choices.map(\.label).first, "Yes")
+        XCTAssertEqual(s.request?.choices.map(\.index), [1, 2, 3, 4])
+        XCTAssertEqual(s.confidence, .hook)
+        XCTAssertTrue(effects.isEmpty)
     }
 
     func testFollowingNotificationDoesNotNotifyAgainAndAnswerResumes() {
@@ -358,5 +373,68 @@ final class BackoffTests: XCTestCase {
         var b = Backoff(base: 1, cap: 30, stableAfter: 60)
         XCTAssertEqual((0..<7).map { _ in b.next(afterUptime: 1) }, [1, 2, 4, 8, 16, 30, 30])
         XCTAssertEqual(b.next(afterUptime: 120), 1)
+    }
+}
+
+
+final class ReplyTests: XCTestCase {
+    func waiting(options: [String] = ["1 Yes", "2 No"], typed: String? = nil, status: SessionStatus = .needsInput) -> Session {
+        Session(key: SessionKey(host: "h", agent: .claude, id: "s"), tmux: TmuxRef(pane: "%5", session: "x", pid: "42"),
+                cwd: "/p", status: status, confidence: .hook, statusSince: 0, lastEventAt: 0,
+                request: status == .needsInput ? PendingRequest(kind: .permission, summary: "rm x", options: options) : nil,
+                lastMessage: nil, typedInput: typed)
+    }
+
+    func testChoicesFromScreenAndHook() {
+        XCTAssertEqual(PendingRequest(kind: .question, summary: "?", options: ["Red", "Green"]).choices,
+                       [ReplyChoice(index: 1, label: "Red"), ReplyChoice(index: 2, label: "Green")])
+        XCTAssertEqual(PendingRequest(kind: .permission, summary: "?", options: ["1 Yes", "2 Yes, and don't ask"]).choices.map(\.label),
+                       ["Yes", "Yes, and don't ask"])
+    }
+
+    func testGuard() {
+        let ok = waiting()
+        XCTAssertNil(Reply.check(ok, .choose(2), hostConnected: true, hookVersion: 3))
+        XCTAssertEqual(Reply.check(ok, .choose(3), hostConnected: true, hookVersion: 3), .noOption)
+        XCTAssertEqual(Reply.check(ok, .text("hi"), hostConnected: true, hookVersion: 3), .dialogOpen)
+        XCTAssertEqual(Reply.check(ok, .choose(1), hostConnected: false, hookVersion: 3), .hostOffline)
+        XCTAssertEqual(Reply.check(ok, .choose(1), hostConnected: true, hookVersion: 2), .hookOutdated)
+        XCTAssertEqual(Reply.check(waiting(status: .running), .text("hi"), hostConnected: true, hookVersion: 3), .running)
+        XCTAssertEqual(Reply.check(waiting(status: .idle), .choose(1), hostConnected: true, hookVersion: 3), .notWaiting)
+        XCTAssertEqual(Reply.check(waiting(typed: "draft", status: .idle), .text("hi"), hostConnected: true, hookVersion: 3), .typed("draft"))
+        XCTAssertEqual(Reply.check(waiting(status: .idle), .text("  \n"), hostConnected: true, hookVersion: 3), .empty)
+        XCTAssertNil(Reply.check(waiting(status: .idle), .text("сделай X"), hostConnected: true, hookVersion: 3))
+        var noTmux = waiting(); noTmux.tmux = nil
+        XCTAssertEqual(Reply.check(noTmux, .choose(1), hostConnected: true, hookVersion: 3), .noTmux)
+    }
+
+    func testCommandKeepsTextOutOfArgv() {
+        let s = waiting(status: .idle)
+        XCTAssertEqual(Reply.arguments(s, .text("rm -rf '$HOME'")), ["send", "--pane", "%5", "--pid", "42", "--text-stdin"])
+        XCTAssertEqual(Reply.arguments(s, .choose(2)), ["send", "--pane", "%5", "--pid", "42", "--choose", "2"])
+        var bad = s; bad.tmux = TmuxRef(pane: "%5; rm -rf ~")
+        XCTAssertNil(Reply.arguments(bad, .choose(1)))
+        let ssh = HostSource.ssh("timoserver").command(Reply.arguments(s, .choose(2))!)
+        XCTAssertEqual(ssh.last, "python3 ~/.capri/bin/capri-hook send --pane %5 --pid 42 --choose 2")
+        XCTAssertEqual(shellQuote("it's"), "'it'\\''s'")
+    }
+
+    func testParseResult() {
+        func out(_ s: String) -> HostCommand.Output { HostCommand.Output(status: 0, stdout: s, stderr: "", timedOut: false) }
+        XCTAssertNil(Reply.parseResult(out(#"{"ok":true,"sent":"text"}"# + "\n")))
+        XCTAssertEqual(Reply.parseResult(out(#"{"ok":false,"reason":"typed","detail":"abc"}"#)), .typed("abc"))
+        XCTAssertEqual(Reply.parseResult(out(#"{"ok":false,"reason":"pane-changed"}"#)), .paneChanged)
+        XCTAssertEqual(Reply.parseResult(HostCommand.Output(status: 255, stdout: "", stderr: "ssh: connect refused\n", timedOut: false)),
+                       .failed("ssh: connect refused"))
+    }
+
+    func testHostCommandRunsWithStdin() {
+        let done = expectation(description: "run")
+        HostCommand.run(["/bin/sh", "-c", "tr a-z A-Z"], stdin: Data("привет abc".utf8)) { out in
+            XCTAssertEqual(out.status, 0)
+            XCTAssertEqual(out.stdout, "привет ABC")
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
     }
 }

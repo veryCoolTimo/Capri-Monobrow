@@ -104,7 +104,7 @@ public enum StreamMessage: Equatable {
     /// Версия протокола, которую понимает этот Capri.
     public static let proto = 1
 
-    case hello(host: String, proto: Int, now: Double?)
+    case hello(host: String, proto: Int, version: Int, now: Double?)
     case event(CapriEvent, replay: Bool)
     case panes([PaneInfo]?)
     case screen(pane: String, agent: Agent?, lines: [String], ts: Double)
@@ -122,13 +122,14 @@ public enum StreamMessage: Equatable {
         var lines: [String]?
         var ts: Double?
         var proto: Int?
+        var version: Int?
         var now: Double?
     }
 
     public static func decode(line: String) -> StreamMessage? {
         guard let d = line.data(using: .utf8), let raw = try? JSONDecoder().decode(Raw.self, from: d) else { return nil }
         switch raw.kind {
-        case "hello": return .hello(host: raw.host ?? "", proto: raw.proto ?? 0, now: raw.now)
+        case "hello": return .hello(host: raw.host ?? "", proto: raw.proto ?? 0, version: raw.version ?? 0, now: raw.now)
         case "event": return raw.event.map { .event($0, replay: raw.replay ?? false) }
         case "panes": return .panes(raw.panes)
         case "screen":

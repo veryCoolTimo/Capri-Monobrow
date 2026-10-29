@@ -8,6 +8,10 @@
                                       для Capri: снимок (последние события, панели tmux, экраны)
                                       и дальше поток новых строк; JSON по строке в stdout.
                                       --only-sessions — только tmux-сессии с этим префиксом (тесты)
+  capri-hook send --pane %N [--pid PID] (--text-stdin | --choose N)
+                                      ответ из Capri: текст из stdin + Enter или вариант диалога N
+                                      (стрелками от курсора + Enter). Проверяет панель и экран прямо
+                                      перед вводом; результат — одна строка JSON
   capri-hook install|uninstall|status [--dry-run] [--no-claude] [--no-codex] [--codex-notify]
 
 Хук-режим ничего не печатает, всегда выходит с 0 и укладывается в десятки миллисекунд:
@@ -29,7 +33,7 @@ import time
 import uuid
 import shlex
 
-VERSION = 2          # версия скрипта
+VERSION = 3          # версия скрипта; 3 — режим send
 PROTO = 1            # версия протокола stream и формата строки журнала
 # Наша запись — команда, где исполняемый файл называется capri-hook (путь может быть любым,
 # в том числе в кавычках shlex.quote).
@@ -915,6 +919,215 @@ def option(args, name):
     return None
 
 
+# ---------------------------------------------------------------- ответ в сессию
+
+PANE_RE = re.compile(r"^%\d+$")
+OPTION_RE = re.compile(r"^\s*(?:[❯›>]\s*)?(\d)\.\s+(.+?)\s*$")
+CURSORS = ("❯", "›")      # ❯ у Claude, › у Codex
+SGR_RE = re.compile(r"\x1b\[([0-9;:]*)([@-~])")
+SEND_LOCK_TIMEOUT = 3.0
+KEY_PAUSE = 0.06
+
+
+def styled(line):
+    """Строка без ANSI и маска «серый/dim» по символам — как ScreenClassifier.parseANSI в Capri."""
+    text, mask = [], []
+    dim = grey = False
+    pos = 0
+    for m in SGR_RE.finditer(line):
+        chunk = line[pos:m.start()]
+        text.append(chunk)
+        mask.extend([dim or grey] * len(chunk))
+        pos = m.end()
+        if m.group(2) != "m":
+            continue
+        codes = [int(c) if c.isdigit() else 0 for c in (m.group(1) or "0").split(";")]
+        i = 0
+        while i < len(codes):
+            c = codes[i]
+            if c == 0:
+                dim = grey = False
+            elif c == 2:
+                dim = True
+            elif c == 22:
+                dim = False
+            elif c == 39:
+                grey = False
+            elif c == 90:
+                grey = True
+            elif 30 <= c <= 37 or 91 <= c <= 97:
+                grey = False
+            elif c in (38, 48, 58):
+                if i + 2 < len(codes) and codes[i + 1] == 5:
+                    if c == 38:
+                        grey = 240 <= codes[i + 2] <= 250
+                    i += 2
+                elif i + 4 < len(codes) and codes[i + 1] == 2:
+                    i += 4
+            i += 1
+    chunk = line[pos:]
+    text.append(chunk)
+    mask.extend([dim or grey] * len(chunk))
+    return "".join(text), mask
+
+
+def screen_rows(pane):
+    raw = capture_screen(pane, lines=60)
+    if raw is None:
+        return None
+    rows = [styled(r) for r in raw]
+    return [r for r in rows if r[0].strip()][-22:]
+
+
+def screen_mode(plain):
+    """dialog | running | prompt — в том же порядке проверок, что ScreenClassifier в Capri."""
+    bottom = "\n".join(plain[-4:]).lower()
+    numbered = any(OPTION_RE.match(r) for r in plain)
+    if ("esc to cancel" in bottom and (numbered or "enter to confirm" in bottom)) \
+            or "press enter to confirm or esc to cancel" in bottom:
+        return "dialog"
+    if "esc to interrupt" in "\n".join(plain[-8:]).lower():
+        return "running"
+    return "prompt"
+
+
+def typed_text(rows):
+    """Набранный в строке ввода текст без серой подсказки; None — строки ввода не видно."""
+    for text, mask in reversed(rows):
+        stripped = text.lstrip()
+        if stripped[:1] in CURSORS:
+            start = len(text) - len(stripped)
+            typed = "".join(ch for ch, dimmed in zip(text[start + 1:], mask[start + 1:]) if not dimmed)
+            return typed.strip("  ")
+    return None
+
+
+def dialog_options(plain):
+    """Строки вариантов текущего диалога (индексы в plain) и позиция курсора среди них."""
+    # Нумерованные: последняя серия 1..k снизу вверх (выше могут быть списки из ответа агента).
+    picked, want = [], None
+    for i in range(len(plain) - 1, -1, -1):
+        m = OPTION_RE.match(plain[i])
+        if not m:
+            continue
+        n = int(m.group(1))
+        if want is None or n == want:
+            picked.append((i, n))
+            want = n - 1
+            if n == 1:
+                break
+    if picked and picked[-1][1] == 1:
+        picked.reverse()
+        rows = [i for i, _ in picked]
+    else:
+        # Меню без номеров (доверие к папке): строка с курсором и соседние с тем же отступом.
+        end = next((i for i in range(len(plain) - 1, -1, -1) if "enter to confirm" in plain[i].lower()), None)
+        cur = next((i for i in range(end - 1, -1, -1) if plain[i].lstrip().startswith(CURSORS)), None) \
+            if end is not None else None
+        if cur is None:
+            return [], None
+        indent = lambda r: len(r) - len(r.lstrip(" "))
+        col = indent(plain[cur]) + 2
+        first, last = cur, cur
+        while first > 0 and indent(plain[first - 1]) == col:
+            first -= 1
+        while last + 1 < end and indent(plain[last + 1]) == col:
+            last += 1
+        rows = list(range(first, last + 1))
+    cursor = next((k for k, i in enumerate(rows) if plain[i].lstrip().startswith(CURSORS)), None)
+    return rows, cursor
+
+
+def tmux_ok(*args, **kw):
+    out = subprocess.run([tmux_bin()] + list(args), capture_output=True, timeout=3, **kw)
+    if out.returncode != 0:
+        raise SendError("tmux", (out.stderr or b"").decode("utf-8", "replace").strip()[:200])
+
+
+class SendError(Exception):
+    def __init__(self, reason, detail=""):
+        Exception.__init__(self, reason)
+        self.reason = reason
+        self.detail = detail
+
+
+def run_send(args):
+    try:
+        result = _run_send(args)
+    except SendError as e:
+        result = {"ok": False, "reason": e.reason, "detail": e.detail}
+    except Exception as e:      # ответ Capri всегда одной строкой JSON
+        result = {"ok": False, "reason": "error", "detail": str(e)[:200]}
+    print(dumps(result))
+    return 0 if result.get("ok") else 1
+
+
+def _run_send(args):
+    pane = option(args, "--pane") or ""
+    pid = option(args, "--pid")
+    choose = option(args, "--choose")
+    text = None
+    if "--text-stdin" in args:
+        text = sys.stdin.buffer.read().decode("utf-8", "replace").rstrip()
+        if not text:
+            raise SendError("empty")
+    if not PANE_RE.match(pane) or (pid is not None and not pid.isdigit()) \
+            or (text is None) == (choose is None) or (choose is not None and not choose.isdigit()):
+        raise SendError("usage")
+    try:
+        info = subprocess.run([tmux_bin(), "display", "-p", "-t", pane, "#{pane_id}\t#{pane_pid}\t#{pane_dead}"],
+                              capture_output=True, text=True, timeout=2)
+    except Exception as e:
+        raise SendError("tmux", str(e)[:200])
+    parts = info.stdout.strip().split("\t")
+    if info.returncode != 0 or len(parts) < 3 or parts[0] != pane or parts[2] == "1":
+        raise SendError("pane-gone")
+    # tmux переиспользует %N после перезапуска сервера: pid отличает «ту же» панель.
+    if pid and parts[1] != pid:
+        raise SendError("pane-changed")
+
+    ensure_capri_dir(capri_dir())
+    with open(os.path.join(capri_dir(), "send.lock"), "a") as lf:
+        # Один писатель: два ответа подряд в одну панель не должны перемешаться.
+        if not lock(lf.fileno(), SEND_LOCK_TIMEOUT):
+            raise SendError("busy")
+        rows = screen_rows(pane)
+        if rows is None:
+            raise SendError("pane-gone")
+        plain = [r[0] for r in rows]
+        mode = screen_mode(plain)
+        if mode == "running":
+            raise SendError("running")
+        if choose is not None:
+            if mode != "dialog":
+                raise SendError("no-dialog")
+            options, cursor = dialog_options(plain)
+            target = int(choose) - 1
+            if cursor is None or not 0 <= target < len(options):
+                raise SendError("no-option", "%d вариантов" % len(options))
+            delta = target - cursor
+            for _ in range(abs(delta)):
+                tmux_ok("send-keys", "-t", pane, "Down" if delta > 0 else "Up")
+                time.sleep(KEY_PAUSE)
+            tmux_ok("send-keys", "-t", pane, "Enter")
+            return {"ok": True, "sent": "choose", "moves": delta,
+                    "label": OPTION_RE.sub(r"\2", plain[options[target]]).lstrip("".join(CURSORS) + " ")[:80]}
+        if mode == "dialog":
+            raise SendError("dialog")
+        typed = typed_text(rows)
+        if typed is None:
+            raise SendError("no-prompt")
+        if typed:
+            raise SendError("typed", typed[:80])
+        buf = "capri-%d" % os.getpid()
+        tmux_ok("load-buffer", "-b", buf, "-", input=text.encode("utf-8"))
+        # -p: bracketed paste — многострочный текст не отправится по частям; -d: удалить буфер.
+        tmux_ok("paste-buffer", "-p", "-d", "-b", buf, "-t", pane)
+        time.sleep(0.15)
+        tmux_ok("send-keys", "-t", pane, "Enter")
+        return {"ok": True, "sent": "text", "chars": len(text)}
+
+
 def main(argv):
     if not argv:
         sys.stderr.write(__doc__)
@@ -928,6 +1141,8 @@ def main(argv):
         global SESSION_PREFIX
         SESSION_PREFIX = option(rest, "--only-sessions")
         return run_stream(once="--once" in rest, replay="--no-replay" not in rest)
+    if mode == "send":
+        return run_send(rest)
     if mode == "install":
         return run_install(rest, install=True)
     if mode == "uninstall":

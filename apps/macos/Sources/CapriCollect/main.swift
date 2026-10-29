@@ -2,7 +2,7 @@
 // Подключается к хостам (`capri-hook stream` локально или по ssh), гонит события через
 // SessionReducer и печатает переходы статусов с задержкой «событие на хосте → состояние в Capri».
 //
-//   CapriCollect --ssh timoserver [--ssh-cmd 'python3 ~/x/capri-hook stream'] --local [--local-cmd '...']
+//   CapriCollect --ssh timoserver [--hook 'python3 ~/x/capri-hook'] --local [--hook '...'] [--only-sessions capri-test-]
 //   --state PATH   куда писать снимок состояния (JSON, права 0600), по умолчанию $TMPDIR/capri-state.json
 //   --seconds N    выйти через N секунд
 // Выход: Ctrl-C.
@@ -12,17 +12,19 @@ import CapriKit
 var sources: [HostSource] = []
 var statePath = (NSTemporaryDirectory() as NSString).appendingPathComponent("capri-state.json")
 var seconds: Double?
+var onlySessions: String?
 var args = Array(CommandLine.arguments.dropFirst())
 while !args.isEmpty {
     let a = args.removeFirst()
     switch a {
     case "--ssh":
-        let host = args.removeFirst()
-        if args.first == "--ssh-cmd" { args.removeFirst(); sources.append(.ssh(host, remoteCommand: args.removeFirst())) }
-        else { sources.append(.ssh(host)) }
+        sources.append(.ssh(args.removeFirst()))
     case "--local":
-        if args.first == "--local-cmd" { args.removeFirst(); sources.append(.local(hookCommand: args.removeFirst())) }
-        else { sources.append(.local()) }
+        sources.append(.local())
+    case "--hook":
+        guard !sources.isEmpty else { FileHandle.standardError.write("--hook идёт после --ssh/--local\n".data(using: .utf8)!); exit(2) }
+        sources[sources.count - 1].hook = args.removeFirst()
+    case "--only-sessions": onlySessions = args.removeFirst()
     case "--state": statePath = args.removeFirst()
     case "--seconds": seconds = Double(args.removeFirst())
     default:
@@ -31,6 +33,7 @@ while !args.isEmpty {
     }
 }
 if sources.isEmpty { sources = [.local()] }
+if let onlySessions { for i in sources.indices { sources[i].streamArgs = ["--only-sessions", onlySessions] } }
 
 setvbuf(stdout, nil, _IOLBF, 0)
 var state = CapriState()

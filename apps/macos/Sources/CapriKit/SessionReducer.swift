@@ -240,8 +240,11 @@ public enum SessionReducer {
                 state.pendingIdle[key] = nil
                 if s.status == .running || s.status == .idle {
                     set(&s, .needsInput, ts); s.confidence = .inferred
-                    s.request = PendingRequest(kind: d.kind == .question ? .question : .permission,
-                                               summary: d.title ?? "Нужен ответ", options: d.options.map { "\($0.key) \($0.label)" })
+                    s.request = screenRequest(d)
+                } else if s.status == .needsInput, ts >= s.statusSince, var r = s.request, r.options.isEmpty {
+                    // Хук PermissionRequest не даёт вариантов — берём их с экрана, текст запроса оставляем из хука.
+                    r.options = d.options.map { "\($0.key) \($0.label)" }
+                    s.request = r
                 }
             case .running:
                 state.pendingIdle[key] = nil
@@ -264,18 +267,22 @@ public enum SessionReducer {
         case .running: set(&s, .running, ts); s.request = nil; s.typedInput = nil
         case .dialog(let d):
             set(&s, .needsInput, ts)
-            s.request = PendingRequest(kind: d.kind == .question ? .question : .permission,
-                                       summary: d.title ?? "Нужен ответ", options: d.options.map { "\($0.key) \($0.label)" })
+            s.request = screenRequest(d)
         case .idle(let typed): set(&s, .idle, ts); s.request = nil; s.typedInput = typed
         case .unknown: break
         }
         s.lastEventAt = ts
         if let p = state.hosts[host]?.panes?.first(where: { $0.pane == pane }) {
-            s.tmux = TmuxRef(pane: pane, session: p.session, window: p.window)
+            s.tmux = TmuxRef(pane: pane, session: p.session, window: p.window, pid: p.pid.isEmpty ? nil : p.pid)
             if !p.path.isEmpty { s.cwd = p.path }
         }
         state.sessions[key] = s
         return transitionEffects(key: key, before: before, after: s.status, replay: false)
+    }
+
+    static func screenRequest(_ d: DialogInfo) -> PendingRequest {
+        PendingRequest(kind: d.kind == .question ? .question : .permission,
+                       summary: d.title ?? "Нужен ответ", options: d.options.map { "\($0.key) \($0.label)" })
     }
 
     static func applyTick(_ state: inout CapriState, now: Double) -> [CapriEffect] {

@@ -22,30 +22,6 @@ public struct Backoff: Equatable {
     public mutating func reset() { attempt = 0 }
 }
 
-/// Откуда брать поток событий одного хоста.
-public struct HostSource: Equatable {
-    public var name: String
-    /// Полная команда: локально `python3 ~/.capri/bin/capri-hook stream`, удалённо через ssh.
-    public var command: [String]
-
-    public init(name: String, command: [String]) { self.name = name; self.command = command }
-
-    public static let defaultRemoteCommand = "python3 ~/.capri/bin/capri-hook stream"
-
-    public static func local(name: String = "local", hookCommand: String? = nil) -> HostSource {
-        let cmd = hookCommand ?? "/usr/bin/python3 \"$HOME/.capri/bin/capri-hook\" stream"
-        // `exec env …` — чтобы работали префиксы `VAR=… cmd` и процесс-потомок не пережил остановку.
-        return HostSource(name: name, command: ["/bin/sh", "-c", "exec /usr/bin/env " + cmd])
-    }
-
-    public static func ssh(_ host: String, name: String? = nil, remoteCommand: String = defaultRemoteCommand) -> HostSource {
-        HostSource(name: name ?? host, command: [
-            "/usr/bin/ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "--", host, remoteCommand,
-        ])
-    }
-}
-
 /// Держит одно соединение `capri-hook stream` и превращает его вывод во входы reducer'а.
 ///
 /// - Переподключается с backoff; молчание дольше `staleAfter` (нет heartbeat) — тоже обрыв.
@@ -60,6 +36,8 @@ public final class HostCollector {
     public var onLog: ((String) -> Void)?
 
     public private(set) var connected = false
+    /// Версия capri-hook на хосте из hello (send есть с 3).
+    public private(set) var hookVersion = 0
     /// Сдвиг «часы Мака − часы хоста», секунды.
     public private(set) var clockOffset: Double = 0
     private var process: Process?
@@ -110,8 +88,9 @@ public final class HostCollector {
         generation += 1
         let gen = generation
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: source.command[0])
-        p.arguments = Array(source.command.dropFirst())
+        let command = source.command(["stream"] + source.streamArgs)
+        p.executableURL = URL(fileURLWithPath: command[0])
+        p.arguments = Array(command.dropFirst())
         let out = Pipe(), err = Pipe()
         p.standardOutput = out
         p.standardError = err
@@ -141,7 +120,7 @@ public final class HostCollector {
         do {
             try p.run()
             process = p
-            log("запуск: \(source.command.joined(separator: " "))")
+            log("запуск: \(command.joined(separator: " "))")
         } catch {
             log("не запустился: \(error)")
             detach(p)
@@ -212,7 +191,7 @@ public final class HostCollector {
     private func handle(_ msg: StreamMessage) {
         let now = Date().timeIntervalSince1970
         switch msg {
-        case let .hello(_, proto, hostNow):
+        case let .hello(_, proto, version, hostNow):
             guard proto == StreamMessage.proto else {
                 log("capri-hook на хосте говорит на протоколе \(proto), Capri ждёт \(StreamMessage.proto) — обновите хук (scripts/install-hooks.sh)")
                 terminate()
@@ -220,6 +199,7 @@ public final class HostCollector {
                 scheduleRetry()
                 return
             }
+            hookVersion = version
             syncClock(hostNow)
             if abs(clockOffset) > 2 { log(String(format: "часы хоста расходятся с Маком на %.1f с — учитываю", clockOffset)) }
         case let .snapshotEnd(hostNow):
