@@ -4,3 +4,4 @@ apps/macos/.build/
 dist/
 work/
 *.log
+refs/
