@@ -7,7 +7,9 @@ import AppKit
 /// Набор сборщиков по хостам + переподключение после сна Мака и при смене сети.
 /// Создавать и вызывать с главного потока.
 public final class CollectorSupervisor {
-    public let collectors: [HostCollector]
+    public private(set) var collectors: [HostCollector]
+    private let onInput: (CapriInput) -> Void
+    private var started = false
     private let path = NWPathMonitor()
     private var lastPathSatisfied: Bool?
     private var lastInterfaces: [String] = []
@@ -15,14 +17,40 @@ public final class CollectorSupervisor {
     public var onLog: ((String) -> Void)?
 
     public init(sources: [HostSource], onInput: @escaping (CapriInput) -> Void) {
-        collectors = sources.map(HostCollector.init(source:))
-        for c in collectors {
-            c.onInput = onInput
-            c.onLog = { [weak self] in self?.onLog?($0) }
+        self.onInput = onInput
+        collectors = []
+        collectors = sources.map(makeCollector)
+    }
+
+    private func makeCollector(_ source: HostSource) -> HostCollector {
+        let c = HostCollector(source: source)
+        c.onInput = onInput
+        c.onLog = { [weak self] in self?.onLog?($0) }
+        return c
+    }
+
+    /// Новый список хостов без перезапуска: прежние сборщики с тем же именем и способом связи остаются,
+    /// убранные останавливаются, новые запускаются. Возвращает имена убранных хостов.
+    @discardableResult
+    public func setSources(_ sources: [HostSource]) -> [String] {
+        var keep: [HostCollector] = []
+        for src in sources {
+            if let c = collectors.first(where: { $0.source.name == src.name && $0.source.transport == src.transport }) {
+                keep.append(c)
+            } else {
+                let c = makeCollector(src)
+                keep.append(c)
+                if started { c.start() }
+            }
         }
+        let removed = collectors.filter { old in !keep.contains { $0 === old } }
+        removed.forEach { $0.stop() }
+        collectors = keep
+        return removed.map(\.source.name)
     }
 
     public func start() {
+        started = true
         collectors.forEach { $0.start() }
         #if canImport(AppKit)
         observers.append(NSWorkspace.shared.notificationCenter.addObserver(
@@ -46,6 +74,7 @@ public final class CollectorSupervisor {
     }
 
     public func stop() {
+        started = false
         path.cancel()
         #if canImport(AppKit)
         observers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }

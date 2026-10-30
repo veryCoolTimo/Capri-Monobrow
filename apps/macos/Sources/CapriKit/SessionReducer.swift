@@ -341,6 +341,18 @@ public enum SessionReducer {
             }
             state.pendingIdle[key] = nil
         }
+        // Имя tmux-сессии и окно — из списка панелей: хук мог их не прислать, а сессию могли переименовать.
+        let byPane = Dictionary(panes.map { ($0.pane, $0) }, uniquingKeysWith: { a, _ in a })
+        for (key, s) in state.sessions where key.host == host && s.status != .ended {
+            guard var t = s.tmux, let p = byPane[t.pane], !p.session.isEmpty,
+                  t.pid == nil || p.pid.isEmpty || t.pid == p.pid,
+                  t.session != p.session || t.window != p.window else { continue }
+            t.session = p.session
+            t.window = p.window
+            // pid запоминаем: tmux после перезапуска сервера переиспользует номера панелей.
+            if t.pid == nil, !p.pid.isEmpty { t.pid = p.pid }
+            state.sessions[key]?.tmux = t
+        }
     }
 
     // MARK: помощники

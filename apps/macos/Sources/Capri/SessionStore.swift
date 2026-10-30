@@ -65,9 +65,16 @@ final class SessionStore: ObservableObject {
         var id: String { name }
     }
 
-    /// Не закрытые сессии: сначала ждущие (самые старые сверху), потом остальные по свежести.
+    /// Не закрытые сессии в стабильном порядке (`SessionOrder`): ждущие (самые старые сверху), работающие,
+    /// остальные; внутри группы — хост, имя tmux-сессии, окно, панель. Свежесть событий порядок не меняет.
     @Published private(set) var sessions: [Session] = []
-    @Published private(set) var hosts: [HostRow] = []
+    /// Имена для интерфейса: имя tmux-сессии и уточнение (проект, окно:панель).
+    @Published private(set) var names: [SessionKey: SessionName] = [:]
+    @Published private(set) var hosts: [HostRow] = [] { didSet { if hostList.rows != hosts { hostList.rows = hosts } } }
+    /// Те же хосты отдельным объектом — для окна настроек.
+    let hostList = HostList()
+    /// `--only-sessions` и т.п.: аргументы потока для всех хостов, в том числе добавленных из настроек.
+    private let streamArgs: [String]
     @Published private(set) var deliveries = DeliveryTracker()
     /// Сводки Codex «что спрашивает сессия» — действуют, пока запрос сессии тот же (отпечаток).
     @Published private(set) var summaries: [SessionKey: (fingerprint: String, text: String)] = [:]
@@ -88,9 +95,11 @@ final class SessionStore: ObservableObject {
     private let journal = CapriPaths.dir.appendingPathComponent("replies.jsonl")
 
     init(sources: [HostSource]) {
+        streamArgs = sources.first?.streamArgs ?? []
         supervisor = CollectorSupervisor(sources: sources) { [weak self] in self?.feed($0) }
         supervisor.onLog = { NSLog("[Capri] %@", $0) }
         hosts = sources.map { HostRow(name: $0.name, connected: false) }
+        hostList.rows = hosts   // didSet в init не срабатывает
     }
 
     func start() {
@@ -103,6 +112,25 @@ final class SessionStore: ObservableObject {
     func stop() {
         timer?.invalidate()
         supervisor.stop()
+    }
+
+    /// Список ssh-хостов из настроек — сразу, без перезапуска. Этот Mac (если был) остаётся первым.
+    func setRemoteHosts(_ names: [String]) {
+        var sources = supervisor.collectors.map(\.source).filter { $0.transport == .local }
+        sources += names.filter(HostSource.isValidAlias).map { HostSource.ssh($0, streamArgs: streamArgs) }
+        let removed = Set(supervisor.setSources(sources))
+        if !removed.isEmpty {
+            for (k, _) in state.sessions where removed.contains(k.host) {
+                state.sessions[k] = nil
+                summaries[k] = nil
+                deliveries.clear(k)
+            }
+            for k in deliveries.items.keys where removed.contains(k.host) { deliveries.clear(k) }
+            for h in removed { state.hosts[h] = nil }
+            details.prune(sessions: state.sessions, panes: state.hosts.compactMapValues(\.panes))
+            publishSessions()
+        }
+        hosts = supervisor.collectors.map { c in HostRow(name: c.source.name, connected: state.hosts[c.source.name]?.connected ?? false) }
     }
 
     func session(_ key: SessionKey) -> Session? { resolve(key).flatMap { state.sessions[$0] } }
@@ -154,15 +182,14 @@ final class SessionStore: ObservableObject {
     }
 
     private func publishSessions() {
-        sessions = state.sessions.values
-            .filter { $0.status != .ended }
-            .sorted { a, b in
-                let wa = a.status == .needsInput, wb = b.status == .needsInput
-                if wa != wb { return wa }
-                if wa { return a.statusSince < b.statusSince }
-                return a.lastEventAt > b.lastEventAt
-            }
+        let list = SessionOrder.sorted(state.sessions.values.filter { $0.status != .ended },
+                                       hosts: supervisor.collectors.map(\.source.name))
+        let n = SessionNames.names(list)
+        if n != names { names = n }
+        sessions = list
     }
+
+    func name(_ s: Session) -> SessionName { names[s.key] ?? SessionName(title: s.title) }
 
     // MARK: ответ
 
@@ -260,6 +287,10 @@ final class SessionStore: ObservableObject {
         h.write(data + Data("\n".utf8))
         try? h.close()
     }
+}
+
+final class HostList: ObservableObject {
+    @Published var rows: [SessionStore.HostRow] = []
 }
 
 /// `~/.capri` на Маке — только для владельца.

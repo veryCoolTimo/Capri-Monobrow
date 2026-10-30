@@ -10,7 +10,6 @@ final class WindowUI: ObservableObject {
     @Published var drafts: [SessionKey: String] = [:]
     /// Почему черновик от Codex не получился.
     @Published var draftError: [SessionKey: String] = [:]
-    @Published var settings = false
     /// Справа чат с Codex вместо выбранной сессии.
     @Published var chatOpen = false
 }
@@ -19,6 +18,7 @@ final class WindowUI: ObservableObject {
 struct WindowActions {
     var send: (SessionKey, ReplyAction) -> Void
     var open: (SessionKey) -> Void
+    var settings: () -> Void
 }
 
 /// Основное окно: хосты слева, список сессий с фильтрами, справа выбранная сессия —
@@ -28,7 +28,6 @@ struct MainWindowView: View {
     @ObservedObject var ui: WindowUI
     var codex: CodexService
     var actions: WindowActions
-    var settings: () -> AnyView
 
     var visible: [Session] {
         store.sessions.filter { ui.filter.matches($0) && (ui.host == nil || $0.key.host == ui.host) }
@@ -64,7 +63,6 @@ struct MainWindowView: View {
         .foregroundColor(Palette.text)
         .background(Color(red: 0.035, green: 0.03, blue: 0.04))
         .environment(\.colorScheme, .dark)
-        .sheet(isPresented: $ui.settings) { settings() }
     }
 
     // MARK: слева
@@ -88,7 +86,7 @@ struct MainWindowView: View {
 
             Spacer()
             CodexPanel(codex: codex, ui: ui).padding(.bottom, 12)
-            Button { ui.settings = true } label: {
+            Button { actions.settings() } label: {
                 HStack {
                     Image(systemName: "slider.horizontal.3")
                     Caps("настройки", size: 9, color: Palette.text)
@@ -173,6 +171,8 @@ struct MainWindowView: View {
                         ForEach(visible, id: \.key) { s in row(s) }
                     }
                     .padding(.horizontal, 8)
+                    // Порядок стабильный (SessionOrder); сессия, сменившая группу, переезжает плавно.
+                    .animation(.easeInOut(duration: 0.28), value: visible.map(\.key))
                 }
             }
         }
@@ -189,6 +189,7 @@ struct MainWindowView: View {
     private func row(_ s: Session) -> some View {
         let on = s.key == selected?.key
         let color = s.statusColor
+        let name = store.name(s)
         return Button {
             ui.selected = s.key
             ui.chatOpen = false
@@ -197,7 +198,10 @@ struct MainWindowView: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     StatusMark(status: s.status).frame(width: 9)
-                    Text(s.project).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                    Text(name.title).font(.system(size: 12, weight: .semibold)).lineLimit(1).layoutPriority(1)
+                    if let d = name.detail {
+                        Text(d).font(.mono(9.5)).foregroundColor(Palette.dim).lineLimit(1).truncationMode(.middle)
+                    }
                     Spacer(minLength: 4)
                     AgoLabel(clock: store.clock, since: s.statusSince, color: color)
                 }
@@ -266,7 +270,8 @@ struct SessionDetailView: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 StatusMark(status: s.status)
-                Text(s.project).font(.system(size: 18, weight: .semibold))
+                Text(store.name(s).title).font(.system(size: 18, weight: .semibold))
+                if let d = store.name(s).detail { Text(d).font(.mono(11)).foregroundColor(Palette.dim) }
                 Caps(s.statusLabel, size: 9, color: s.statusColor, weight: .bold)
                 AgoLabel(clock: store.clock, since: s.statusSince, color: s.statusColor)
                 Spacer()
@@ -275,7 +280,7 @@ struct SessionDetailView: View {
             }
             HStack(spacing: 10) {
                 Caps(s.hostLabel, size: 8)
-                if let t = s.tmux { Caps("tmux \(t.session ?? "?") \(t.pane)", size: 8) }
+                if let t = s.tmux { Caps("tmux \(t.session ?? "?") · окно \(t.window ?? "?") · \(t.pane)", size: 8) }
                 if s.confidence == .inferred { Caps("по экрану", size: 8, color: Palette.violet) }
                 if let cwd = s.cwd { Text(cwd).font(.mono(9)).foregroundColor(Palette.dim).lineLimit(1).truncationMode(.head) }
             }
@@ -320,7 +325,7 @@ struct SessionDetailView: View {
             HStack(alignment: .bottom, spacing: 8) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(">").font(.mono(13, .bold)).foregroundColor(Palette.crimson)
-                    TextField(s.status == .running ? "сессия работает…" : "ответ в \(s.project) — Enter отправить, ⌥Enter новая строка",
+                    TextField(s.status == .running ? "сессия работает…" : "ответ в \(store.name(s).title) — Enter отправить, ⌥Enter новая строка",
                               text: draft, axis: .vertical)
                         .textFieldStyle(.plain).font(.mono(12))
                         .lineLimit(1...5)
@@ -393,7 +398,7 @@ struct SessionDetailView: View {
     static func time(_ ts: Double) -> String { formatter.string(from: Date(timeIntervalSince1970: ts)) }
 }
 
-/// Экран tmux-панели. Прокрутка вниз — только когда содержимое изменилось, чтобы не сбивать чтение.
+/// Экран tmux-панели (`ScreenTextView`: без прыжков прокрутки).
 struct ScreenPane: View {
     @ObservedObject var details: DetailStore
     var clock: Clock
@@ -411,25 +416,7 @@ struct ScreenPane: View {
                 if snap != nil { Caps("\(lines.count) строк", size: 7.5) }
             }
             if snap != nil {
-                ScrollViewReader { proxy in
-                    ScrollView([.vertical, .horizontal]) {
-                        VStack(alignment: .leading, spacing: 0) {
-                            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                                line.runs.reduce(Text("")) { acc, run in
-                                    acc + Text(run.text).foregroundColor(run.dim ? Palette.dim.opacity(0.75) : Palette.text.opacity(0.92))
-                                }
-                                .font(.mono(10.5, .regular))
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: false)
-                            }
-                            Color.clear.frame(height: 1).id("end")
-                        }
-                        .textSelection(.enabled)
-                        .padding(8)
-                    }
-                    .onAppear { proxy.scrollTo("end", anchor: .bottomLeading) }
-                    .onChange(of: lines) { _ in proxy.scrollTo("end", anchor: .bottomLeading) }
-                }
+                ScreenTextView(lines: lines)
                 .background(Color.black.opacity(0.6))
                 .overlay(Rectangle().stroke(Palette.line.opacity(0.4), lineWidth: 1))
             } else {

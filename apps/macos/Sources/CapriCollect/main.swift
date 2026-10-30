@@ -18,7 +18,9 @@ while !args.isEmpty {
     let a = args.removeFirst()
     switch a {
     case "--ssh":
-        sources.append(.ssh(args.removeFirst()))
+        let host = args.removeFirst()
+        guard HostSource.isValidAlias(host) else { FileHandle.standardError.write("плохой хост: \(host)\n".data(using: .utf8)!); exit(2) }
+        sources.append(.ssh(host))
     case "--local":
         sources.append(.local())
     case "--hook":
@@ -43,7 +45,7 @@ let started = Date()
 func stamp() -> String { String(format: "%7.2f", Date().timeIntervalSince(started)) }
 
 func describe(_ s: Session) -> String {
-    var line = "\(s.key) [\(s.project)] \(s.status.rawValue) (\(s.confidence.rawValue))"
+    var line = "\(s.key) [\(s.title)] \(s.status.rawValue) (\(s.confidence.rawValue))"
     if let r = s.request { line += " · \(r.kind.rawValue): \(r.summary.prefix(60))" }
     if let o = s.request?.options, !o.isEmpty { line += " · варианты: \(o.joined(separator: " / "))" }
     if let t = s.typedInput { line += " · набрано: «\(t)»" }

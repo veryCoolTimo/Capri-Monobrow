@@ -55,7 +55,7 @@ final class AttentionCenter: NSObject {
 
     private var policy: AttentionPolicy {
         AttentionPolicy(pausedUntil: settings.pausedUntil, sound: settings.sound,
-                        system: settings.systemNotifications, fullscreenQuiet: settings.fullscreenQuiet)
+                        system: settings.notificationPolicy, fullscreenQuiet: settings.fullscreenQuiet)
     }
 
     private func needsInput(_ s: Session) {

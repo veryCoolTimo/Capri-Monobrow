@@ -22,6 +22,12 @@ public struct HostSource: Equatable {
         self.name = name; self.transport = transport; self.hook = hook; self.streamArgs = streamArgs
     }
 
+    /// Имя хоста уходит в ssh: только ASCII-алиас из ~/.ssh/config, без ведущего «-»; `local` занят этим Маком.
+    public static func isValidAlias(_ h: String) -> Bool {
+        !h.isEmpty && h != "local" && !h.hasPrefix("-")
+            && h.unicodeScalars.allSatisfy { $0.isASCII && (CharacterSet.alphanumerics.contains($0) || "-_.@".unicodeScalars.contains($0)) }
+    }
+
     public static func local(name: String = "local", hook: String = defaultLocalHook, streamArgs: [String] = []) -> HostSource {
         HostSource(name: name, transport: .local, hook: hook, streamArgs: streamArgs)
     }

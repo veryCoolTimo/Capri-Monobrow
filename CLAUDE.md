@@ -19,8 +19,10 @@
   - `scripts/mac.sh "npm run build:macos"`
   - `scripts/mac.sh sync` — только синхронизировать.
 - Установка и запуск на Маке: `scripts/mac.sh "bash scripts/install-macos.sh"` — собирает, ставит
-  `/Applications/Capri.app` и запускает (`--no-open` — только поставить). Отладка без окна:
-  `open -a /Applications/Capri.app --args --debug-control`. Перед новым
+  `/Applications/Capri.app` и запускает в фоне, без окна (`--no-open` — только поставить). Окно Capri
+  никогда не открывать «само» (Тимофей работает в полноэкранных приложениях) — только по явному действию. Отладка без окна:
+  `open -a /Applications/Capri.app --args --background --debug-control` — только когда Capri не запущен
+  (`open` по запущенному = «повторный запуск» = окно). Перед новым
   запуском закрыть старый экземпляр: `scripts/mac.sh "bash scripts/stop-macos.sh"`
   (скрипты запуска делают это сами).
 - **Любая GUI-сборка (приложение и спайки) обязана иметь выход:** значок в строке меню с

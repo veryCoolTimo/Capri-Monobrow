@@ -474,16 +474,14 @@ final class NotchController: NSObject {
         }
     }
 
-    /// Ответ дошёл: если больше никто не ждёт — свернуть через секунду, иначе перейти к следующему.
+    /// Ответ дошёл: если больше никто не ждёт — свернуть через секунду. Выбор сам не переключаем:
+    /// следующую сессию выбирает человек.
     private func delivered(_ key: SessionKey) {
         guard state == .expanded, ui.selected.flatMap(store.resolve) == key else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            guard let self, self.state == .expanded, self.ui.selected.flatMap(self.store.resolve) == key else { return }
-            if let next = self.store.waiting.first(where: { $0.key != key }) {
-                self.ui.selected = next.key
-            } else if !self.hovering {
-                self.go(.collapsed, reason: "delivered")
-            }
+            guard let self, self.state == .expanded, self.ui.selected.flatMap(self.store.resolve) == key,
+                  self.store.waiting.isEmpty, !self.hovering else { return }
+            self.go(.collapsed, reason: "delivered")
         }
     }
 
@@ -532,14 +530,17 @@ final class NotchController: NSObject {
 
     private func dumpState() {
         let rows = store.sessions.map { s -> [String: Any] in
-            var r: [String: Any] = ["key": s.key.description, "status": s.status.rawValue, "project": s.project,
+            var r: [String: Any] = ["key": s.key.description, "status": s.status.rawValue, "project": s.project, "title": store.name(s).full,
                                     "tmux": s.tmux?.session ?? "", "headline": s.headline]
             if let c = s.request?.choices { r["choices"] = c.map { "\($0.index) \($0.label)" } }
             if let d = store.deliveries[s.key] { r["delivery"] = "\(d)" }
             return r
         }
         let out: [String: Any] = ["state": state.rawValue, "selected": ui.selected?.description ?? "", "sessions": rows,
-                                  "hosts": store.hosts.map { "\($0.name)=\($0.connected)" }]
+                                  "hosts": store.hosts.map { "\($0.name)=\($0.connected)" },
+                                  // Видимые обычные окна Capri и политика активации — проверка «окно само не вылезает».
+                                  "windows": NSApp.windows.filter { $0.isVisible && $0.styleMask.contains(.titled) && !($0 is NSPanel) }.map(\.title),
+                                  "regular": NSApp.activationPolicy() == .regular]
         if let d = try? JSONSerialization.data(withJSONObject: out, options: [.prettyPrinted, .sortedKeys]) {
             try? d.write(to: CapriPaths.tmp.appendingPathComponent("state.json"))
         }

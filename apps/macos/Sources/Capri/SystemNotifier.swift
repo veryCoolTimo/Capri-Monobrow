@@ -22,7 +22,7 @@ final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         let center = UNUserNotificationCenter.current()
         let send = { [weak self] in
             let c = UNMutableNotificationContent()
-            c.title = "\(s.project) ждёт ответа"
+            c.title = "\(s.title) ждёт ответа"
             c.subtitle = "\(SessionStore.displayHost(s.key.host)) · \(s.key.agent.rawValue)"
             c.body = text.map { String(Redactor.redact($0).prefix(80)) } ?? "\(s.kindLabel.isEmpty ? "нужен ответ" : s.kindLabel)"
             c.threadIdentifier = s.key.host

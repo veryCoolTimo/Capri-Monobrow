@@ -27,9 +27,7 @@ rm -rf "$CAPRI_ROOT/dist/Capri Prototype.app"
 mkdir -p "$CAPRI_APP/Contents/MacOS" "$CAPRI_APP/Contents/Resources"
 cp "$CAPRI_BIN_DIR/Capri" "$CAPRI_APP/Contents/MacOS/Capri"
 cp "$ICON" "$CAPRI_APP/Contents/Resources/AppIcon.icns"
-# Keep the .app root sealed; the asset loader also supports a direct SwiftPM run.
-rm -rf "$CAPRI_APP/Capri_Capri.bundle"
-ditto "$CAPRI_BIN_DIR/Capri_Capri.bundle" "$CAPRI_APP/Contents/Resources/Capri_Capri.bundle"
+rm -rf "$CAPRI_APP/Capri_Capri.bundle" "$CAPRI_APP/Contents/Resources/Capri_Capri.bundle"
 cat > "$CAPRI_APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -40,8 +38,8 @@ cat > "$CAPRI_APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>Capri</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.3.0</string>
-<key>CFBundleVersion</key><string>3</string>
+<key>CFBundleShortVersionString</key><string>0.4.0</string>
+<key>CFBundleVersion</key><string>4</string>
 <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>

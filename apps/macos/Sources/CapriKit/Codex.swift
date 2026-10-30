@@ -168,8 +168,13 @@ public enum CodexPrompts {
         return out
     }
 
+    /// «votek2 (папка votek)» — имя tmux-сессии и проект, если он другой.
+    static func name(_ s: Session) -> String {
+        s.title == s.project ? s.title : "\(s.title) (папка \(s.project))"
+    }
+
     static func describe(_ s: Session) -> String {
-        var out = "Сессия: \(s.project) · хост \(s.key.host) · агент \(s.key.agent.rawValue) · статус \(s.status.rawValue)"
+        var out = "Сессия: \(name(s)) · хост \(s.key.host) · агент \(s.key.agent.rawValue) · статус \(s.status.rawValue)"
         if let r = s.request {
             out += "\nЗапрос (\(r.kind.rawValue)\(r.tool.map { ", \($0)" } ?? "")): \(Redactor.redact(r.summary))"
             if !r.options.isEmpty { out += "\nВарианты: " + r.choices.map { "\($0.index). \(Redactor.redact($0.label))" }.joined(separator: "; ") }
@@ -214,7 +219,7 @@ public enum CodexPrompts {
         if shown.isEmpty { p += "— сессий нет\n" }
         for s in shown {
             if hidden.contains(s.key.host) {
-                p += "\nСессия: \(s.project) · хост \(s.key.host) · статус \(s.status.rawValue) (содержимое скрыто настройками)\n"
+                p += "\nСессия: \(name(s)) · хост \(s.key.host) · статус \(s.status.rawValue) (содержимое скрыто настройками)\n"
                 continue
             }
             p += "\n" + describe(s) + "\n"
