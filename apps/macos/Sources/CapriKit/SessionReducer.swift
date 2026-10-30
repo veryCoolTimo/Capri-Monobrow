@@ -18,9 +18,10 @@ public struct SessionKey: Hashable, Codable, CustomStringConvertible {
     public var description: String { "\(host)/\(agent.rawValue)/\(id)" }
 }
 
-/// Чего сессия ждёт: запрос разрешения, вопрос с вариантами или уведомление без деталей.
+/// Чего сессия ждёт: запрос разрешения, вопрос с вариантами, уведомление без деталей или вопрос текстом в конце
+/// ответа (`reply`: ответ закончился вопросом — ждёт ответа, хотя меню нет).
 public struct PendingRequest: Codable, Equatable {
-    public enum Kind: String, Codable { case permission, question, notification }
+    public enum Kind: String, Codable { case permission, question, notification, reply }
     public var kind: Kind
     public var tool: String?
     /// Коротко для notch: команда, вопрос или текст уведомления.
@@ -150,7 +151,7 @@ public enum SessionReducer {
 
         switch e.event {
         case "SessionStart":
-            if e.data["source"]?.string != "compact" || s.status == .unknown { set(&s, .idle, e.ts) }
+            if e.data["source"]?.string != "compact" || s.status == .unknown { set(&s, .idle, e.ts); s.request = nil }
         case "UserPromptSubmit", "PreToolUse", "PostToolUse":
             set(&s, .running, e.ts); s.request = nil
         case "PermissionRequest":
@@ -166,8 +167,14 @@ public enum SessionReducer {
                 set(&s, .idle, e.ts)
             }
         case "Stop", "Interrupt":
-            set(&s, .idle, e.ts); s.request = nil
-            if let m = e.data["last_assistant_message"]?.string { s.lastMessage = m }
+            let message = e.data["last_assistant_message"]?.string
+            if let m = message { s.lastMessage = m }
+            // `stop_hook_active` — другой Stop-хук продолжает работу: это ещё не конец ответа.
+            if e.event == "Stop", e.data["stop_hook_active"]?.bool != true, let q = message.flatMap(textQuestion) {
+                set(&s, .needsInput, e.ts); s.request = PendingRequest(kind: .reply, summary: q)
+            } else {
+                set(&s, .idle, e.ts); s.request = nil
+            }
         case "StopFailure":
             let err = e.data["error"]?.string ?? ""
             set(&s, err.contains("rate") ? .rateLimited : .error, e.ts); s.request = nil
@@ -206,10 +213,16 @@ public enum SessionReducer {
         guard !first.hasPrefix(titlePromptPrefix), var s = state.sessions[key], e.ts >= s.lastEventAt else { return [] }
         let before = s.status
         if s.status == .running {
-            set(&s, .idle, e.ts)
-            s.lastMessage = e.data["last-assistant-message"]?.string ?? s.lastMessage
+            let message = e.data["last-assistant-message"]?.string
+            s.lastMessage = message ?? s.lastMessage
+            if let q = message.flatMap(textQuestion) {
+                set(&s, .needsInput, e.ts); s.request = PendingRequest(kind: .reply, summary: q)
+            } else {
+                set(&s, .idle, e.ts)
+            }
         }
         s.lastEventAt = e.ts
+        if s.status != before { state.pendingIdle[key] = nil }
         state.sessions[key] = s
         return transitionEffects(key: key, before: before, after: s.status, replay: replay)
     }
@@ -223,6 +236,28 @@ public enum SessionReducer {
         }
         let summary = input?["command"]?.string ?? input?["description"]?.string ?? input?["file_path"]?.string ?? tool ?? "Разрешение"
         return PendingRequest(kind: .permission, tool: tool, summary: summary)
+    }
+
+    /// Вопрос в конце ответа: последний абзац (не код) кончается предложением с «?» (после него — только
+    /// закрывающие знаки) — возвращает это предложение (до 160 символов), иначе nil. Код в `…`, ссылки и «?»
+    /// в середине абзаца не считаются.
+    static func textQuestion(_ message: String) -> String? {
+        let text = message.replacingOccurrences(of: "\r\n", with: "\n")
+        let paragraphs = text.components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard var last = paragraphs.last, !last.hasPrefix("```"), !last.hasSuffix("```") else { return nil }
+        // Строчный код и ссылки — не вопросы.
+        last = last.replacingOccurrences(of: "`[^`]*`", with: "код", options: .regularExpression)
+        last = last.replacingOccurrences(of: "https?://\\S+", with: "ссылка", options: .regularExpression)
+        let closing = CharacterSet(charactersIn: " \t\n)*_\"»”'.")
+        let tail = last.trimmingCharacters(in: closing)
+        guard tail.hasSuffix("?") else { return nil }
+        let head = tail.dropLast()
+        let start = head.lastIndex(where: { ".!?\n".contains($0) }).map { tail.index(after: $0) } ?? tail.startIndex
+        var q = String(tail[start...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        q = q.trimmingCharacters(in: CharacterSet(charactersIn: "*_`>-•# "))
+        guard q.count >= 3 else { return nil }
+        return q.count > 160 ? String(q.prefix(159)) + "…" : q
     }
 
     // MARK: экран (фолбэк)
@@ -240,7 +275,9 @@ public enum SessionReducer {
             switch screen {
             case .idle(let typed):
                 s.typedInput = typed
-                if (s.status == .running || s.status == .needsInput) && ts >= s.statusSince + screenLag
+                // Вопрос текстом в конце ответа — на экране обычная строка ввода, это и есть ожидание.
+                if (s.status == .running || (s.status == .needsInput && s.request?.kind != .reply))
+                    && ts >= s.statusSince + screenLag
                     && ts >= s.lastEventAt {
                     // Ожидание, начатое до последнего события, устарело — считаем заново от этого снимка.
                     if let since = state.pendingIdle[key], since >= s.lastEventAt {} else { state.pendingIdle[key] = ts }
@@ -249,6 +286,9 @@ public enum SessionReducer {
                 state.pendingIdle[key] = nil
                 if s.status == .running || s.status == .idle {
                     set(&s, .needsInput, ts); s.confidence = .inferred
+                    s.request = screenRequest(d)
+                } else if s.status == .needsInput, s.request?.kind == .reply {
+                    // После вопроса текстом появилось меню — теперь ждёт выбора в нём.
                     s.request = screenRequest(d)
                 } else if s.status == .needsInput, ts >= s.statusSince, var r = s.request, r.options.isEmpty {
                     // Хук PermissionRequest не даёт вариантов — берём их с экрана, текст запроса оставляем из хука.
@@ -313,7 +353,7 @@ public enum SessionReducer {
         for (key, since) in state.pendingIdle where now - since >= screenIdleGrace {
             state.pendingIdle[key] = nil
             guard var s = state.sessions[key], s.status == .running || s.status == .needsInput,
-                  s.lastEventAt <= since else { continue }
+                  s.request?.kind != .reply, s.lastEventAt <= since else { continue }
             set(&s, .idle, since)
             s.request = nil
             s.confidence = .inferred

@@ -177,7 +177,7 @@ public enum CodexPrompts {
     static func describe(_ s: Session, label: String? = nil, prefix: Bool = true) -> String {
         var out = (prefix ? "Сессия: " : "") + "\(label ?? name(s)) · хост \(s.key.host) · агент \(s.key.agent.rawValue) · статус \(s.status.rawValue)"
         if let r = s.request {
-            out += "\nЗапрос (\(r.kind.rawValue)\(r.tool.map { ", \($0)" } ?? "")): \(Redactor.redact(r.summary))"
+            out += "\nЗапрос (\(r.kind == .reply ? "вопрос текстом в конце ответа" : r.kind.rawValue)\(r.tool.map { ", \($0)" } ?? "")): \(Redactor.redact(r.summary))"
             if !r.options.isEmpty { out += "\nВарианты: " + r.choices.map { "\($0.index). \(Redactor.redact($0.label))" }.joined(separator: "; ") }
         }
         if let m = s.lastMessage, s.status != .running {

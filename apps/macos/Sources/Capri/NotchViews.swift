@@ -95,14 +95,14 @@ func hudButton(_ title: String, accent: Color = Palette.crimson, enabled: Bool =
 // MARK: - Свёрнутый вид
 
 /// Слева от выреза — глаза Capri (клик — помощник), справа — шкала сессий: столбик на сессию, зелёный — ждёт
-/// меня, малиновый — работает, тусклый — простаивает; не влезли — «+N».
+/// меня, малиновый — работает, тусклый — простаивает (пять самых свежих, как в раскрытом); остальные — «+N».
 struct TopRowView: View {
     @ObservedObject var store: SessionStore
     @ObservedObject var ui: NotchUI
     @ObservedObject var codex: CodexService
     var notchWidth: CGFloat
 
-    static let maxBars = 6
+    static let maxBars = 5
 
     var body: some View {
         let waiting = store.waiting.count
@@ -170,14 +170,14 @@ struct PeekLineView: View {
 
 // MARK: - Компактный раскрытый notch
 
-/// Обзор сессий: все живые сессии ровной таблицей (ждут → работают → остальные), у каждой — состояние, что
-/// делает и сколько. Ответы сессиям — через Capri (помощник) или основное окно; клик по строке — окно на ней.
+/// Обзор сессий: пять самых свежих (ждущие меня — всегда первыми) ровной таблицей: состояние, что делает и
+/// сколько. Ответы сессиям — через Capri (помощник) или основное окно; клик по строке — окно на ней.
 struct ExpandedView: View {
     @ObservedObject var store: SessionStore
     @ObservedObject var ui: NotchUI
     var actions: NotchActions
 
-    static let maxRows = 7
+    static let maxRows = 5
 
     var body: some View {
         let list = store.overview

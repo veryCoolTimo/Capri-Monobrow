@@ -83,15 +83,20 @@ final class SessionStore: ObservableObject {
 
     var waiting: [Session] { sessions.filter { $0.status == .needsInput } }
     var runningCount: Int { sessions.filter { $0.status == .running }.count }
-    /// Все живые сессии для обзора в notch: ждут меня → работают → ошибка/лимит → остальные (без закрытых),
-    /// внутри группы — стабильный порядок стора.
+    /// Живые сессии для notch: ждущие меня, потом работающие, потом по свежести активности (последнее событие
+    /// или смена состояния), без закрытых. Простаивающая сессия, видимая только по экрану (`pane:`), — в конце:
+    /// её время — момент, когда Capri её впервые увидела, а не её активность.
     var overview: [Session] {
-        func rank(_ s: SessionStatus) -> Int {
-            switch s { case .needsInput: 0; case .running: 1; case .error, .rateLimited: 2; default: 3 }
+        func rank(_ s: Session) -> Int { s.status == .needsInput ? 0 : s.status == .running ? 1 : 2 }
+        // Работающие — по началу работы (не прыгают от каждого события инструмента), остальные — по последней
+        // активности.
+        func recent(_ s: Session) -> Double {
+            if s.status == .running { return s.statusSince }
+            return s.key.id.hasPrefix("pane:") && s.status == .idle ? 0 : max(s.lastEventAt, s.statusSince)
         }
-        return sessions.enumerated().filter { $0.element.status != .ended }
-            .sorted { (rank($0.element.status), $0.offset) < (rank($1.element.status), $1.offset) }
-            .map(\.element)
+        return sessions.filter { $0.status != .ended }.sorted {
+            rank($0) != rank($1) ? rank($0) < rank($1) : recent($0) > recent($1)
+        }
     }
     /// Есть что показать в свёрнутом notch.
     var active: Bool { sessions.contains { $0.status == .needsInput || $0.status == .running } }

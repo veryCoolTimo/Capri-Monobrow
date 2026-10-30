@@ -9,6 +9,7 @@ extension Session {
         switch (status, request?.kind) {
         case (.needsInput, .question?): return "вопрос"
         case (.needsInput, .permission?): return "разрешение"
+        case (.needsInput, .reply?): return "ответила"
         case (.needsInput, _): return "нужен ответ"
         case (.idle, _): return "ждёт задачу"
         default: return ""

@@ -318,6 +318,55 @@ final class SessionReducerTests: XCTestCase {
         XCTAssertEqual(notifyIds.subtracting(ids).count, 1, "тред генерации заголовка не стал сессией")
     }
 
+    func testTextQuestion() {
+        XCTAssertEqual(SessionReducer.textQuestion("Сделал карту.\n\nДобавить ещё биом? Или оставить так?"), "Или оставить так?")
+        XCTAssertEqual(SessionReducer.textQuestion("Готово. **Запускать сервер?**"), "Запускать сервер?")
+        XCTAssertNil(SessionReducer.textQuestion("Что сделал?\n\nВсё готово, тесты зелёные."))
+        XCTAssertNil(SessionReducer.textQuestion("Пример:\n\n```\nif a ? b : c\n```"))
+        XCTAssertNil(SessionReducer.textQuestion(""))
+        XCTAssertNil(SessionReducer.textQuestion("Ссылка: https://x.com/a?b=1"))
+        XCTAssertNil(SessionReducer.textQuestion("Теперь `user?.name` безопасен."))
+        XCTAssertNil(SessionReducer.textQuestion("Готово? Да, всё работает."))
+        XCTAssertEqual(SessionReducer.textQuestion("Сделал.\r\n\r\nДеплоить?"), "Деплоить?")
+        XCTAssertEqual(SessionReducer.textQuestion("Итог.\n\n## Что дальше — оставить «как есть»?)"), "Что дальше — оставить «как есть»?")
+    }
+
+    /// Ответ закончился вопросом без меню — «ждёт меня» с уведомлением; экран со строкой ввода это не сбрасывает.
+    func testStopWithQuestionNeedsInput() {
+        var state = CapriState()
+        let claude = live.filter { $0.agent == .claude }
+        _ = run(Array(claude.prefix(1)), into: &state)
+        let key = session(state, .claude).key
+        let pane = session(state, .claude).tmux?.pane ?? "%10"
+        func hook(_ event: String, _ ts: Double, _ data: String = "{}") -> CapriEvent {
+            CapriEvent.decode(line: #"{"v":1,"ts":\#(ts),"host":"server","agent":"claude","source":"hook","event":"\#(event)","session_id":"\#(key.id)","tmux":{"pane":"\#(pane)"},"data":\#(data)}"#)!
+        }
+        let t0 = session(state, .claude).lastEventAt + 1
+        _ = run([hook("UserPromptSubmit", t0)], into: &state)
+        let effects = run([hook("Stop", t0 + 5, #"{"last_assistant_message":"Сервер готов.\n\nСделать бэкап мира?"}"#)], into: &state)
+        var s = state.sessions[key]!
+        XCTAssertEqual(s.status, .needsInput)
+        XCTAssertEqual(s.request, PendingRequest(kind: .reply, summary: "Сделать бэкап мира?"))
+        XCTAssertEqual(effects, [.notifyNeedsInput(key)])
+        for k in 0..<3 {
+            SessionReducer.reduce(&state, .screen(host: "server", pane: pane, agent: .claude, lines: Fixtures.screen("claude-idle-suggestion"),
+                                                  ts: t0 + 30 + Double(k) * 10))
+            SessionReducer.reduce(&state, .tick(t0 + 35 + Double(k) * 10))
+        }
+        s = state.sessions[key]!
+        XCTAssertEqual(s.status, .needsInput)
+        // На экране появилось меню — запрос теперь из меню.
+        SessionReducer.reduce(&state, .screen(host: "server", pane: pane, agent: .claude, lines: Fixtures.screen("claude-ask-question"),
+                                              ts: t0 + 80))
+        XCTAssertEqual(state.sessions[key]!.request?.kind, .question)
+        _ = run([hook("UserPromptSubmit", t0 + 90)], into: &state)
+        _ = run([hook("Stop", t0 + 100, #"{"last_assistant_message":"Готово, бэкап сделан."}"#)], into: &state)
+        XCTAssertEqual(state.sessions[key]!.status, .idle)
+        // Stop, пока другой Stop-хук продолжает работу, — не вопрос.
+        _ = run([hook("Stop", t0 + 110, #"{"stop_hook_active":true,"last_assistant_message":"Продолжить?"}"#)], into: &state)
+        XCTAssertEqual(state.sessions[key]!.status, .idle)
+    }
+
     func testStopFailureIsError() {
         var state = CapriState()
         _ = run(Fixtures.events("stage0-claude-mac-stopfailure.jsonl"), into: &state)

@@ -38,6 +38,7 @@ extension NotchController {
         case "expand": go(.expanded, reason: "control")
         case "assistant": go(.assistant, reason: "control")
         case "ask": go(.assistant, reason: "control"); codex.ask(arg)
+        case "fx": CapriFX.forced = Int(arg).map { ($0, Date().addingTimeInterval(4)) }
         case "confirm": if let p = codex.pendingProposal { codex.confirm(p.message, p.proposal.id) }
         case "collapse": go(.collapsed, reason: "control")
         case "peek": go(.peek, reason: "control")
