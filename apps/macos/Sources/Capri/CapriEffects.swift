@@ -2,7 +2,8 @@ import SwiftUI
 import CapriKit
 
 /// Эффекты поверх глаз Capri, нарисованные кодом: глитч (сдвинутые полосы и разнос по цвету, как «relic» в
-/// сериале) и её малиновые молнии с блёстками и фиолетовой «сбитой печатью». Всё детерминировано по тику 12 fps.
+/// сериале) и её тонкие малиновые молнии-зигзаги со звёздочками (по рефу Тимофея) и фиолетовой «сбитой печатью».
+/// Всё детерминировано по тику 12 fps.
 enum CapriFX {
     struct Glitch {
         /// Разнос малиновой и фиолетовой копий (доля ширины).
@@ -12,9 +13,8 @@ enum CapriFX {
     }
 
     struct Bolt {
-        /// Номера мест из `spots`.
-        var shapes: [Int]
-        var mirror: Bool
+        /// Зерно формы каждой молнии (одна или две).
+        var seeds: [Int]
         /// «Кипение» линии: меняется раз в два тика.
         var boil: Int
     }
@@ -49,38 +49,67 @@ enum CapriFX {
         case .error: TickNoise.burst(tick, period: 20, length: 4, salt: 5)
         }
         guard let beat else { return nil }
-        let first = Int(TickNoise.hash(beat, 31) % UInt64(spots.count))
         let two = mood == .alert || TickNoise.unit(beat, 32) < 0.4
-        return Bolt(shapes: two ? [first, (first + 2) % spots.count] : [first],
-                    mirror: TickNoise.unit(beat, 33) < 0.5, boil: tick / 2)
+        return Bolt(seeds: two ? [beat * 2, beat * 2 + 1] : [beat * 2], boil: tick / 2)
     }
 
-    /// Молния: классический клин-зигзаг в единичном квадрате (острие внизу).
-    static let bolt: [CGPoint] = [
-        CGPoint(x: 0.50, y: 0), CGPoint(x: 1, y: 0), CGPoint(x: 0.66, y: 0.40), CGPoint(x: 0.90, y: 0.40),
-        CGPoint(x: 0.12, y: 1), CGPoint(x: 0.38, y: 0.54), CGPoint(x: 0.10, y: 0.54),
-    ]
-
-    /// Где молнии (доли кадра 2:1): между глаз и по краям, мимо зрачков; `up` — острием вверх.
-    static let spots: [(box: CGRect, up: Bool)] = [
-        (CGRect(x: 0.41, y: 0.42, width: 0.17, height: 0.70), true),
-        (CGRect(x: 0.84, y: -0.12, width: 0.17, height: 0.62), false),
-        (CGRect(x: -0.01, y: 0.50, width: 0.16, height: 0.62), true),
-        (CGRect(x: 0.85, y: 0.55, width: 0.15, height: 0.56), true),
-    ]
-
-    /// Контур молнии `i` в кадре `r`; `mirror` — отражение по горизонтали, `boil` — кипение линии.
-    static func boltPath(_ i: Int, mirror: Bool, boil: Int, in r: CGRect) -> Path {
-        let spot = spots[i]
-        let pts = bolt.enumerated().map { k, p -> CGPoint in
-            let jx = 0.05 * (TickNoise.unit(boil, 40 + k) - 0.5), jy = 0.04 * (TickNoise.unit(boil, 50 + k) - 0.5)
-            let ux = p.x + jx, uy = spot.up ? 1 - (p.y + jy) : p.y + jy
-            let x = spot.box.minX + ux * spot.box.width, y = spot.box.minY + uy * spot.box.height
-            return CGPoint(x: r.minX + (mirror ? 1 - x : x) * r.width, y: r.minY + y * r.height)
+    /// Вершины молнии в кадре `r`: из-за края поперёк кадра зигзагом из 5–7 колен.
+    static func boltPoints(_ seed: Int, boil: Int, in r: CGRect) -> [CGPoint] {
+        let u = { (salt: Int) in CGFloat(TickNoise.unit(seed, 80 + salt)) }
+        let side = Int(TickNoise.hash(seed, 81) % 4)
+        // Начало за краем и направление: слева/справа — поперёк, сверху/снизу — вниз/вверх наискось.
+        let start: CGPoint, end: CGPoint
+        switch side {
+        case 0: start = CGPoint(x: -0.03, y: 0.15 + 0.7 * u(1)); end = CGPoint(x: 0.35 + 0.3 * u(2), y: 0.2 + 0.6 * u(3))
+        case 1: start = CGPoint(x: 1.03, y: 0.15 + 0.7 * u(1)); end = CGPoint(x: 0.35 + 0.3 * u(2), y: 0.2 + 0.6 * u(3))
+        case 2: start = CGPoint(x: 0.1 + 0.8 * u(1), y: -0.05); end = CGPoint(x: 0.2 + 0.6 * u(2), y: 0.85)
+        default: start = CGPoint(x: 0.1 + 0.8 * u(1), y: 1.05); end = CGPoint(x: 0.2 + 0.6 * u(2), y: 0.15)
         }
+        let a = CGPoint(x: r.minX + start.x * r.width, y: r.minY + start.y * r.height)
+        let b = CGPoint(x: r.minX + end.x * r.width, y: r.minY + end.y * r.height)
+        let dx = b.x - a.x, dy = b.y - a.y, len = max(1, (dx * dx + dy * dy).squareRoot())
+        let nx = -dy / len, ny = dx / len
+        let n = 5 + Int(TickNoise.hash(seed, 82) % 3)
+        return (0..<n).map { k in
+            let f = CGFloat(k) / CGFloat(n - 1)
+            // Колено вбок, поочерёдно; кипение — лёгкий сдвиг раз в два тика.
+            let side = k == 0 || k == n - 1 ? 0 : (k % 2 == 0 ? 1 : -1) * (0.6 + 0.4 * u(10 + k))
+            let amp = r.height * 0.13 * side + r.height * 0.012 * (CGFloat(TickNoise.unit(boil, 90 + k)) - 0.5)
+            return CGPoint(x: a.x + dx * f + nx * amp, y: a.y + dy * f + ny * amp)
+        }
+    }
+
+    /// Контур молнии: каждое колено — тонкая игла от широкого основания к острию чуть дальше следующей вершины.
+    static func boltPath(_ seed: Int, boil: Int, in r: CGRect) -> Path {
+        let pts = boltPoints(seed, boil: boil, in: r)
         var path = Path()
-        path.addLines(pts)
-        path.closeSubpath()
+        for k in 0..<(pts.count - 1) {
+            let p = pts[k], q = pts[k + 1]
+            let dx = q.x - p.x, dy = q.y - p.y, len = max(1, (dx * dx + dy * dy).squareRoot())
+            let w = r.height * 0.045 * (1 - 0.5 * CGFloat(k) / CGFloat(pts.count))
+            let tip = CGPoint(x: q.x + dx * 0.12, y: q.y + dy * 0.12)
+            path.addLines([CGPoint(x: p.x - dy / len * w / 2, y: p.y + dx / len * w / 2), tip,
+                           CGPoint(x: p.x + dy / len * w / 2, y: p.y - dx / len * w / 2)])
+            path.closeSubpath()
+        }
+        return path
+    }
+
+    /// Звёздочки-контуры рядом с молнией, как на рефе.
+    static func stars(_ seed: Int, near pts: [CGPoint], in r: CGRect) -> Path {
+        var path = Path()
+        for k in 0..<2 {
+            let p = pts[1 + Int(TickNoise.hash(seed, 100 + k) % UInt64(max(1, pts.count - 2)))]
+            let c = CGPoint(x: p.x + r.height * (0.25 * CGFloat(TickNoise.unit(seed, 110 + k)) - 0.12),
+                            y: p.y + r.height * (0.25 * CGFloat(TickNoise.unit(seed, 120 + k)) - 0.12))
+            let R = r.height * (0.035 + 0.02 * CGFloat(TickNoise.unit(seed, 130 + k)))
+            let star = (0..<10).map { i -> CGPoint in
+                let a = CGFloat(i) * .pi / 5 - .pi / 2, rad = i % 2 == 0 ? R : R * 0.45
+                return CGPoint(x: c.x + cos(a) * rad, y: c.y + sin(a) * rad)
+            }
+            path.addLines(star)
+            path.closeSubpath()
+        }
         return path
     }
 }
@@ -123,22 +152,13 @@ struct CapriShotView: View {
     }
 
     private func draw(_ b: CapriFX.Bolt, in r: CGRect, ctx: GraphicsContext) {
-        for i in b.shapes {
-            let path = CapriFX.boltPath(i, mirror: b.mirror, boil: b.boil, in: r)
-            // Фиолетовая «сбитая печать» под молнией, сама молния — малиновая с белыми блёстками.
-            ctx.fill(path.offsetBy(dx: r.width * 0.012, dy: r.height * 0.03), with: .color(Palette.violet))
+        for seed in b.seeds {
+            let path = CapriFX.boltPath(seed, boil: b.boil, in: r)
+            // Фиолетовая «сбитая печать» под молнией, сама молния — малиновая, рядом звёздочки-контуры.
+            ctx.fill(path.offsetBy(dx: r.height * 0.012, dy: r.height * 0.015), with: .color(Palette.violet))
             ctx.fill(path, with: .color(Palette.crimson))
-            var c = ctx
-            c.clip(to: path)
-            let box = path.boundingRect
-            let dot = max(0.6, r.width * 0.004)
-            var sparkles = Path()
-            for k in 0..<40 {
-                let x = box.minX + box.width * TickNoise.unit(i * 100 + k, 60 + b.boil % 3)
-                let y = box.minY + box.height * TickNoise.unit(i * 100 + k, 70 + b.boil % 3)
-                sparkles.addEllipse(in: CGRect(x: x, y: y, width: dot, height: dot))
-            }
-            c.fill(sparkles, with: .color(.white.opacity(0.85)))
+            let stars = CapriFX.stars(seed, near: CapriFX.boltPoints(seed, boil: b.boil, in: r), in: r)
+            ctx.stroke(stars, with: .color(Palette.crimson), lineWidth: max(1, r.height * 0.008))
         }
     }
 }

@@ -67,17 +67,21 @@ enum CapriArt {
     }
 }
 
-/// Клипы сериала с её глазами крупным планом — только локально, в `~/.capri/art/eyes/` (кадры сериала не входят
-/// в публичный репозиторий; кладёт `scripts/push-capri-art.sh`). `clips.json` (12 fps): `{"clips": {"look":
-/// [["000.png", 35], …], "close": …, "many": …, "slits": …}}`. Нет папки — Capri показывает кадры `CapriArt`.
+/// Клипы сериала с Capri крупным планом — только локально, в `~/.capri/art/eyes/` (кадры сериала не входят
+/// в публичный репозиторий; кладёт `scripts/push-capri-art.sh`). `clips.json`: `{"fps": 24, "clips": {"look":
+/// [["000.png", 14], …], …}}` — держания в кадрах `fps`. Обязателен `look` (рассматривает); по желанию `close`,
+/// `many` (закрыла глаза → много глаз), `slits` (щёлки), `appear`, `talk`, `shut`, `burst` (маска появляется,
+/// говорит, закрывает глаза, взрыв глаз), `crazy` (безумный глитч). Нет папки — Capri показывает кадры `CapriArt`.
 struct ShowArt {
     let images: [NSImage]
-    let look, close, many, slits: FrameClip
-    /// «Тебя ждут»: глаза закрываются → много глаз, по кругу.
+    let fps: Double
+    let clips: [String: FrameClip]
+    /// «Тебя ждут»: маска появляется → закрывает глаза → взрыв глаз (или глаза закрываются → много глаз), по кругу.
     let alert: FrameClip
 
     static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".capri/art/eyes")
     static let shared: ShowArt? = load(dir)
+    static let names = ["look", "close", "many", "slits", "appear", "talk", "shut", "burst", "crazy"]
 
     static func load(_ dir: URL) -> ShowArt? {
         func skip(_ why: String) -> ShowArt? {
@@ -88,18 +92,19 @@ struct ShowArt {
         guard FileManager.default.fileExists(atPath: json.path) else { return nil }
         guard let data = try? Data(contentsOf: json),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let clips = root["clips"] as? [String: Any] else { return skip("clips.json не читается") }
+              let raw = root["clips"] as? [String: Any] else { return skip("clips.json не читается") }
+        let fps = (root["fps"] as? Double).map { min(max($0, 6), 30) } ?? 12
         var images: [NSImage] = [], index: [String: Int] = [:]
         func clip(_ name: String) -> FrameClip? {
-            guard let list = clips[name] as? [[Any]], !list.isEmpty else { return nil }
+            guard let list = raw[name] as? [[Any]], !list.isEmpty else { return nil }
             var frames: [Int] = [], holds: [Int] = []
             for item in list {
-                // Только PNG прямо в папке, не больше 64 рисунков по 4 МБ.
+                // Только PNG прямо в папке, не больше 256 рисунков по 4 МБ.
                 guard item.count == 2, let file = item[0] as? String, let hold = item[1] as? Int,
                       file.hasSuffix(".png"), !file.hasPrefix("."), !file.contains("/") else { return nil }
                 if index[file] == nil {
                     let url = dir.appendingPathComponent(file)
-                    guard images.count < 64,
+                    guard images.count < 256,
                           let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 4 << 20,
                           let im = NSImage(contentsOf: url) else { return nil }
                     index[file] = images.count
@@ -110,20 +115,37 @@ struct ShowArt {
             }
             return FrameClip(frames: frames, holds: holds)
         }
-        guard let look = clip("look"), let close = clip("close"), let many = clip("many"), let slits = clip("slits") else {
-            return skip("нужны клипы look, close, many, slits из PNG до 4 МБ")
+        var clips: [String: FrameClip] = [:]
+        for name in names where raw[name] != nil {
+            guard let c = clip(name) else { return skip("клип \(name): нужны PNG до 4 МБ прямо в папке") }
+            clips[name] = c
         }
-        return ShowArt(images: images, look: look, close: close, many: many, slits: slits,
-                       alert: close.capped(6) + many.holdingLast(26))
+        guard let look = clips["look"] else { return skip("нет клипа look") }
+        let second = Int(fps)
+        let none = FrameClip(frames: [], holds: [])
+        let alert: FrameClip = if let burst = clips["burst"] {
+            (clips["appear"] ?? none)
+                + (clips["talk"].map { FrameClip(frames: [$0.frames[0]], holds: [second / 2]) } ?? none)
+                + (clips["shut"] ?? none)
+                + burst.holdingLast(second / 2)
+        } else if let close = clips["close"], let many = clips["many"] {
+            close.capped(second / 2) + many.holdingLast(2 * second)
+        } else {
+            look
+        }
+        return ShowArt(images: images, fps: fps, clips: clips, alert: alert)
     }
 
-    /// Рисунок настроения: `tick` — общий счётчик 12 fps, `since` — тики с начала настроения.
+    private func clip(_ name: String) -> FrameClip { clips[name] ?? clips["look"]! }
+
+    /// Рисунок настроения: `tick` — общий счётчик кадров `fps`, `since` — кадры с начала настроения.
     func image(_ mood: CapriMood, tick: Int, since: Int) -> NSImage? {
-        let i: Int?
-        switch mood {
-        case .idle, .listening, .speaking: i = look.frame(at: tick, loop: true)
-        case .thinking, .error: i = slits.frame(at: since, loop: false)
-        case .alert: i = alert.frame(at: since, loop: true)
+        let i: Int? = switch mood {
+        case .idle, .listening: clip("look").frame(at: tick, loop: true)
+        case .speaking: clip("talk").frame(at: tick, loop: true)
+        case .thinking: clip("slits").frame(at: since, loop: false)
+        case .alert: alert.frame(at: since, loop: true)
+        case .error: clip(clips["crazy"] != nil ? "crazy" : "slits").frame(at: since, loop: clips["crazy"] != nil)
         }
         return i.map { images[$0] }
     }
@@ -131,16 +153,20 @@ struct ShowArt {
     /// Один рисунок без движения («Уменьшить движение», пауза).
     func still(_ mood: CapriMood) -> NSImage? {
         switch mood {
-        case .idle, .listening, .speaking: open
-        case .thinking, .error: slits.frames.last.map { images[$0] }
+        case .idle, .listening: open
+        case .speaking: first("talk")
+        case .thinking, .error: last("slits")
         case .alert: all
         }
     }
 
+    private func first(_ name: String) -> NSImage? { clip(name).frames.first.map { images[$0] } }
+    private func last(_ name: String) -> NSImage? { clip(name).frames.last.map { images[$0] } }
+
     /// Мини-глаза: открытые, закрытые (моргание) и много глаз.
-    var open: NSImage? { look.frames.first.map { images[$0] } }
-    var shut: NSImage? { close.frames.last.map { images[$0] } }
-    var all: NSImage? { many.frames.last.map { images[$0] } }
+    var open: NSImage? { first("look") }
+    var shut: NSImage? { clips["close"] != nil ? last("close") : open }
+    var all: NSImage? { clips["many"] != nil ? last("many") : last("burst") }
 }
 
 /// Анимированные глаза Capri. `active` — анимировать (виден и нужен); иначе статичный кадр.
@@ -153,13 +179,14 @@ struct CapriSprite: View {
     private var still: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / CapriFace.fps, paused: !active || still)) { ctx in
+        TimelineView(.animation(minimumInterval: 1 / (ShowArt.shared?.fps ?? CapriFace.fps), paused: !active || still)) { ctx in
             let animating = active && !still
             let t = ctx.date.timeIntervalSinceReferenceDate
             let since = started?.mood == mood ? max(0, ctx.date.timeIntervalSince(started!.at)) : 0
+            // Эффекты — «на двойках» (12 fps), клипы — в своём темпе.
             let tick = Int(t * CapriFace.fps), sinceTick = Int(since * CapriFace.fps)
             let image: NSImage? = if let show = ShowArt.shared {
-                animating ? show.image(mood, tick: tick, since: sinceTick) : show.still(mood)
+                animating ? show.image(mood, tick: Int(t * show.fps), since: Int(since * show.fps)) : show.still(mood)
             } else {
                 CapriArt.images[CapriArt.frame(mood, t: t, since: since, still: !animating)]
             }
