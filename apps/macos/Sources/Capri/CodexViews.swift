@@ -118,9 +118,9 @@ struct CodexChatView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 10) {
                 // Анимация — только пока Capri думает или отвечает; иначе статичный кадр.
-                CapriFace(mood: assistantMood(codex: codex, waiting: store.waiting.count, typing: !question.isEmpty),
+                CapriHead(mood: assistantMood(codex: codex, waiting: store.waiting.count, typing: !question.isEmpty),
                           active: codex.chatBusy)
-                    .frame(width: 40, height: 35)
+                    .frame(width: 46, height: 46)
                 Caps("спросить capri", size: 13, color: Palette.text, weight: .heavy)
                 Caps("видит все сессии · секреты вырезаны · \(HotKey.assistant.label) — из notch", size: 8)
                 Spacer()

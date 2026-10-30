@@ -60,9 +60,9 @@ struct AssistantView: View {
             Bubble(codex: codex, store: store, shown: ui.assistantShown)
                 .padding(.leading, 6)
             HStack(alignment: .bottom, spacing: 10) {
-                CapriFace(mood: mood, active: ui.assistantShown)
+                CapriHead(mood: mood, active: ui.assistantShown)
                     .accessibilityHidden(true)
-                    .frame(width: 66, height: 58)
+                    .frame(width: 74, height: 74)
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 6) {
                         Text(">").font(.mono(13, .bold)).foregroundColor(Palette.codex)
@@ -150,8 +150,11 @@ private struct Bubble: View {
         .frame(height: min(contentHeight, Self.maxHeight))
         .padding(.horizontal, 11).padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(BubbleShape().fill(Palette.codex.opacity(0.09)))
-        .overlay(BubbleShape().stroke(Palette.codex.opacity(0.6), lineWidth: 1))
+        // Как в рефе Persona 5: малиновая «тень» со сдвигом под тёмным облачком со светлой кромкой.
+        // Следующий .background ложится под предыдущий: сначала тёмное облачко, под ним — малиновая «тень».
+        .background(BubbleShape().fill(Color(red: 0.06, green: 0.05, blue: 0.08)))
+        .background(BubbleShape().fill(Palette.crimson.opacity(0.85)).offset(x: 3, y: 3))
+        .overlay(BubbleShape().stroke(Palette.text.opacity(0.85), lineWidth: 1.2))
         .padding(.bottom, 8)   // место под хвостик
         .animation(.easeOut(duration: 0.18), value: answer?.text)
     }
@@ -170,7 +173,7 @@ private struct Bubble: View {
     }
 }
 
-/// Облачко с хвостиком внизу слева — к голове Capri.
+/// Облачко с хвостиком-молнией внизу слева — к голове Capri (зигзаг по мотивам рефа Persona 5).
 struct BubbleShape: Shape {
     func path(in r0: CGRect) -> Path {
         let r = CGRect(x: r0.minX, y: r0.minY, width: r0.width, height: r0.height - 8)
@@ -180,10 +183,14 @@ struct BubbleShape: Shape {
         p.addLine(to: CGPoint(x: r.maxX - c, y: r.minY))
         p.addLine(to: CGPoint(x: r.maxX, y: r.minY + c))
         p.addLine(to: CGPoint(x: r.maxX, y: r.maxY))
-        // Хвостик к голове (голова ~ на 40 pt от левого края).
-        p.addLine(to: CGPoint(x: r.minX + 46, y: r.maxY))
-        p.addLine(to: CGPoint(x: r.minX + 30, y: r0.maxY))
-        p.addLine(to: CGPoint(x: r.minX + 32, y: r.maxY))
+        // Хвостик-молния к голове (голова ~ на 45 pt от левого края).
+        p.addLine(to: CGPoint(x: r.minX + 54, y: r.maxY))
+        p.addLine(to: CGPoint(x: r.minX + 44, y: r.maxY + 4))
+        p.addLine(to: CGPoint(x: r.minX + 50, y: r.maxY + 4))
+        p.addLine(to: CGPoint(x: r.minX + 34, y: r0.maxY))
+        p.addLine(to: CGPoint(x: r.minX + 38, y: r.maxY + 1))
+        p.addLine(to: CGPoint(x: r.minX + 32, y: r.maxY + 1))
+        p.addLine(to: CGPoint(x: r.minX + 36, y: r.maxY))
         p.addLine(to: CGPoint(x: r.minX + c, y: r.maxY))
         p.addLine(to: CGPoint(x: r.minX, y: r.maxY - c))
         p.closeSubpath()
