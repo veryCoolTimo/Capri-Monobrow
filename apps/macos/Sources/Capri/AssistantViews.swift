@@ -62,7 +62,7 @@ struct AssistantView: View {
             HStack(alignment: .bottom, spacing: 10) {
                 CapriFace(mood: mood, active: ui.assistantShown)
                     .accessibilityHidden(true)
-                    .frame(width: 74, height: 74)
+                    .frame(width: 112, height: 56)
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 6) {
                         Text(">").font(.mono(13, .bold)).foregroundColor(Palette.codex)

@@ -17,8 +17,8 @@ enum CapriMood: Equatable {
     case error
 }
 
-/// Вид Capri. `.bust` — голова и плечи (помощник, чат), `.mask` — только маска с глазами (свёрнутый notch).
-/// Кадры — арт, сгенерированный Codex по рефам (`CapriArt`). `active` — анимировать (виден и нужен).
+/// Вид Capri — её глаза крупным планом (`CapriArt`). `.bust` — с полной анимацией (помощник, чат),
+/// `.mask` — мини в свёрнутом notch: только моргание, «тебя ждут» — много глаз. `active` — анимировать.
 struct CapriFace: View {
     enum Style { case bust, mask }
     var mood: CapriMood
@@ -35,7 +35,7 @@ struct CapriFace: View {
     }
 }
 
-/// Мини-маска в свёрнутом notch: перерисовка только в кадры моргания (`EyesSchedule`), «тебя ждут» — свой кадр.
+/// Мини-глаза в свёрнутом notch: перерисовка только в кадры моргания (`EyesSchedule`), «тебя ждут» — много глаз.
 struct CapriMaskSprite: View {
     var mood: CapriMood
     var active = true
@@ -43,11 +43,8 @@ struct CapriMaskSprite: View {
 
     var body: some View {
         TimelineView(EyesSchedule(paused: !active || still || mood == .alert)) { ctx in
-            let frame: CapriArt.Frame = mood == .alert ? .maskAlert
-                : (!still && (EyesSchedule.blink(at: ctx.date) ?? 0) > 0.5 ? .maskBlink : .mask)
-            if let im = CapriArt.images[frame] {
-                Image(nsImage: im).resizable().interpolation(.high).aspectRatio(contentMode: .fit)
-            }
+            CapriArtImage(frame: mood == .alert ? .many
+                          : (!still && (EyesSchedule.blink(at: ctx.date) ?? 0) > 0.5 ? .blink : .open))
         }
         .accessibilityLabel(Text("Capri"))
     }

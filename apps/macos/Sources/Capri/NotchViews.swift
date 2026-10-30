@@ -104,7 +104,7 @@ struct TopRowView: View {
         let waiting = store.waiting.count
         HStack(spacing: 0) {
             CapriFace(mood: waiting > 0 ? .alert : codex.chatBusy ? .thinking : .idle, style: .mask)
-                .frame(width: 24, height: 13)
+                .frame(width: 26, height: 13)
                 .help("Capri — спросить (⌃⌥Space)")
             Spacer(minLength: ui.hasNotch ? notchWidth : 8)
             HStack(spacing: 7) {
