@@ -1,13 +1,21 @@
 import SwiftUI
 import CapriKit
 
-/// Состояние самого notch (не сессий): выбранная сессия, черновик ответа, акцент peek.
+/// Состояние самого notch (не сессий): выбранная сессия, черновик ответа, акцент peek, помощник.
 final class NotchUI: ObservableObject {
     @Published var selected: SessionKey?
     @Published var reply = ""
     @Published var hasNotch = true
     /// Сессия, о которой peek сообщает прямо сейчас (новое «ждёт меня»).
     @Published var alertKey: SessionKey?
+    /// Высота содержимого раскрытого notch и помощника (капля подстраивается под неё).
+    @Published var expandedHeight: CGFloat?
+    @Published var assistantHeight: CGFloat?
+    /// Текст в поле помощника и показан ли он сейчас (анимация лица — только пока виден).
+    @Published var assistantText = ""
+    @Published var assistantShown = false
+    /// Увеличивается при каждом открытии помощника — поле ввода забирает фокус.
+    @Published var assistantFocusTick = 0
 }
 
 /// Действия notch → контроллер.
@@ -17,6 +25,12 @@ struct NotchActions {
     var select: (SessionKey) -> Void
     /// «Подробнее» — основное окно на этой сессии.
     var details: (SessionKey) -> Void
+    /// Экранчик с Capri.
+    var assistant: () -> Void
+    /// Основное окно (без выбора сессии).
+    var window: () -> Void
+    /// Основное окно на разговоре с Capri.
+    var conversation: () -> Void
 }
 
 func agoText(_ seconds: Double) -> String {
@@ -53,16 +67,45 @@ struct WaitBar: View {
     var body: some View { SegmentBar(fraction: min(1, (clock.now - since) / 600), color: color) }
 }
 
+/// Высота содержимого для подгонки капли.
+struct ContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+extension View {
+    /// Сообщить высоту (содержимое должно иметь свою, т.е. `fixedSize(vertical:)`).
+    func reportHeight(_ set: @escaping (CGFloat) -> Void) -> some View {
+        background(GeometryReader { Color.clear.preference(key: ContentHeightKey.self, value: $0.size.height) })
+            .onPreferenceChange(ContentHeightKey.self) { h in if h > 0 { set(h) } }
+    }
+}
+
+func hudButton(_ title: String, accent: Color = Palette.crimson, enabled: Bool = true, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+        Caps(title, size: 8.5, color: accent == Palette.crimson ? Palette.text : accent, weight: .bold)
+            .padding(.horizontal, 7).padding(.vertical, 4)
+            .hud(stroke: accent.opacity(0.7), fill: accent.opacity(0.1), cut: 5)
+    }
+    .buttonStyle(.plain)
+    .disabled(!enabled)
+    .opacity(enabled ? 1 : 0.4)
+}
+
 // MARK: - Свёрнутый вид
 
+/// Слева от выреза — глаза Capri (клик — помощник), справа — счётчики.
 struct TopRowView: View {
     @ObservedObject var store: SessionStore
     @ObservedObject var ui: NotchUI
+    @ObservedObject var codex: CodexService
     var notchWidth: CGFloat
     var body: some View {
         let waiting = store.waiting.count
         HStack(spacing: 0) {
-            CapriGlyph(alert: waiting > 0)
+            CapriFace(mood: waiting > 0 ? .alert : codex.chatBusy ? .thinking : .idle, style: .eyes)
+                .frame(width: 24, height: 13)
+                .help("Capri — спросить (⌃⌥Space)")
             Spacer(minLength: ui.hasNotch ? notchWidth : 8)
             HStack(spacing: 7) {
                 if waiting > 0 {
@@ -93,7 +136,7 @@ struct PeekLineView: View {
         HStack(spacing: 7) {
             if let s = focus {
                 Image(systemName: "triangle.fill").font(.system(size: 7, weight: .bold)).foregroundColor(Palette.acid)
-                Caps(s.project, size: 10, color: Palette.acid, weight: .bold)
+                Caps(store.name(s).title, size: 10, color: Palette.acid, weight: .bold).fixedSize()
                 Rectangle().fill(Palette.line).frame(width: 1, height: 11)
                 Text(store.summary(s) ?? s.headline).font(.system(size: 12, weight: .medium)).foregroundColor(Palette.text).lineLimit(1)
                 Spacer(minLength: 0)
@@ -110,59 +153,75 @@ struct PeekLineView: View {
     }
 }
 
-// MARK: - Раскрытая панель
+// MARK: - Компактный раскрытый notch
 
+/// Только ждущие сессии (до 4 строк) + выбранная; выбранная раскрывается на месте: варианты или ответ.
+/// Всё подробное — в основном окне.
 struct ExpandedView: View {
     @ObservedObject var store: SessionStore
     @ObservedObject var ui: NotchUI
     var actions: NotchActions
     @FocusState private var replyFocused: Bool
 
-    /// Выбранная сессия. Если выбор задан, но сессия закрылась — nil (карточка скажет об этом),
-    /// а не тихая подмена: иначе набранный ответ ушёл бы в другую сессию.
-    var selected: Session? {
-        guard let k = ui.selected else { return store.sessions.first }
-        guard let r = store.resolve(k) else { return nil }
-        return store.sessions.first { $0.key == r }
+    static let maxRows = 4
+
+    private var selectedKey: SessionKey? { ui.selected.flatMap(store.resolve) }
+
+    /// Ждущие в стабильном порядке стора + выбранная (даже если уже не ждёт — строка не исчезает из-под курсора).
+    private var rows: [Session] {
+        let sel = selectedKey
+        let list = store.sessions.filter { $0.status == .needsInput || $0.key == sel }
+        guard list.count > Self.maxRows else { return list }
+        var head = Array(list.prefix(Self.maxRows))
+        if let sel, !head.contains(where: { $0.key == sel }), let s = list.first(where: { $0.key == sel }) { head[Self.maxRows - 1] = s }
+        return head
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            header
-            if store.sessions.isEmpty {
-                Spacer()
-                Caps("сессий нет", size: 10).frame(maxWidth: .infinity)
-                Spacer()
-            } else {
-                list
-                if let s = selected {
-                    card(s)
-                } else {
-                    Caps("выбранная сессия закрылась — выберите другую", size: 8.5, color: Palette.crimson)
-                        .frame(maxWidth: .infinity, alignment: .leading).padding(8)
-                        .hud(stroke: Palette.line, fill: Palette.fill, cut: 9)
+        let rows = rows
+        let waiting = store.waiting.count
+        VStack(alignment: .leading, spacing: 5) {
+            header(waiting)
+            if rows.isEmpty {
+                HStack(spacing: 8) {
+                    Text("Никто не ждёт").font(.system(size: 12, weight: .medium))
+                    Caps("работают · \(store.runningCount)", size: 8.5, color: store.runningCount > 0 ? Palette.crimson : Palette.dim)
+                    Spacer()
+                }
+                .padding(.vertical, 4)
+            }
+            ForEach(rows, id: \.key) { s in
+                VStack(alignment: .leading, spacing: 5) {
+                    row(s)
+                    if s.key == selectedKey { detail(s) }
                 }
             }
+            if waiting > rows.filter({ $0.status == .needsInput }).count {
+                Caps("+\(waiting - rows.filter { $0.status == .needsInput }.count) ждут — в окне", size: 8, color: Palette.dim)
+            }
+            footer
         }
+        .animation(.easeInOut(duration: 0.22), value: rows.map(\.key))
+        .animation(.easeInOut(duration: 0.22), value: selectedKey)
         .foregroundColor(Palette.text)
         .environment(\.colorScheme, .dark)
         .padding(.horizontal, 14).padding(.top, 4).padding(.bottom, 10)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .fixedSize(horizontal: false, vertical: true)
+        .reportHeight { ui.expandedHeight = $0 }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
-    private var header: some View {
+    private func header(_ waiting: Int) -> some View {
         VStack(spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Caps("ждут меня", size: 11, color: Palette.text, weight: .bold)
-                Caps(String(format: "// %02d", store.waiting.count), size: 11, color: Palette.acid, weight: .bold)
+                Caps("ждут меня", size: 10, color: Palette.text, weight: .bold)
+                Caps(String(format: "// %02d", waiting), size: 10, color: Palette.acid, weight: .bold)
                 Spacer()
-                ForEach(store.hosts) { h in
-                    HStack(spacing: 3) {
-                        Rectangle().fill(h.connected ? Palette.acid : Palette.crimson).frame(width: 5, height: 5)
-                        Caps(SessionStore.displayHost(h.name), size: 8, color: h.connected ? Palette.dim : Palette.crimson)
-                    }
-                    .help(h.connected ? "\(h.name): на связи" : "\(h.name): нет связи")
+                ForEach(store.hosts.filter { !$0.connected }) { h in
+                    Caps("нет связи: \(SessionStore.displayHost(h.name))", size: 7.5, color: Palette.crimson)
                 }
+                hudButton("✦ capri", accent: Palette.codex) { actions.assistant() }
+                    .help("Спросить Capri (⌃⌥Space)")
             }
             HStack(spacing: 0) {
                 Rectangle().fill(Palette.crimson).frame(width: 26, height: 2)
@@ -171,96 +230,52 @@ struct ExpandedView: View {
         }
     }
 
-    private var list: some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            VStack(spacing: 2) {
-                ForEach(store.sessions, id: \.key) { s in row(s) }
-            }
-        }
-        .frame(maxHeight: .infinity)
-    }
-
-    private func color(_ s: Session) -> Color {
-        switch s.status {
-        case .needsInput: return Palette.acid
-        case .running: return Palette.crimson
-        case .error, .rateLimited: return Palette.crimson
-        default: return Palette.dim
-        }
-    }
-
     private func row(_ s: Session) -> some View {
-        let isSelected = s.key == selected?.key
+        let on = s.key == selectedKey
+        let name = store.name(s)
         return Button(action: { actions.select(s.key) }) {
             HStack(spacing: 7) {
-                Group {
-                    switch s.status {
-                    case .needsInput: Image(systemName: "triangle.fill").font(.system(size: 7, weight: .bold))
-                    case .running: Rectangle().frame(width: 5, height: 5).rotationEffect(.degrees(45))
-                    default: Rectangle().frame(width: 5, height: 1.5)
-                    }
-                }
-                .foregroundColor(color(s)).frame(width: 9)
-                Text(s.project).font(.system(size: 11, weight: .semibold)).lineLimit(1).frame(width: 96, alignment: .leading)
-                Caps(s.hostLabel, size: 7).fixedSize()
-                Text(s.headline).font(.system(size: 10)).foregroundColor(Palette.text.opacity(0.75)).lineLimit(1)
+                StatusMark(status: s.status).frame(width: 9)
+                Text(name.title).font(.system(size: 11.5, weight: .semibold)).lineLimit(1).fixedSize()
+                if let d = name.detail { Text(d).font(.mono(8.5)).foregroundColor(Palette.dim).lineLimit(1) }
+                Text(store.summary(s) ?? s.headline).font(.system(size: 10.5)).foregroundColor(Palette.text.opacity(0.72)).lineLimit(1)
                 Spacer(minLength: 4)
-                AgoLabel(clock: store.clock, since: s.statusSince, color: color(s))
+                AgoLabel(clock: store.clock, since: s.statusSince, color: s.statusColor)
             }
-            .padding(.horizontal, 6).padding(.vertical, 3)
-            .background(isSelected ? Palette.crimson.opacity(0.14) : Color.clear)
+            .padding(.horizontal, 6).padding(.vertical, 4)
+            .background(on ? Palette.crimson.opacity(0.14) : Color.clear)
+            .overlay(alignment: .leading) { Rectangle().fill(on ? s.statusColor : .clear).frame(width: 2) }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
 
-    private func card(_ s: Session) -> some View {
-        let waiting = s.status == .needsInput
-        let accent = waiting ? Palette.acid : Palette.crimson
-        let choices = waiting ? (s.request?.choices ?? []) : []
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Caps(waiting ? "▲ attention" : s.status.rawValue.replacingOccurrences(of: "_", with: " "),
-                     size: 8, color: accent, weight: .bold).fixedSize()
-                Caps(s.kindLabel, size: 8).fixedSize()
-                Spacer(minLength: 4)
-                if waiting { WaitBar(clock: store.clock, since: s.statusSince, color: accent) }
-                hudButton("подробнее", accent: Palette.crimson) { actions.details(s.key) }
-                    .help("Основное окно: экран сессии и история")
-                hudButton("открыть ↗", accent: Palette.crimson, enabled: s.tmux != nil) { actions.open(s.key) }
-                    .help(s.tmux == nil ? "сессия не в tmux" : "Terminal с tmux attach на эту панель")
-            }
-            Text("\(s.project)  ·  \(s.hostLabel)").font(.system(size: 10, weight: .semibold))
-                .foregroundColor(Palette.text.opacity(0.8)).lineLimit(1)
-            if waiting || s.status == .idle {
-                Text(s.headline)
-                    .font(s.request?.kind == .permission ? .mono(10.5) : .system(size: 11))
-                    .foregroundColor(Palette.text)
-                    .lineLimit(2)
-                    .padding(.horizontal, 7).padding(.vertical, 3)
+    private func detail(_ s: Session) -> some View {
+        let choices = s.status == .needsInput ? (s.request?.choices ?? []) : []
+        return VStack(alignment: .leading, spacing: 5) {
+            if s.status == .needsInput, let r = s.request, r.summary.count > 60 {
+                Text(r.summary).font(r.kind == .permission ? .mono(10) : .system(size: 10.5))
+                    .lineLimit(3).padding(.horizontal, 7).padding(.vertical, 3)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.black.opacity(0.55))
             }
-            if let summary = store.summary(s) { CodexSummaryLine(text: summary) }
             if !choices.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 5) {
                         ForEach(choices) { c in
                             hudButton("\(c.index) \(short(c.label))", accent: c.index == 1 ? Palette.acid : Palette.crimson,
-                                      enabled: !store.deliveries.isBusy(s.key)) {
-                                actions.send(s.key, .choose(c.index))
-                            }
-                            .help(c.label)
+                                      enabled: !store.deliveries.isBusy(s.key)) { actions.send(s.key, .choose(c.index)) }
+                                .help(c.label)
                         }
                     }
                 }
             } else {
                 replyRow(s)
             }
-            status(s)
+            if let h = store.hint(s) { Text(h.text).font(.system(size: 9.5)).foregroundColor(h.color).lineLimit(1) }
         }
-        .padding(8)
-        .hud(stroke: accent.opacity(0.6), fill: accent.opacity(0.05), cut: 9)
+        .padding(.leading, 22)
+        .transition(.opacity)
     }
 
     private func replyRow(_ s: Session) -> some View {
@@ -268,42 +283,36 @@ struct ExpandedView: View {
         return HStack(spacing: 6) {
             HStack(spacing: 6) {
                 Text(">").font(.mono(12, .bold)).foregroundColor(Palette.crimson)
-                TextField(s.status == .running ? "сессия работает…" : "ответ в \(s.project)", text: $ui.reply)
+                TextField(s.status == .running ? "сессия работает…" : "ответ в \(store.name(s).title)", text: $ui.reply)
                     .textFieldStyle(.plain).font(.mono(11.5))
                     .focused($replyFocused)
                     .onSubmit { submit(s) }
             }
-            .padding(.horizontal, 8).padding(.vertical, 5)
+            .padding(.horizontal, 8).padding(.vertical, 4)
             .hud(fill: Color.black.opacity(0.5), cut: 6)
-            hudButton("⏎", accent: Palette.crimson, enabled: refusal == nil && !ui.reply.isEmpty) { submit(s) }
+            hudButton("⏎", enabled: refusal == nil && !ui.reply.isEmpty) { submit(s) }
         }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 6) {
+            if let k = selectedKey {
+                hudButton("подробнее ⟶") { actions.details(k) }.help("Основное окно: экран сессии и история")
+                hudButton("открыть ↗", enabled: store.session(k)?.tmux != nil) { actions.open(k) }
+                    .help("Terminal с tmux attach на эту панель")
+            }
+            Spacer()
+            hudButton("окно capri") { actions.window() }
+        }
+        .padding(.top, 2)
     }
 
     private func submit(_ s: Session) {
-        let text = ui.reply
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        actions.send(s.key, .text(text))
-    }
-
-    @ViewBuilder
-    private func status(_ s: Session) -> some View {
-        if let h = store.hint(s) {
-            Text(h.text).font(.system(size: 9.5)).foregroundColor(h.color).lineLimit(1)
-        }
+        guard !ui.reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        actions.send(s.key, .text(ui.reply))
     }
 
     private func short(_ label: String) -> String {
         label.count > 16 ? String(label.prefix(15)) + "…" : label
-    }
-
-    private func hudButton(_ title: String, accent: Color, enabled: Bool = true, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Caps(title, size: 8.5, color: accent == Palette.crimson ? Palette.text : accent, weight: .bold)
-                .padding(.horizontal, 7).padding(.vertical, 4)
-                .hud(stroke: accent.opacity(0.7), fill: accent.opacity(0.1), cut: 5)
-        }
-        .buttonStyle(.plain)
-        .disabled(!enabled)
-        .opacity(enabled ? 1 : 0.4)
     }
 }

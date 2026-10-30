@@ -21,9 +21,10 @@ public struct NotchScreen: Equatable {
     }
 }
 
-/// Свёрнутый — продолжение выреза; peek — чуть выехал вниз, одна строка; expanded — полная панель.
+/// Свёрнутый — продолжение выреза; peek — чуть выехал вниз, одна строка; expanded — компактный список
+/// ждущих с быстрым ответом; assistant — экранчик с Capri (персонаж, облачко, ввод).
 public enum NotchState: String, CaseIterable {
-    case collapsed, peek, expanded
+    case collapsed, peek, expanded, assistant
 }
 
 public enum NotchGeometry {
@@ -31,7 +32,14 @@ public enum NotchGeometry {
     public static let pillSize = CGSize(width: 200, height: 26)
     public static let peekExtraHeight: CGFloat = 34
     public static let peekExtraWidth: CGFloat = 40
-    public static let expandedSize = CGSize(width: 440, height: 320)
+    /// Компактный раскрытый notch: ширина постоянная, высота — по содержимому (`contentHeight`).
+    public static let expandedWidth: CGFloat = 400
+    public static let expandedHeight: ClosedRange<CGFloat> = 96...300
+    public static let assistantWidth: CGFloat = 430
+    public static let assistantHeight: ClosedRange<CGFloat> = 150...330
+    /// Самая большая форма — под неё фиксированная прозрачная панель.
+    public static let expandedSize = CGSize(width: max(expandedWidth, assistantWidth),
+                                            height: max(expandedHeight.upperBound, assistantHeight.upperBound))
     /// Запас прозрачной панели вокруг самой большой формы: под перелёт пружины и тень.
     public static let hostMargin: CGFloat = 24
 
@@ -63,7 +71,9 @@ public enum NotchGeometry {
     }
 
     /// `quiet` — нет активности: свёрнутая капля совпадает с вырезом (без выреза — невидимая полоска).
-    public static func shapeSize(_ state: NotchState, _ s: NotchScreen, quiet: Bool = false) -> CGSize {
+    /// `contentHeight` — высота содержимого раскрытого notch и помощника (nil — нижняя граница).
+    public static func shapeSize(_ state: NotchState, _ s: NotchScreen, quiet: Bool = false, contentHeight: CGFloat? = nil) -> CGSize {
+        func clamp(_ h: CGFloat?, _ r: ClosedRange<CGFloat>) -> CGFloat { min(max(h ?? r.lowerBound, r.lowerBound), r.upperBound) }
         let collapsed: CGSize
         if let notch = notchRect(s) {
             collapsed = CGSize(width: notch.width + 2 * sideWidth, height: notch.height)
@@ -75,7 +85,8 @@ public enum NotchGeometry {
             return notchRect(s)?.size ?? CGSize(width: pillSize.width, height: 0)
         case .collapsed: return collapsed
         case .peek: return CGSize(width: collapsed.width + peekExtraWidth, height: collapsed.height + peekExtraHeight)
-        case .expanded: return expandedSize
+        case .expanded: return CGSize(width: expandedWidth, height: clamp(contentHeight, expandedHeight))
+        case .assistant: return CGSize(width: assistantWidth, height: clamp(contentHeight, assistantHeight))
         }
     }
 
@@ -89,8 +100,8 @@ public enum NotchGeometry {
     }
 
     /// Капля в состоянии `state` (глобальные координаты) — для отрисовки и проверки попадания мыши.
-    public static func shapeRect(_ state: NotchState, _ s: NotchScreen, quiet: Bool = false) -> CGRect {
-        let size = shapeSize(state, s, quiet: quiet)
+    public static func shapeRect(_ state: NotchState, _ s: NotchScreen, quiet: Bool = false, contentHeight: CGFloat? = nil) -> CGRect {
+        let size = shapeSize(state, s, quiet: quiet, contentHeight: contentHeight)
         let host = hostFrame(s)
         var x = anchorX(s) - size.width / 2
         x = max(min(x, host.maxX - size.width), host.minX)

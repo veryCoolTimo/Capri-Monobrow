@@ -158,9 +158,11 @@ final class RedactorTests: XCTestCase {
                     confidence: .hook, statusSince: 0, lastEventAt: 0,
                     request: PendingRequest(kind: .permission, summary: summary), lastMessage: nil, typedInput: nil)
         }
-        let p = CodexPrompts.chat(question: "что ждёт?", sessions: [s("prod", "rm -rf /data/clients"), s("dev", "npm test")],
-                                  private: ["prod"]) { _ in ["SCREEN LINE"] }
+        let secret = HistoryEntry(id: 1, ts: 0, kind: .info, text: "SECRET HISTORY")
+        let p = Assistant.prompt(question: "что ждёт?", sessions: [s("prod", "rm -rf /data/clients"), s("dev", "npm test")],
+                                 private: ["prod"], history: { $0.key.host == "prod" ? [secret] : [] }, screens: { _ in ["SCREEN LINE"] }).text
         XCTAssertFalse(p.contains("rm -rf"))
+        XCTAssertFalse(p.contains("SECRET HISTORY"))
         XCTAssertTrue(p.contains("prod"))
         XCTAssertTrue(p.contains("npm test"))
         XCTAssertEqual(p.components(separatedBy: "SCREEN LINE").count, 2, "экран только у не скрытого хоста")
@@ -254,5 +256,67 @@ for line in sys.stdin:
         c.call("hello") { r in if case .failure(let e) = r { after = e } }
         XCTAssertEqual(after, .notRunning)
         c.stop()
+    }
+}
+
+final class AssistantTests: XCTestCase {
+    func session(_ id: String, tmux: String, status: SessionStatus = .idle) -> Session {
+        Session(key: SessionKey(host: "h", agent: .claude, id: id), tmux: TmuxRef(pane: "%\(id.count)", session: tmux),
+                cwd: "/w/votek", status: status, confidence: .hook, statusSince: 0, lastEventAt: 0,
+                request: status == .needsInput ? PendingRequest(kind: .question, summary: "Какой формат?", options: ["1 JSON", "2 CSV"]) : nil,
+                lastMessage: "готово: тесты зелёные", typedInput: nil)
+    }
+
+    func testPromptNamesSessionsWithRefsHistoryAndMentionedScreens() {
+        let a = session("a", tmux: "votek"), b = session("bb", tmux: "votek2", status: .needsInput)
+        let token = "ghp_" + String(repeating: "x", count: 36)
+        let hist = HistoryEntry(id: 1, ts: 0, kind: .info, text: "запустила деплой \(token)")
+        let p = Assistant.prompt(question: "что сделала votek?", sessions: [a, b],
+                                 history: { $0.key.id == "a" ? [hist] : [] }, screens: { ["экран \($0.key.id)"] })
+        XCTAssertEqual(p.refs, ["S1": a.key, "S2": b.key])
+        XCTAssertTrue(p.text.contains("S1 · votek ·"), p.text)
+        XCTAssertTrue(p.text.contains("запустила деплой"))
+        XCTAssertFalse(p.text.contains(token), "история проходит через Redactor")
+        XCTAssertTrue(p.text.contains("экран a"), "упомянутая в вопросе сессия — с экраном")
+        XCTAssertTrue(p.text.contains("экран bb"), "ждущая — с экраном")
+    }
+
+    func testPrivateHostsGetNoRefsAndNoFolder() {
+        var prod = session("p", tmux: "votek3")
+        prod.key.host = "quiz"
+        let p = Assistant.prompt(question: "ответь votek3", sessions: [prod, session("a", tmux: "dev")], private: ["quiz"],
+                                 history: { _ in [] }, screens: { _ in ["SCREEN"] })
+        XCTAssertEqual(Array(p.refs.keys), ["S1"])
+        XCTAssertEqual(p.refs["S1"]?.id, "a")
+        XCTAssertTrue(p.text.contains("— · votek3 · хост quiz"))
+        XCTAssertFalse(p.text.contains("готово: тесты зелёные · хост quiz"))
+    }
+
+    func testParseExtractsActionsAndCleansText() {
+        let r = Assistant.parse("""
+        Отвечу votek2 форматом JSON.
+        <capri-action>{"session":"S2","choose":1}</capri-action>
+        <capri-action>{"session":"S1","text":"запусти тесты"}</capri-action>
+        <capri-action>{"session":"S3","rm":"-rf"}</capri-action>
+        """)
+        XCTAssertEqual(r.text, "Отвечу votek2 форматом JSON.")
+        XCTAssertEqual(r.proposals, [Assistant.Proposal(ref: "S2", action: .choose(1)),
+                                     Assistant.Proposal(ref: "S1", action: .text("запусти тесты"))])
+        XCTAssertTrue(Assistant.parse("<capri-action>{\"session\":\"S1\",\"choose\":42}</capri-action>").proposals.isEmpty)
+        XCTAssertTrue(Assistant.parse("<capri-action>{\"session\":\"S1\",\"choose\":true}</capri-action>").proposals.isEmpty)
+    }
+
+    func testStreamingHidesUnfinishedActionBlock() {
+        XCTAssertEqual(Assistant.visible("Готово. <capri-action>{\"session\":\"S"), "Готово.")
+        XCTAssertEqual(Assistant.visible("Готово. <capr"), "Готово.")
+        XCTAssertEqual(Assistant.visible("a < b"), "a < b")
+    }
+
+    func testLocalAnswerListsWaiting() {
+        let w = session("w", tmux: "votek2", status: .needsInput), r = session("r", tmux: "vfx", status: .running)
+        let text = Assistant.localAnswer(sessions: [w, r], names: [:])
+        XCTAssertTrue(text.contains("votek2 — Какой формат?"), text)
+        XCTAssertTrue(text.contains("Работают: vfx"), text)
+        XCTAssertEqual(Assistant.localAnswer(sessions: [], names: [:]), "Никто не ждёт.")
     }
 }

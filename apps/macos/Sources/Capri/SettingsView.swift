@@ -29,6 +29,11 @@ final class Settings: ObservableObject {
     /// Текст запроса в уведомлениях macOS (виден на экране блокировки). По умолчанию — только имя сессии.
     @Published var notificationText: Bool { didSet { d.set(notificationText, forKey: "capri.notificationText") } }
     @Published var loginItemError: String?
+    /// Глобальный шорткат вызова Capri (⌃⌥Space).
+    @Published var assistantHotKey: Bool { didSet { d.set(assistantHotKey, forKey: "capri.assistantHotKey"); onHotKeyChange?() } }
+    var onHotKeyChange: (() -> Void)?
+    /// Шорткат не зарегистрировался (занят другим приложением).
+    @Published var hotKeyError: String?
     var loginItem: Bool {
         get { LoginItem.enabled }
         set { loginItemError = LoginItem.set(newValue); objectWillChange.send() }
@@ -49,6 +54,7 @@ final class Settings: ObservableObject {
         codexPrivateHosts = Set(d.stringArray(forKey: "capri.codexPrivateHosts") ?? ["quiz"])
         codexPath = d.string(forKey: "capri.codexPath") ?? ""
         hosts = Self.hosts
+        assistantHotKey = d.object(forKey: "capri.assistantHotKey") as? Bool ?? true
     }
 
     /// Настройки прототипа (`local.capri.prototype`) переезжают в `local.capri` один раз;
@@ -113,6 +119,14 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section {
+                Toggle("Вызывать Capri по \(HotKey.assistant.label)", isOn: $settings.assistantHotKey)
+                if let e = settings.hotKeyError { Text(e).font(.caption).foregroundColor(Palette.crimson) }
+            } header: {
+                Text("Capri")
+            } footer: {
+                Text("Ещё: клик по глазам слева от выреза или «✦ capri» в раскрытом notch.").font(.caption).foregroundColor(.secondary)
+            }
             Section("Уведомления") {
                 Toggle("Звук, когда сессия ждёт ответа", isOn: $settings.sound)
                 Toggle("Уведомления macOS, когда notch не видно", isOn: $settings.systemNotifications)
@@ -183,7 +197,7 @@ struct SettingsView: View {
             } header: {
                 Text("Codex")
             } footer: {
-                Text("Помощник, сводки и черновики отправляют в OpenAI запросы сессий и низ их экранов. Токены, ключи, пароли и email вырезаются; инструменты у Codex выключены — он только читает текст. Сессии с выключенных хостов — только имя и статус.")
+                Text("Помощник, сводки и черновики отправляют в OpenAI запросы сессий, последние события и низ экранов ждущих и упомянутых в вопросе сессий. Токены, ключи, пароли и email вырезаются; инструменты у Codex выключены — он только читает текст. Сессии с выключенных хостов — только имя и статус.")
                     .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
         }

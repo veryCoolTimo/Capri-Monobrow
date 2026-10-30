@@ -5,6 +5,8 @@ import Combine
 import CapriKit
 
 // Notch-капля над строкой меню: свёрнутый → (наведение или новое «ждёт меня») → peek → (клик) → expanded.
+// Помощник (assistant) — по ⌃⌥Space, клику по глазам Capri слева от выреза или кнопке «✦ capri».
+// Высота expanded и assistant — по содержимому (SwiftUI сообщает её в NotchUI), капля подстраивается пружиной.
 // Панель фиксированного размера и прозрачная; капля — CAShapeLayer, её путь анимируется пружиной в
 // render server. Отработано в NotchSpike (Этап 0), здесь — на живых сессиях.
 // Проверка без мыши: SIGUSR1 — peek, SIGUSR2 — клик, SIGINFO — снимок окна в ~/.capri/tmp/notch-<state>.png.
@@ -81,6 +83,7 @@ final class FadingHost<Content: View>: NSHostingView<Content> {
 
     func reset(shown: Bool, lift: CGFloat) {
         shownState = shown
+        isHidden = !shown
         alphaValue = shown ? 1 : hiddenContentAlpha
         setFrameOrigin(shown ? restingOrigin : CGPoint(x: restingOrigin.x, y: restingOrigin.y + lift))
     }
@@ -88,16 +91,19 @@ final class FadingHost<Content: View>: NSHostingView<Content> {
 
 final class NotchController: NSObject {
     let store: SessionStore
+    let codex: CodexService
     let ui = NotchUI()
     /// Меню по правому клику (с «Выйти») — его даёт AppDelegate.
     var makeMenu: (() -> NSMenu)?
-    /// «Подробнее» в карточке — открыть основное окно.
-    var onDetails: ((SessionKey, String) -> Void)?
+    /// «Подробнее» в карточке — открыть основное окно (nil — без выбора сессии; второе — черновик ответа).
+    var onDetails: ((SessionKey?, String) -> Void)?
+    /// «Весь разговор» в помощнике — основное окно на чате.
+    var onConversation: (() -> Void)?
     /// Отладочные команды, которые обрабатывает не notch (окно и т.п.).
     var onDebug: ((String, String) -> Void)?
 
     private var panel: NotchPanel!
-    private var container: NSView!
+    private(set) var container: NSView!
     private let dropLayer = CAShapeLayer()
     private let maskLayer = CAShapeLayer()
     private let strokeLayer = CAShapeLayer()
@@ -106,7 +112,8 @@ final class NotchController: NSObject {
     private var topRow: FadingHost<TopRowView>!
     private var peekLine: FadingHost<PeekLineView>!
     private var expandedHost: FadingHost<ExpandedView>!
-    private var screen: NSScreen!
+    private var assistantHost: FadingHost<AssistantView>!
+    private(set) var screen: NSScreen!
     private var notch = NotchScreen(frame: .zero, visibleFrame: .zero, safeAreaTop: 0, auxiliaryTopLeft: nil, auxiliaryTopRight: nil)
     private var host: CGRect = .zero
     private(set) var state: NotchState = .collapsed
@@ -118,14 +125,17 @@ final class NotchController: NSObject {
     private var signalSources: [DispatchSourceSignal] = []
     private var cancellables: Set<AnyCancellable> = []
     private var hovering = false
+    /// Переходы notch в лог — только с `--debug-control`.
+    var debugLog = false
     private var lastSound: Date = .distantPast
     /// Экран, на котором живёт notch.
     var notchScreen: NSScreen? { screen }
     /// Полноэкранное приложение на экране notch: свёрнутый notch спрятан, всплывает только на «ждёт меня».
     private(set) var suppressed = false
 
-    init(store: SessionStore) {
+    init(store: SessionStore, codex: CodexService) {
         self.store = store
+        self.codex = codex
         super.init()
     }
 
@@ -172,14 +182,25 @@ final class NotchController: NSObject {
                 let draft = self.ui.selected.flatMap(self.store.resolve) == self.store.resolve(key) ? self.ui.reply : ""
                 self.go(.collapsed, reason: "details")
                 self.onDetails?(key, draft)
+            },
+            assistant: { [weak self] in self?.go(.assistant, reason: "button") },
+            window: { [weak self] in
+                self?.go(.collapsed, reason: "window")
+                self?.onDetails?(nil, "")
+            },
+            conversation: { [weak self] in
+                self?.go(.collapsed, reason: "conversation")
+                self?.onConversation?()
             })
-        topRow = FadingHost(rootView: TopRowView(store: store, ui: ui, notchWidth: 0))
+        topRow = FadingHost(rootView: TopRowView(store: store, ui: ui, codex: codex, notchWidth: 0))
         peekLine = FadingHost(rootView: PeekLineView(store: store, ui: ui))
         expandedHost = FadingHost(rootView: ExpandedView(store: store, ui: ui, actions: actions))
+        assistantHost = FadingHost(rootView: AssistantView(codex: codex, store: store, ui: ui, actions: actions))
         topRow.sizingOptions = []
         peekLine.sizingOptions = []
         expandedHost.sizingOptions = []
-        for v in [topRow!, peekLine!, expandedHost!] as [NSView] {
+        assistantHost.sizingOptions = []
+        for v in [topRow!, peekLine!, expandedHost!, assistantHost!] as [NSView] {
             v.wantsLayer = true
             contentView.addSubview(v)
         }
@@ -195,8 +216,14 @@ final class NotchController: NSObject {
             self?.pickScreen()
         }
         NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: panel, queue: .main) { [weak self] _ in
-            if self?.state == .expanded { self?.go(.collapsed, reason: "resignKey") }
+            if self?.state == .expanded || self?.state == .assistant { self?.go(.collapsed, reason: "resignKey") }
         }
+        // Содержимое поменяло высоту — капля подстраивается.
+        // @Published шлёт значение до записи в свойство — берём высоту из потока, не из ui.
+        ui.$expandedHeight.removeDuplicates()
+            .sink { [weak self] h in self?.contentResized(.expanded, h) }.store(in: &cancellables)
+        ui.$assistantHeight.removeDuplicates()
+            .sink { [weak self] h in self?.contentResized(.assistant, h) }.store(in: &cancellables)
         // Изменения сессий: свёрнутая капля растёт/сжимается вокруг выреза.
         store.objectWillChange
             .receive(on: DispatchQueue.main)
@@ -213,8 +240,28 @@ final class NotchController: NSObject {
         applyScreen()
     }
 
+    /// Высота содержимого под верхней строкой (её мерит SwiftUI).
+    private var measured: [NotchState: CGFloat] = [:]
+
+    /// Высота формы с учётом содержимого.
+    private func contentHeight(_ s: NotchState) -> CGFloat? {
+        let row = NotchGeometry.notchRect(notch)?.height ?? NotchGeometry.pillSize.height
+        return measured[s].map { $0 + row }
+    }
+
+    private func global(_ s: NotchState) -> CGRect {
+        NotchGeometry.shapeRect(s, notch, quiet: quiet, contentHeight: contentHeight(s))
+    }
+
     private func local(_ s: NotchState) -> CGRect {
-        NotchGeometry.shapeRect(s, notch, quiet: quiet).offsetBy(dx: -host.minX, dy: -host.minY)
+        global(s).offsetBy(dx: -host.minX, dy: -host.minY)
+    }
+
+    private func contentResized(_ s: NotchState, _ h: CGFloat?) {
+        measured[s] = h
+        guard state == s, panel != nil else { return }
+        animateShape(to: s)
+        updateMouseThrough()
     }
 
     private func radii(_ s: NotchState) -> (top: CGFloat, bottom: CGFloat) {
@@ -222,7 +269,7 @@ final class NotchController: NSObject {
         switch s {
         case .collapsed: return (hasNotch ? 6 : 0, hasNotch ? 10 : 13)
         case .peek: return (hasNotch ? 8 : 0, 16)
-        case .expanded: return (hasNotch ? 14 : 0, 24)
+        case .expanded, .assistant: return (hasNotch ? 14 : 0, 24)
         }
     }
 
@@ -241,6 +288,7 @@ final class NotchController: NSObject {
         case .collapsed: return 0
         case .peek: return 0.55
         case .expanded: return 0.8
+        case .assistant: return 0.9
         }
     }
 
@@ -266,17 +314,23 @@ final class NotchController: NSObject {
         let rowHeight = notchRect?.height ?? NotchGeometry.pillSize.height
         let collapsed = NotchGeometry.shapeRect(.collapsed, notch).offsetBy(dx: -host.minX, dy: -host.minY)
         let peek = local(.peek)
-        let expanded = local(.expanded)
-        topRow.rootView = TopRowView(store: store, ui: ui, notchWidth: notchRect?.width ?? 0)
+        topRow.rootView = TopRowView(store: store, ui: ui, codex: codex, notchWidth: notchRect?.width ?? 0)
         topRow.frame = CGRect(x: collapsed.minX, y: bounds.height - rowHeight, width: collapsed.width, height: rowHeight)
         topRow.restingOrigin = topRow.frame.origin
         peekLine.frame = CGRect(x: peek.minX, y: peek.minY + 3, width: peek.width, height: peek.height - rowHeight - 3)
         peekLine.restingOrigin = peekLine.frame.origin
-        expandedHost.frame = CGRect(x: expanded.minX, y: expanded.minY, width: expanded.width, height: expanded.height - rowHeight)
+        // Содержимое expanded/assistant — во всю наибольшую высоту под верхней строкой, прижато к верху;
+        // лишнее срезает маска капли.
+        for (hostView, s) in [(expandedHost as NSView, NotchState.expanded), (assistantHost as NSView, NotchState.assistant)] {
+            let maxRect = NotchGeometry.shapeRect(s, notch, contentHeight: .greatestFiniteMagnitude).offsetBy(dx: -host.minX, dy: -host.minY)
+            hostView.frame = CGRect(x: maxRect.minX, y: maxRect.minY, width: maxRect.width, height: maxRect.height - rowHeight)
+        }
         expandedHost.restingOrigin = expandedHost.frame.origin
+        assistantHost.restingOrigin = assistantHost.frame.origin
         topRow.reset(shown: !(quiet && state == .collapsed), lift: 0)
         peekLine.reset(shown: state == .peek, lift: 6)
         expandedHost.reset(shown: state == .expanded, lift: 8)
+        assistantHost.reset(shown: state == .assistant, lift: 8)
     }
 
     // MARK: состояния
@@ -301,6 +355,7 @@ final class NotchController: NSObject {
     func go(_ target: NotchState, reason: String) {
         guard target != state else { return }
         let from = state
+        if debugLog { Self.debugWrite("notch \(from.rawValue) → \(target.rawValue) (\(reason))") }
         let growing = NotchState.allCases.firstIndex(of: target)! > NotchState.allCases.firstIndex(of: from)!
         state = target
         if suppressed {
@@ -315,8 +370,11 @@ final class NotchController: NSObject {
             }
         }
         collapseWork?.cancel()
-        panel.allowKey = target == .expanded
+        let interactive: Set<NotchState> = [.expanded, .assistant]
+        panel.allowKey = interactive.contains(target)
         if target != .peek { ui.alertKey = nil }
+        ui.assistantShown = target == .assistant
+        if target == .assistant { ui.assistantFocusTick += 1 }
         // Карточка не должна переключаться сама при пересортировке списка — закрепляем выбор.
         if target == .expanded, ui.selected.flatMap(store.resolve) == nil {
             ui.selected = store.waiting.first?.key ?? store.sessions.first?.key
@@ -324,8 +382,10 @@ final class NotchController: NSObject {
 
         if from == .peek { peekLine.set(shown: false, delay: 0, duration: 0.1, lift: 6) }
         if from == .expanded { expandedHost.set(shown: false, delay: 0, duration: 0.12, lift: 8) }
+        if from == .assistant { assistantHost.set(shown: false, delay: 0, duration: 0.12, lift: 8) }
         if target == .peek { peekLine.set(shown: true, delay: growing ? 0.1 : 0.2, duration: 0.22, lift: 6) }
         if target == .expanded { expandedHost.set(shown: true, delay: 0.12, duration: 0.24, lift: 8) }
+        if target == .assistant { assistantHost.set(shown: true, delay: 0.14, duration: 0.26, lift: 10) }
         if quiet { topRow.set(shown: target != .collapsed, delay: target == .collapsed ? 0 : 0.1, duration: 0.2, lift: 0) }
 
         let shapeDelay: TimeInterval = growing ? 0 : 0.06
@@ -334,14 +394,15 @@ final class NotchController: NSObject {
             self.animateShape(to: target)
         }
         // Ключевым окно делаем после пружины: смена key-статуса перерисовывает SwiftUI-панель.
-        if target == .expanded {
+        if interactive.contains(target) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                guard let self, self.state == .expanded else { return }
+                guard let self, self.state == target else { return }
                 self.panel.makeKey()
+                if target == .assistant { self.ui.assistantFocusTick += 1 }
             }
-        } else if from == .expanded {
+        } else if interactive.contains(from) {
             panel.resignKey()
-            ui.reply = ""
+            if from == .expanded { ui.reply = "" }
         }
         updateMouseThrough()
     }
@@ -418,6 +479,21 @@ final class NotchController: NSObject {
         go(state == .expanded ? (hovering ? .peek : .collapsed) : .expanded, reason: "click")
     }
 
+    /// ⌃⌥Space и пункт меню: открыть экранчик Capri или убрать его.
+    func toggleAssistant() {
+        if suppressed && state == .collapsed { setPanelVisible(true) }
+        go(state == .assistant ? .collapsed : .assistant, reason: "assistant")
+    }
+
+    /// Клик по левому крылу верхней строки (там глаза Capri), а не по строке peek под ней.
+    private func onCapriEyes(_ p: NSPoint) -> Bool {
+        let top = NotchGeometry.anchorTop(notch)
+        let row = NotchGeometry.notchRect(notch)?.height ?? NotchGeometry.pillSize.height
+        guard p.y >= top - row else { return false }
+        if let n = NotchGeometry.notchRect(notch) { return p.x < n.minX }
+        return p.x < global(state).minX + 40
+    }
+
     /// Спрятать свёрнутый notch (полноэкранное приложение) или вернуть. Раскрытый и peek не трогаем —
     /// они спрячутся, когда свернутся.
     func setSuppressed(_ value: Bool) {
@@ -442,7 +518,7 @@ final class NotchController: NSObject {
             lastSound = Date()
             NSSound(named: "Tink")?.play()
         }
-        if state == .expanded {
+        if state == .expanded || state == .assistant {
             glitch()
             return
         }
@@ -460,13 +536,13 @@ final class NotchController: NSObject {
 
     // MARK: действия
 
-    private func select(_ key: SessionKey) {
+    func select(_ key: SessionKey) {
         if ui.selected != key { ui.reply = "" }
         ui.selected = key
         store.clearDelivery(key)
     }
 
-    private func send(_ key: SessionKey, _ action: ReplyAction) {
+    func send(_ key: SessionKey, _ action: ReplyAction) {
         let key = store.resolve(key) ?? key
         ui.selected = key
         store.send(key, action) { [weak self] ok in
@@ -485,72 +561,15 @@ final class NotchController: NSObject {
         }
     }
 
-    private func open(_ key: SessionKey) {
+    func open(_ key: SessionKey) {
         if store.openTerminal(key) { go(.collapsed, reason: "open") }
-    }
-
-    // MARK: отладочное управление
-
-    /// Только с `--debug-control`: команды из `~/.capri/tmp/control` идут по тем же путям, что клики, —
-    /// для сквозной проверки без мыши. Файл в каталоге 0700, читается и удаляется раз в 0.3 с.
-    func startDebugControl() {
-        let file = CapriPaths.tmp.appendingPathComponent("control")
-        CapriPaths.ensureDir()
-        Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
-            // Только обычный файл владельца, не ссылка.
-            var st = stat()
-            guard lstat(file.path, &st) == 0 else { return }
-            defer { try? FileManager.default.removeItem(at: file) }
-            guard (st.st_mode & S_IFMT) == S_IFREG, st.st_uid == getuid(),
-                  let data = FileManager.default.contents(atPath: file.path) else { return }
-            for line in String(decoding: data, as: UTF8.self).split(separator: "\n") { self?.debugCommand(String(line)) }
-        }
-        NSLog("[Capri] отладочное управление: %@", file.path)
-    }
-
-    private func debugCommand(_ line: String) {
-        let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
-        let arg = parts.count > 1 ? parts[1] : ""
-        NSLog("[Capri] control: %@", parts.first ?? "")
-        switch parts.first {
-        case "expand": go(.expanded, reason: "control")
-        case "collapse": go(.collapsed, reason: "control")
-        case "peek": go(.peek, reason: "control")
-        case "select":
-            // select <tmux-сессия>: первая сессия Capri в этой tmux-сессии
-            if let s = store.sessions.first(where: { $0.tmux?.session == arg }) { select(s.key) }
-        case "choose": if let k = ui.selected, let n = Int(arg) { send(k, .choose(n)) }
-        case "text": if let k = ui.selected { ui.reply = arg; send(k, .text(arg)) }
-        case "open": if let k = ui.selected { open(k) }
-        case "snapshot": snapshot()
-        case "dump": dumpState()
-        default: if let cmd = parts.first { onDebug?(cmd, arg) }
-        }
-    }
-
-    private func dumpState() {
-        let rows = store.sessions.map { s -> [String: Any] in
-            var r: [String: Any] = ["key": s.key.description, "status": s.status.rawValue, "project": s.project, "title": store.name(s).full,
-                                    "tmux": s.tmux?.session ?? "", "headline": s.headline]
-            if let c = s.request?.choices { r["choices"] = c.map { "\($0.index) \($0.label)" } }
-            if let d = store.deliveries[s.key] { r["delivery"] = "\(d)" }
-            return r
-        }
-        let out: [String: Any] = ["state": state.rawValue, "selected": ui.selected?.description ?? "", "sessions": rows,
-                                  "hosts": store.hosts.map { "\($0.name)=\($0.connected)" },
-                                  // Видимые обычные окна Capri и политика активации — проверка «окно само не вылезает».
-                                  "windows": NSApp.windows.filter { $0.isVisible && $0.styleMask.contains(.titled) && !($0 is NSPanel) }.map(\.title),
-                                  "regular": NSApp.activationPolicy() == .regular]
-        if let d = try? JSONSerialization.data(withJSONObject: out, options: [.prettyPrinted, .sortedKeys]) {
-            try? d.write(to: CapriPaths.tmp.appendingPathComponent("state.json"))
-        }
     }
 
     // MARK: мышь
 
     /// Попадание считаем по целевой форме, а не по кадру анимации — так нет дрожания на границе.
     private func shapeContains(_ p: NSPoint) -> Bool {
-        NotchGeometry.shapeRect(state, notch, quiet: quiet).insetBy(dx: -2, dy: -2).contains(p)
+        global(state).insetBy(dx: -2, dy: -2).contains(p)
     }
 
     private func updateMouseThrough() {
@@ -588,26 +607,30 @@ final class NotchController: NSObject {
         monitors.append(NSEvent.addLocalMonitorForEvents(matching: moves) { [weak self] e in self?.mouseMoved(); return e } as Any)
         // Клик мимо раскрытой панели — свернуть.
         monitors.append(NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            guard let self, self.state == .expanded, !self.shapeContains(NSEvent.mouseLocation) else { return }
+            guard let self, self.state == .expanded || self.state == .assistant, !self.shapeContains(NSEvent.mouseLocation) else { return }
             self.go(.collapsed, reason: "clickOutside")
         } as Any)
         monitors.append(NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] e in
             guard let self, e.window === self.panel else { return e }
             guard self.shapeContains(NSEvent.mouseLocation) else {
-                if self.state == .expanded { self.go(.collapsed, reason: "clickOutside") }
+                if self.state == .expanded || self.state == .assistant { self.go(.collapsed, reason: "clickOutside") }
                 return e
             }
             if e.type == .rightMouseDown, let menu = self.makeMenu?() {
                 NSMenu.popUpContextMenu(menu, with: e, for: self.container)
                 return nil
             }
-            // В раскрытой панели клик идёт в кнопки и поле ввода; в свёрнутой/peek — раскрывает.
-            if self.state != .expanded { self.clickNotch(); return nil }
+            // В раскрытой панели и помощнике клик идёт в кнопки и поле ввода; в свёрнутой/peek — раскрывает
+            // (по глазам Capri слева от выреза — помощник).
+            if self.state == .collapsed || self.state == .peek {
+                if self.onCapriEyes(NSEvent.mouseLocation) { self.go(.assistant, reason: "eyes") } else { self.clickNotch() }
+                return nil
+            }
             return e
         } as Any)
         monitors.append(NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self else { return e }
-            if e.keyCode == 53, self.state == .expanded { self.go(.collapsed, reason: "esc"); return nil }
+            if e.keyCode == 53, self.state == .expanded || self.state == .assistant { self.go(.collapsed, reason: "esc"); return nil }
             if e.modifierFlags.contains(.command), e.charactersIgnoringModifiers == "q" { NSApp.terminate(nil); return nil }
             return e
         } as Any)
@@ -629,22 +652,5 @@ final class NotchController: NSObject {
             src.resume()
             signalSources.append(src)
         }
-    }
-
-    /// Снимок собственного окна без записи экрана (маска слоя не учитывается).
-    private func snapshot() {
-        let scale = screen.backingScaleFactor
-        let size = container.bounds.size
-        guard let ctx = CGContext(data: nil, width: Int(size.width * scale), height: Int(size.height * scale), bitsPerComponent: 8,
-                                  bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
-        ctx.scaleBy(x: scale, y: scale)
-        ctx.setFillColor(NSColor(calibratedWhite: 0.55, alpha: 1).cgColor)
-        ctx.fill(CGRect(origin: .zero, size: size))
-        container.layer?.render(in: ctx)
-        guard let image = ctx.makeImage() else { return }
-        let rep = NSBitmapImageRep(cgImage: image)
-        CapriPaths.ensureDir()
-        try? rep.representation(using: .png, properties: [:])?.write(to: CapriPaths.tmp.appendingPathComponent("notch-\(state.rawValue).png"))
     }
 }

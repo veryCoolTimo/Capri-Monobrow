@@ -17,10 +17,28 @@ final class CodexService: ObservableObject {
     }
 
     struct ChatMessage: Identifiable, Equatable {
-        enum Role { case user, codex, error }
+        /// `local` — ответ самой Capri без Codex.
+        enum Role { case user, codex, error, local }
         let id = UUID()
         var role: Role
         var text: String
+        /// Предложенные помощником действия «ответь сессии» — ждут подтверждения человека.
+        var proposals: [Proposal] = []
+    }
+
+    struct Proposal: Identifiable, Equatable {
+        enum State: Equatable { case pending, sending, sent, failed(String), cancelled }
+        let id = UUID()
+        var key: SessionKey
+        /// Имя сессии на момент предложения.
+        var title: String
+        var action: ReplyAction
+        /// Для выбора варианта — его подпись из диалога сессии.
+        var choiceLabel: String?
+        /// Что сессия спрашивала, когда Capri предложила действие: изменилось — отправлять нельзя.
+        var fingerprint: String
+        var status: SessionStatus
+        var state: State = .pending
     }
 
     @Published private(set) var state: State = .off
@@ -359,30 +377,91 @@ final class CodexService: ObservableObject {
         })
     }
 
+    /// Вопрос помощнику. Codex видит все сессии (`Assistant.prompt`); без Codex Capri отвечает сама,
+    /// по локальным данным. Пока ответ идёт, его текст — пустая строка (облачко показывает «думает»).
     func ask(_ question: String) {
         let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty, !chatBusy, isReady else { return }
+        guard !q.isEmpty, !chatBusy else { return }
+        // Неподтверждённые действия прошлых ответов больше не актуальны.
+        for i in chat.indices { for j in chat[i].proposals.indices where chat[i].proposals[j].state == .pending { chat[i].proposals[j].state = .cancelled } }
         chat.append(ChatMessage(role: .user, text: q))
-        let reply = ChatMessage(role: .codex, text: "…")
+        guard isReady else {
+            var text = Assistant.localAnswer(sessions: store.sessions, names: store.names)
+            text += state == .signedOut ? " Чтобы отвечать на другое, войдите в Codex (меню ✦)." : " Codex сейчас не подключён."
+            chat.append(ChatMessage(role: .local, text: text))
+            return
+        }
+        let reply = ChatMessage(role: .codex, text: "")
         chat.append(reply)
         chatBusy = true
         let id = reply.id
-        let prompt = CodexPrompts.chat(question: q, sessions: store.sessions, private: privateHosts()) { [weak self] s in
-            self?.store.details.rawScreen(s)
-        }
+        let details = store.details
+        let prompt = Assistant.prompt(question: q, sessions: store.sessions, names: store.names, private: privateHosts(),
+                                      history: { details.history.list($0.key) }, screens: { details.rawScreen($0) })
         let delta: (String) -> Void = { [weak self] text in
-            guard let self, !text.isEmpty, let i = self.chat.firstIndex(where: { $0.id == id }) else { return }
-            self.chat[i].text = text
+            guard let self, let i = self.chat.firstIndex(where: { $0.id == id }) else { return }
+            let shown = Assistant.visible(text)
+            if !shown.isEmpty { self.chat[i].text = shown }
         }
-        enqueue(Job(kind: .chat, prompt: prompt, onDelta: delta) { [weak self] r in
+        enqueue(Job(kind: .chat, prompt: prompt.text, onDelta: delta) { [weak self] r in
             guard let self else { return }
             self.chatBusy = false
             guard let i = self.chat.firstIndex(where: { $0.id == id }) else { return }
             switch r {
-            case .success(let t): self.chat[i].text = t
+            case .success(let t):
+                let parsed = Assistant.parse(t)
+                self.chat[i].proposals = parsed.proposals.compactMap { p in
+                    guard let key = prompt.refs[p.ref], let s = self.store.session(key) else { return nil }
+                    var label: String?
+                    if case .choose(let n) = p.action {
+                        // Выбор — только существующего варианта ждущей сессии.
+                        guard s.status == .needsInput, let c = s.request?.choices.first(where: { $0.index == n }) else { return nil }
+                        label = c.label
+                    }
+                    return Proposal(key: s.key, title: self.store.name(s).title, action: p.action, choiceLabel: label,
+                                    fingerprint: s.requestFingerprint, status: s.status)
+                }
+                self.chat[i].text = parsed.text.isEmpty && self.chat[i].proposals.isEmpty ? "(пустой ответ)" : parsed.text
             case .failure(let e): self.chat[i] = ChatMessage(role: .error, text: Self.message(e))
             }
         })
+    }
+
+    /// Человек подтвердил действие помощника — отправка теми же путями и проверками, что и ответ руками.
+    func confirm(_ message: UUID, _ proposal: UUID) {
+        guard let i = chat.firstIndex(where: { $0.id == message }),
+              let j = chat[i].proposals.firstIndex(where: { $0.id == proposal }),
+              chat[i].proposals[j].state == .pending else { return }
+        let p = chat[i].proposals[j]
+        guard let s = store.session(p.key), s.requestFingerprint == p.fingerprint, s.status == p.status else {
+            chat[i].proposals[j].state = .failed("сессия уже спрашивает другое — спросите Capri ещё раз")
+            return
+        }
+        chat[i].proposals[j].state = .sending
+        store.send(p.key, p.action) { [weak self] ok in
+            guard let self, let i = self.chat.firstIndex(where: { $0.id == message }),
+                  let j = self.chat[i].proposals.firstIndex(where: { $0.id == proposal }) else { return }
+            if ok {
+                self.chat[i].proposals[j].state = .sent
+            } else if case .refused(let m)? = self.store.deliveries[p.key] {
+                self.chat[i].proposals[j].state = .failed(m)
+            } else {
+                self.chat[i].proposals[j].state = .failed("не отправлено")
+            }
+        }
+    }
+
+    func cancel(_ message: UUID, _ proposal: UUID) {
+        guard let i = chat.firstIndex(where: { $0.id == message }),
+              let j = chat[i].proposals.firstIndex(where: { $0.id == proposal }),
+              chat[i].proposals[j].state == .pending else { return }
+        chat[i].proposals[j].state = .cancelled
+    }
+
+    /// Первое неподтверждённое действие последнего ответа (Enter в помощнике подтверждает его).
+    var pendingProposal: (message: UUID, proposal: Proposal)? {
+        guard let m = chat.last, let p = m.proposals.first(where: { $0.state == .pending }) else { return nil }
+        return (m.id, p)
     }
 
     func clearChat() {

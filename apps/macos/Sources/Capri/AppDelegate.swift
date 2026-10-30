@@ -22,12 +22,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let windowUI = WindowUI()
     private let settings = Settings()
     private var cancellables: Set<AnyCancellable> = []
+    private var hotKey: HotKey?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMainMenu()
         store = SessionStore(sources: Self.sources())
-        notch = NotchController(store: store)
         codex = CodexService(store: store)
+        notch = NotchController(store: store, codex: codex)
         codex.summariesEnabled = { [weak self] in self?.settings.codexSummaries ?? false }
         codex.privateHosts = { [weak self] in self?.settings.codexPrivateHosts ?? [] }
         settings.onCodexChange = { [weak self] on in
@@ -36,10 +37,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         notch.makeMenu = { [weak self] in self?.makeMenu() ?? NSMenu() }
         notch.onDetails = { [weak self] key, draft in
-            self?.openWindow(select: key)
+            guard let self else { return }
+            guard let key else { self.openWindow(); return }
+            self.openWindow(select: key)
             // Набранное в notch не теряется при переходе в окно.
-            if !draft.isEmpty, let k = self?.store.resolve(key) { self?.windowUI.drafts[k] = draft }
+            if !draft.isEmpty, let k = self.store.resolve(key) { self.windowUI.drafts[k] = draft }
         }
+        notch.onConversation = { [weak self] in
+            self?.windowUI.chatOpen = true
+            self?.openWindow()
+        }
+        settings.onHotKeyChange = { [weak self] in self?.updateHotKey() }
+        updateHotKey()
         notch.onDebug = { [weak self] cmd, arg in self?.debugCommand(cmd, arg) }
         attention = AttentionCenter(store: store, notch: notch, settings: settings) { [weak self] key in self?.openWindow(select: key) }
         attention.onPauseChange = { [weak self] in self?.updateStatusIcon() }
@@ -192,6 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             item("Пауза уведомлений на 1 час", #selector(pauseAlerts))
         }
+        item("Спросить Capri (\(HotKey.assistant.label))", #selector(showAssistant))
         item("Открыть Capri", #selector(openDashboard), key: "o")
         item("Показать notch-панель", #selector(showNotch))
         menu.addItem(.separator())
@@ -202,6 +212,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showNotch() { notch.go(.expanded, reason: "menu") }
+    @objc private func showAssistant() { notch.go(.assistant, reason: "menu") }
+
+    private func updateHotKey() {
+        hotKey = nil
+        settings.hotKeyError = nil
+        guard settings.assistantHotKey else { return }
+        let k = HotKey.assistant
+        hotKey = HotKey(keyCode: k.keyCode, modifiers: k.modifiers) { [weak self] in self?.notch.toggleAssistant() }
+        if hotKey == nil { settings.hotKeyError = "\(k.label) занят другим приложением" }
+    }
     @objc private func codexSignIn() { codex.signIn() }
     @objc private func pauseAlerts() { attention.pause(hours: 1) }
     @objc private func resumeAlerts() { attention.resume() }

@@ -38,7 +38,15 @@ final class NotchGeometryTests: XCTestCase {
         let f = NotchGeometry.shapeRect(.expanded, builtIn)
         XCTAssertEqual(f.maxY, 982)
         XCTAssertEqual(f.midX, 756)
-        XCTAssertEqual(f.size, NotchGeometry.expandedSize)
+        XCTAssertEqual(f.size, CGSize(width: 400, height: 96))
+    }
+
+    func testExpandedAndAssistantHeightFollowContentWithinLimits() {
+        XCTAssertEqual(NotchGeometry.shapeSize(.expanded, builtIn, contentHeight: 180).height, 180)
+        XCTAssertEqual(NotchGeometry.shapeSize(.expanded, builtIn, contentHeight: 900).height, 300)
+        XCTAssertEqual(NotchGeometry.shapeSize(.assistant, builtIn, contentHeight: 10).height, 150)
+        let host = NotchGeometry.hostFrame(builtIn)
+        XCTAssertTrue(host.contains(NotchGeometry.shapeRect(.assistant, builtIn, contentHeight: 900)))
     }
 
     func testHostPanelIsFixedAndContainsEveryState() {

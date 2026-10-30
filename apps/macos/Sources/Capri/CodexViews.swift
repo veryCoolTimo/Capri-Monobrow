@@ -28,7 +28,7 @@ struct CodexPanel: View {
                 panelButton("перезапустить") { codex.stop(); codex.start() }
             case .ready:
                 if let l = codex.limits { LimitsView(limits: l) }
-                panelButton(ui.chatOpen ? "к сессиям" : "что ждёт меня? ✦") { ui.chatOpen.toggle() }
+                panelButton(ui.chatOpen ? "к сессиям" : "спросить capri ✦") { ui.chatOpen.toggle() }
             case .starting, .off:
                 EmptyView()
             }
@@ -106,8 +106,8 @@ struct LimitsView: View {
     }()
 }
 
-/// Чат «что ждёт меня?»: к каждому вопросу Codex получает свежую картину по всем сессиям
-/// (статусы, запросы, низ экранов ждущих — с вырезанными секретами).
+/// Разговор с Capri в окне — тот же, что в экранчике notch. К каждому вопросу Codex получает свежую картину
+/// по всем сессиям (`Assistant.prompt`, секреты вырезаны); действия «ответь сессии» — карточками с подтверждением.
 struct CodexChatView: View {
     @ObservedObject var codex: CodexService
     @ObservedObject var store: SessionStore
@@ -116,9 +116,13 @@ struct CodexChatView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Caps("спросить codex", size: 13, color: Palette.text, weight: .heavy)
-                Caps("видит все сессии · секреты вырезаны", size: 8)
+            HStack(alignment: .center, spacing: 10) {
+                // Анимация — только пока Capri думает или отвечает; иначе статичный кадр.
+                CapriFace(mood: assistantMood(codex: codex, waiting: store.waiting.count, typing: !question.isEmpty),
+                          active: codex.chatBusy)
+                    .frame(width: 40, height: 35)
+                Caps("спросить capri", size: 13, color: Palette.text, weight: .heavy)
+                Caps("видит все сессии · секреты вырезаны · \(HotKey.assistant.label) — из notch", size: 8)
                 Spacer()
                 Button("очистить") { codex.clearChat() }.buttonStyle(.plain).font(.mono(9.5))
                     .foregroundColor(Palette.dim).disabled(codex.chatBusy || codex.chat.isEmpty)
@@ -143,12 +147,12 @@ struct CodexChatView: View {
             HStack(alignment: .bottom, spacing: 8) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text("?").font(.mono(13, .bold)).foregroundColor(Palette.codex)
-                    TextField(codex.isReady ? "например: что ждёт меня и с чего начать?" : "Codex не подключён", text: $question, axis: .vertical)
+                    TextField(codex.isReady ? "например: что сделала web? ответь api «да»" : "Codex не подключён — Capri ответит сама, что знает",
+                              text: $question, axis: .vertical)
                         .textFieldStyle(.plain).font(.system(size: 12.5))
                         .lineLimit(1...4)
                         .focused($focused)
                         .onSubmit(send)
-                        .disabled(!codex.isReady)
                 }
                 .padding(.horizontal, 9).padding(.vertical, 7)
                 .hud(stroke: Palette.codex.opacity(0.6), fill: Color.black.opacity(0.5), cut: 7)
@@ -158,7 +162,7 @@ struct CodexChatView: View {
                         .hud(stroke: Palette.codex.opacity(0.7), fill: Palette.codex.opacity(0.1), cut: 5)
                 }
                 .buttonStyle(.plain)
-                .disabled(!codex.isReady || codex.chatBusy || question.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(codex.chatBusy || question.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
         .padding(.horizontal, 16).padding(.top, 30).padding(.bottom, 14)
@@ -167,17 +171,17 @@ struct CodexChatView: View {
 
     private var suggestions: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Codex получает список сессий, их запросы и низ экранов тех, что ждут. Ничего не запускает.")
+            Text("Capri отправляет в Codex список сессий, их запросы, последние события и низ экранов ждущих и упомянутых. Codex ничего не запускает; ответить сессии — только после вашего «отправить».")
                 .font(.system(size: 11)).foregroundColor(Palette.dim)
-            ForEach(["Что сейчас ждёт меня и что ответить первым?", "Есть ли среди запросов рискованные команды?",
-                     "Какие сессии давно простаивают?"], id: \.self) { q in
+            ForEach(["Что сейчас ждёт меня и что ответить первым?", "Что сделали сессии за последний час?",
+                     "Есть ли среди запросов рискованные команды?"], id: \.self) { q in
                 Button { question = q; send() } label: {
                     Text(q).font(.system(size: 11.5)).foregroundColor(Palette.text.opacity(0.85))
                         .padding(.horizontal, 8).padding(.vertical, 5)
                         .hud(stroke: Palette.codex.opacity(0.35), fill: Color.clear, cut: 5)
                 }
                 .buttonStyle(.plain)
-                .disabled(!codex.isReady || codex.chatBusy)
+                .disabled(codex.chatBusy)
             }
         }
     }
@@ -185,11 +189,9 @@ struct CodexChatView: View {
     private func bubble(_ m: CodexService.ChatMessage) -> some View {
         let user = m.role == .user
         return VStack(alignment: .leading, spacing: 3) {
-            Caps(user ? "вы" : m.role == .error ? "ошибка" : "codex", size: 7.5,
+            Caps(user ? "вы" : m.role == .error ? "ошибка" : m.role == .local ? "capri (без codex)" : "capri", size: 7.5,
                  color: user ? Palette.dim : m.role == .error ? Palette.crimson : Palette.codex, weight: .bold)
-            Text(m.text).font(.system(size: 12)).foregroundColor(m.role == .error ? Palette.crimson : Palette.text)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            ChatMessageBody(codex: codex, message: m)
         }
         .padding(.horizontal, 10).padding(.vertical, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -199,7 +201,7 @@ struct CodexChatView: View {
 
     private func send() {
         let q = question
-        guard !q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, codex.isReady, !codex.chatBusy else { return }
+        guard !q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !codex.chatBusy else { return }
         question = ""
         codex.ask(q)
     }

@@ -173,8 +173,9 @@ public enum CodexPrompts {
         s.title == s.project ? s.title : "\(s.title) (папка \(s.project))"
     }
 
-    static func describe(_ s: Session) -> String {
-        var out = "Сессия: \(name(s)) · хост \(s.key.host) · агент \(s.key.agent.rawValue) · статус \(s.status.rawValue)"
+    /// `label` — как назвать сессию (по умолчанию `name(s)`); без префикса «Сессия: » — для списков помощника.
+    static func describe(_ s: Session, label: String? = nil, prefix: Bool = true) -> String {
+        var out = (prefix ? "Сессия: " : "") + "\(label ?? name(s)) · хост \(s.key.host) · агент \(s.key.agent.rawValue) · статус \(s.status.rawValue)"
         if let r = s.request {
             out += "\nЗапрос (\(r.kind.rawValue)\(r.tool.map { ", \($0)" } ?? "")): \(Redactor.redact(r.summary))"
             if !r.options.isEmpty { out += "\nВарианты: " + r.choices.map { "\($0.index). \(Redactor.redact($0.label))" }.joined(separator: "; ") }
@@ -207,27 +208,6 @@ public enum CodexPrompts {
         \(describe(s))
         """
         if let screen, !screen.isEmpty { p += "\n\nНиз экрана сессии:\n```\n\(screenText(screen))\n```" }
-        return p
-    }
-
-    /// Вопрос в чате с картиной по всем сессиям.
-    /// `private` — хосты, содержимое сессий которых в Codex не уходит (только проект и статус).
-    public static func chat(question: String, sessions: [Session], private hidden: Set<String> = [],
-                            screens: (Session) -> [String]?) -> String {
-        var p = "Текущее состояние сессий (обновлено сейчас):\n"
-        let shown = sessions.filter { $0.status != .ended }.prefix(40)
-        if shown.isEmpty { p += "— сессий нет\n" }
-        for s in shown {
-            if hidden.contains(s.key.host) {
-                p += "\nСессия: \(name(s)) · хост \(s.key.host) · статус \(s.status.rawValue) (содержимое скрыто настройками)\n"
-                continue
-            }
-            p += "\n" + describe(s) + "\n"
-            if s.status == .needsInput, let lines = screens(s), !lines.isEmpty {
-                p += "Низ экрана:\n```\n\(screenText(lines, tail: 12))\n```\n"
-            }
-        }
-        p += "\nВопрос человека: \(question)"
         return p
     }
 
