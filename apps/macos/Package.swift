@@ -10,7 +10,7 @@ let package = Package(
     ],
     targets: [
         .target(name: "CapriKit"),
-        .executableTarget(name: "Capri", dependencies: ["CapriKit"], resources: [.copy("Resources/Capri")]),
+        .executableTarget(name: "Capri", dependencies: ["CapriKit"]),
         .executableTarget(name: "CapriCollect", dependencies: ["CapriKit"]),
         .testTarget(name: "CapriKitTests", dependencies: ["CapriKit"], resources: [.copy("Fixtures")])
     ],

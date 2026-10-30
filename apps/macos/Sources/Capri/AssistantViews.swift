@@ -60,7 +60,7 @@ struct AssistantView: View {
             Bubble(codex: codex, store: store, shown: ui.assistantShown)
                 .padding(.leading, 6)
             HStack(alignment: .bottom, spacing: 10) {
-                CapriHead(mood: mood, active: ui.assistantShown)
+                CapriFace(mood: mood, active: ui.assistantShown)
                     .accessibilityHidden(true)
                     .frame(width: 74, height: 74)
                 VStack(alignment: .leading, spacing: 5) {
