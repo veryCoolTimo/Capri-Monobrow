@@ -7,7 +7,8 @@ import CapriKit
 enum CapriFX {
     /// Глитч по образцу сериала (маска с открытым ртом рассыпается): уровень 1 — сдвинутые полосы с цветным
     /// разносом; 2 — плюс кайма по краям фигур, рваный край кадра и цветные мазки (строка растянута в полосу);
-    /// 3 — плюс сдвинутые блоки, цветные плашки и двойная экспозиция.
+    /// 3 — плюс сдвинутые блоки, цветные плашки и двойная экспозиция; 4 — «взлом» из конца той же сцены: кадр
+    /// чёрно-белый, поверх — крупные ярко-розовые клинья, тонкие рваные строки и розовая молния-зигзаг.
     struct Glitch {
         var level: Int
         /// Разнос малиновой и фиолетовой копий (доля ширины).
@@ -24,7 +25,13 @@ enum CapriFX {
         var tear = 0
         /// Сдвиг двойной экспозиции (доля ширины, 0 — нет).
         var ghost: CGFloat = 0
+        /// «Взлом»: розовые клинья (вершины в долях кадра) и молния-зигзаг.
+        var shards: [[CGPoint]] = []
+        var zigzag: [CGPoint] = []
     }
+
+    /// Розовый «взлома» из сериала.
+    static let hackPink = Color(red: 0.98, green: 0.33, blue: 0.59)
 
     static let tints: [Color] = [Palette.crimson, Palette.acid, Palette.violet, Color(red: 1, green: 0.48, blue: 0.66)]
 
@@ -51,8 +58,8 @@ enum CapriFX {
             level = on(240, 4, 9) ? 3 : on(66, 2, 1) ? (TickNoise.unit(tick / 66, 13) < 0.35 ? 2 : 1) : 0
         case .thinking: level = on(40, 2, 2) ? 1 : 0
         case .speaking: level = on(36, 3, 7) ? 2 : on(9, 1, 3) ? 1 : 0
-        case .alert: level = on(36, 4, 4, since) ? 3 : on(12, 1, 8) ? 1 : 0
-        case .error: level = on(20, 3, 5) ? 3 : on(7, 1, 10) ? 2 : 0
+        case .alert: level = on(36, 6, 4, since) ? 4 : on(12, 1, 8) ? 1 : 0
+        case .error: level = on(20, 3, 5) ? (TickNoise.unit(tick / 20, 14) < 0.5 ? 4 : 3) : on(7, 1, 10) ? 2 : 0
         }
         let transition = since > 0 && since < 3 ? 2 : 0
         let l = max(level, transition)
@@ -84,6 +91,33 @@ enum CapriFX {
                     tint: Int(TickNoise.hash(tick, 405 + k * 4) % 4))
         }
         g.ghost = (0.05 + 0.08 * u(500)) * (u(501) < 0.5 ? -1 : 1)
+        guard level >= 4 else { return g }
+        // Взлом: клинья-молнии с зубцом (в кадре 2:1 — по долям ширины и высоты), рваные строки чаще.
+        g.ghost = 0
+        g.blocks = []
+        g.patches = []
+        g.shards = (0..<(4 + Int(TickNoise.hash(tick / 2, 700) % 3))).map { k in
+            let v = { (salt: Int) in CGFloat(TickNoise.unit(tick / 2, 710 + k * 10 + salt)) }
+            let cx = v(0), cy = v(1), len = 0.4 + 0.5 * v(2), w = 0.15 + 0.2 * v(3)
+            let a = (v(4) - 0.5) * 0.9 + (v(5) < 0.5 ? .pi : 0)
+            let ux = cos(a), uy = sin(a) * 2, nx = -sin(a) / 2, ny = cos(a)
+            let t = 0.35 + 0.3 * v(6), j = 0.4 + 0.5 * v(7)
+            return [CGPoint(x: cx - ux * len / 2 + nx * w / 2, y: cy - uy * len / 2 + ny * w / 2),
+                    CGPoint(x: cx - ux * len * (0.5 - t) + nx * w * j, y: cy - uy * len * (0.5 - t) + ny * w * j),
+                    CGPoint(x: cx - ux * len * (0.42 - t) - nx * w * 0.1, y: cy - uy * len * (0.42 - t) - ny * w * 0.1),
+                    CGPoint(x: cx + ux * len / 2, y: cy + uy * len / 2),
+                    CGPoint(x: cx - ux * len / 2 - nx * w / 2, y: cy - uy * len / 2 - ny * w / 2)]
+        }
+        g.smears = (0..<(4 + Int(TickNoise.hash(tick, 800) % 4))).map { k in
+            (y: u(801 + k * 4) * 0.95, h: 0.01 + 0.08 * u(802 + k * 4), src: u(803 + k * 4), tint: 0)
+        }
+        var x = 0.1 + 0.8 * u(900), y: CGFloat = -0.05
+        g.zigzag = [CGPoint(x: x, y: y)]
+        for k in 0..<8 where y < 1.05 {
+            x += (0.06 + 0.1 * u(901 + k)) * (k % 2 == 0 ? 1 : -1)
+            y += 0.12 + 0.18 * u(910 + k)
+            g.zigzag.append(CGPoint(x: x, y: y))
+        }
         return g
     }
 
@@ -184,6 +218,7 @@ struct CapriShotView: View {
 
     /// Глитч: двойная экспозиция → кайма → мазки → сдвинутые полосы с цветным разносом → блоки → плашки → рваный край.
     private func draw(_ g: CapriFX.Glitch, art: GraphicsContext.ResolvedImage, in r: CGRect, ctx: GraphicsContext) {
+        if g.level >= 4 { return hack(g, art: art, in: r, ctx: ctx) }
         func band(_ y: CGFloat, _ h: CGFloat) -> Path {
             Path(CGRect(x: r.minX, y: r.minY + y * r.height, width: r.width, height: h * r.height))
         }
@@ -252,6 +287,57 @@ struct CapriShotView: View {
             ctx.fill(white, with: .color(.white.opacity(0.8)))
             ctx.fill(black, with: .color(.black))
         }
+    }
+
+    /// Чёрно-белый с высоким контрастом: светлое — почти белое, тёмное — чёрное.
+    private static let mono: ColorMatrix = {
+        var m = ColorMatrix()
+        let (wr, wg, wb, k, o): (Float, Float, Float, Float, Float) = (0.3, 0.59, 0.11, 4, -0.3)
+        m.r1 = wr * k; m.r2 = wg * k; m.r3 = wb * k; m.r5 = o
+        m.g1 = wr * k; m.g2 = wg * k; m.g3 = wb * k; m.g5 = o
+        m.b1 = wr * k; m.b2 = wg * k; m.b3 = wb * k; m.b5 = o
+        return m
+    }()
+
+    /// «Взлом»: чёрно-белый кадр, розовые клинья умножением (на белом — розовые, на чёрном — чёрные), рваные
+    /// строки из растянутых строк и тонких штрихов, розовая молния-зигзаг, рваный край.
+    private func hack(_ g: CapriFX.Glitch, art: GraphicsContext.ResolvedImage, in r: CGRect, ctx: GraphicsContext) {
+        func at(_ p: CGPoint) -> CGPoint { CGPoint(x: r.minX + p.x * r.width, y: r.minY + p.y * r.height) }
+        var mono = ctx
+        mono.addFilter(.colorMatrix(Self.mono))
+        mono.draw(art, in: r)
+        var pink = ctx
+        pink.blendMode = .multiply
+        var shards = Path()
+        for s in g.shards { shards.addLines(s.map(at)); shards.closeSubpath() }
+        pink.fill(shards, with: .color(CapriFX.hackPink))
+        var streaks: [Path] = [Path(), Path(), Path(), Path()]
+        let colors: [Color] = [.white, Color(white: 0.82), Color(white: 0.25), CapriFX.hackPink]
+        for (n, m) in g.smears.enumerated() {
+            let y0 = r.minY + m.y * r.height, h = m.h * r.height
+            var c = mono
+            c.clip(to: Path(CGRect(x: r.minX, y: y0, width: r.width, height: h)))
+            let k = max(1, m.h / 0.006)
+            c.draw(art, in: CGRect(x: r.minX, y: y0 - m.src * r.height * k, width: r.width, height: r.height * k))
+            c.fill(Path(CGRect(x: r.minX, y: y0, width: r.width, height: h)), with: .color(.white.opacity(0.3)))
+            for i in 0..<24 {
+                let x = r.minX + r.width * TickNoise.unit(n * 100 + i, 1000 + g.tear % 97)
+                let yy = y0 + h * TickNoise.unit(n * 100 + i, 1100 + g.tear % 97)
+                let w = r.width * (0.01 + 0.08 * TickNoise.unit(n * 100 + i, 1200 + g.tear % 97))
+                streaks[i % 4].addRect(CGRect(x: x, y: yy, width: w, height: max(0.5, r.height * 0.005)))
+            }
+        }
+        for (i, p) in streaks.enumerated() { ctx.fill(p, with: .color(colors[i])) }
+        var zig = Path()
+        zig.addLines(g.zigzag.map(at))
+        ctx.stroke(zig, with: .color(CapriFX.hackPink), lineWidth: max(1.2, r.height * 0.016))
+        var edge = Path()
+        for k in 0..<16 {
+            let y = r.minY + r.height * TickNoise.unit(g.tear, 600 + k)
+            let w = r.width * (0.01 + 0.06 * TickNoise.unit(g.tear, 620 + k))
+            edge.addRect(CGRect(x: k % 2 == 0 ? r.minX : r.maxX - w, y: y, width: w, height: max(1, r.height * 0.01)))
+        }
+        ctx.fill(edge, with: .color(.white))
     }
 
     private func draw(_ b: CapriFX.Bolt, in r: CGRect, ctx: GraphicsContext) {

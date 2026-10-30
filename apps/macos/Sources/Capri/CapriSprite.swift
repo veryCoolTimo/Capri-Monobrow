@@ -127,7 +127,7 @@ struct ShowArt {
             (clips["appear"] ?? none)
                 + (clips["talk"].map { FrameClip(frames: [$0.frames[0]], holds: [second / 2]) } ?? none)
                 + (clips["shut"] ?? none)
-                + burst.holdingLast(second / 2)
+                + burst.holdingLast(second)
         } else if let close = clips["close"], let many = clips["many"] {
             close.capped(second / 2) + many.holdingLast(2 * second)
         } else {
@@ -163,6 +163,16 @@ struct ShowArt {
         }
     }
 
+    /// Конец сцены «тебя ждут» (последние 0,7 с: взрыв глаз держится) — розовый «взлом», как в сериале.
+    func hacking(_ mood: CapriMood, tick: Int, since: Int) -> Bool {
+        let tail = Int(fps * 0.7), calm = clip("look").total * 3
+        switch mood {
+        case .alert: return since % alert.total >= alert.total - tail
+        case .idle: return tick % (calm + alert.total) >= calm + alert.total - tail
+        default: return false
+        }
+    }
+
     private func first(_ name: String) -> NSImage? { clip(name).frames.first.map { images[$0] } }
     private func last(_ name: String) -> NSImage? { clip(name).frames.last.map { images[$0] } }
 
@@ -193,8 +203,11 @@ struct CapriSprite: View {
             } else {
                 CapriArt.images[CapriArt.frame(mood, t: t, since: since, still: !animating)]
             }
+            let hacking = animating && ShowArt.shared?.hacking(mood, tick: Int(t * (ShowArt.shared?.fps ?? 12)),
+                                                                since: Int(since * (ShowArt.shared?.fps ?? 12))) == true
             CapriShotView(image: image,
-                          glitch: animating ? CapriFX.glitch(mood, tick: tick, since: sinceTick) : nil,
+                          glitch: hacking ? CapriFX.make(level: 4, tick: tick, strength: 1)
+                              : animating ? CapriFX.glitch(mood, tick: tick, since: sinceTick) : nil,
                           bolt: animating ? CapriFX.bolt(mood, tick: tick, since: sinceTick) : nil)
         }
         .onAppear { started = (mood, Date()) }
