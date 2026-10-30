@@ -39,6 +39,7 @@ struct ChatMessageBody: View {
 func assistantMood(codex: CodexService, waiting: Int, typing: Bool) -> CapriMood {
     let last = codex.chat.last
     if codex.chatBusy { return (last?.text.isEmpty ?? true) ? .thinking : .speaking }
+    if codex.speaking { return .speaking }
     if last?.role == .error { return .error }
     if typing { return .listening }
     if waiting > 0 { return .alert }

@@ -45,6 +45,9 @@ final class CodexService: ObservableObject {
     @Published private(set) var limits: CodexLimits?
     @Published private(set) var chat: [ChatMessage] = []
     @Published private(set) var chatBusy = false
+    /// Capri «договаривает» ответ: рот двигается ещё столько, сколько его читать (по длине текста, 1,5–8 с).
+    @Published private(set) var speaking = false
+    private var speakingTask: DispatchWorkItem?
     /// Черновик готовится для этой сессии.
     @Published private(set) var drafting: SessionKey?
 
@@ -422,9 +425,18 @@ final class CodexService: ObservableObject {
                                     fingerprint: s.requestFingerprint, status: s.status)
                 }
                 self.chat[i].text = parsed.text.isEmpty && self.chat[i].proposals.isEmpty ? "(пустой ответ)" : parsed.text
+                self.speak(for: self.chat[i].text)
             case .failure(let e): self.chat[i] = ChatMessage(role: .error, text: Self.message(e))
             }
         })
+    }
+
+    private func speak(for text: String) {
+        speakingTask?.cancel()
+        speaking = true
+        let task = DispatchWorkItem { [weak self] in self?.speaking = false }
+        speakingTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + min(8, max(1.5, Double(text.count) / 18)), execute: task)
     }
 
     /// Человек подтвердил действие помощника — отправка теми же путями и проверками, что и ответ руками.

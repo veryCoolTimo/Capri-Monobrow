@@ -94,36 +94,51 @@ func hudButton(_ title: String, accent: Color = Palette.crimson, enabled: Bool =
 
 // MARK: - Свёрнутый вид
 
-/// Слева от выреза — глаза Capri (клик — помощник), справа — счётчики.
+/// Слева от выреза — глаза Capri (клик — помощник), справа — шкала сессий: столбик на сессию, зелёный — ждёт
+/// меня, малиновый — работает, тусклый — простаивает; не влезли — «+N».
 struct TopRowView: View {
     @ObservedObject var store: SessionStore
     @ObservedObject var ui: NotchUI
     @ObservedObject var codex: CodexService
     var notchWidth: CGFloat
+
+    static let maxBars = 6
+
     var body: some View {
         let waiting = store.waiting.count
+        let list = store.overview
         HStack(spacing: 0) {
             CapriFace(mood: waiting > 0 ? .alert : codex.chatBusy ? .thinking : .idle, style: .mask)
-                .frame(width: 26, height: 13)
+                .frame(width: 32, height: 16)
                 .help("Capri — спросить (⌃⌥Space)")
             Spacer(minLength: ui.hasNotch ? notchWidth : 8)
-            HStack(spacing: 7) {
-                if waiting > 0 {
-                    HStack(spacing: 3) {
-                        Image(systemName: "triangle.fill").font(.system(size: 7, weight: .bold))
-                        Text("\(waiting)")
-                    }.foregroundColor(Palette.acid)
+            HStack(spacing: 2.5) {
+                ForEach(list.prefix(Self.maxBars), id: \.key) { s in SessionBar(status: s.status) }
+                if list.count > Self.maxBars {
+                    Caps("+\(list.count - Self.maxBars)", size: 7.5, color: Palette.dim, weight: .bold).fixedSize()
                 }
-                if store.runningCount > 0 {
-                    HStack(spacing: 3) {
-                        Rectangle().frame(width: 5, height: 5).rotationEffect(.degrees(45))
-                        Text("\(store.runningCount)")
-                    }.foregroundColor(Palette.crimson)
-                }
-            }.font(.mono(11, .bold))
+            }
+            .help("Ждут меня: \(waiting) · работают: \(store.runningCount) · всего: \(list.count)")
         }
-        .padding(.horizontal, 15)
+        .padding(.horizontal, 13)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// Столбик сессии в свёрнутом notch: ждёт — зелёный и выше, работает — малиновый, иначе — тусклый контур.
+struct SessionBar: View {
+    var status: SessionStatus
+    var body: some View {
+        let color = Session.color(status)
+        let tall = status == .needsInput
+        Group {
+            if status == .needsInput || status == .running || status == .error || status == .rateLimited {
+                Rectangle().fill(color)
+            } else {
+                Rectangle().strokeBorder(color.opacity(0.7), lineWidth: 1)
+            }
+        }
+        .frame(width: 4, height: tall ? 12 : 9)
     }
 }
 
@@ -155,54 +170,35 @@ struct PeekLineView: View {
 
 // MARK: - Компактный раскрытый notch
 
-/// Только ждущие сессии (до 4 строк) + выбранная; выбранная раскрывается на месте: варианты или ответ.
-/// Всё подробное — в основном окне.
+/// Обзор сессий: все живые сессии ровной таблицей (ждут → работают → остальные), у каждой — состояние, что
+/// делает и сколько. Ответы сессиям — через Capri (помощник) или основное окно; клик по строке — окно на ней.
 struct ExpandedView: View {
     @ObservedObject var store: SessionStore
     @ObservedObject var ui: NotchUI
     var actions: NotchActions
-    @FocusState private var replyFocused: Bool
 
-    static let maxRows = 4
-
-    private var selectedKey: SessionKey? { ui.selected.flatMap(store.resolve) }
-
-    /// Ждущие в стабильном порядке стора + выбранная (даже если уже не ждёт — строка не исчезает из-под курсора).
-    private var rows: [Session] {
-        let sel = selectedKey
-        let list = store.sessions.filter { $0.status == .needsInput || $0.key == sel }
-        guard list.count > Self.maxRows else { return list }
-        var head = Array(list.prefix(Self.maxRows))
-        if let sel, !head.contains(where: { $0.key == sel }), let s = list.first(where: { $0.key == sel }) { head[Self.maxRows - 1] = s }
-        return head
-    }
+    static let maxRows = 7
 
     var body: some View {
-        let rows = rows
-        let waiting = store.waiting.count
-        VStack(alignment: .leading, spacing: 5) {
-            header(waiting)
+        let list = store.overview
+        let rows = Array(list.prefix(Self.maxRows))
+        VStack(alignment: .leading, spacing: 6) {
+            header(list)
             if rows.isEmpty {
-                HStack(spacing: 8) {
-                    Text("Никто не ждёт").font(.system(size: 12, weight: .medium))
-                    Caps("работают · \(store.runningCount)", size: 8.5, color: store.runningCount > 0 ? Palette.crimson : Palette.dim)
-                    Spacer()
+                Text("Сессий нет").font(.system(size: 12, weight: .medium)).foregroundColor(Palette.dim)
+                    .padding(.vertical, 4)
+            }
+            VStack(spacing: 1) {
+                ForEach(rows, id: \.key) { row($0) }
+            }
+            if list.count > rows.count {
+                Button(action: actions.window) {
+                    Caps("ещё \(list.count - rows.count) — в окне ⟶", size: 8, color: Palette.dim)
                 }
-                .padding(.vertical, 4)
+                .buttonStyle(.plain)
             }
-            ForEach(rows, id: \.key) { s in
-                VStack(alignment: .leading, spacing: 5) {
-                    row(s)
-                    if s.key == selectedKey { detail(s) }
-                }
-            }
-            if waiting > rows.filter({ $0.status == .needsInput }).count {
-                Caps("+\(waiting - rows.filter { $0.status == .needsInput }.count) ждут — в окне", size: 8, color: Palette.dim)
-            }
-            footer
         }
         .animation(.easeInOut(duration: 0.22), value: rows.map(\.key))
-        .animation(.easeInOut(duration: 0.22), value: selectedKey)
         .foregroundColor(Palette.text)
         .environment(\.colorScheme, .dark)
         .padding(.horizontal, 14).padding(.top, 4).padding(.bottom, 10)
@@ -211,17 +207,22 @@ struct ExpandedView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
-    private func header(_ waiting: Int) -> some View {
-        VStack(spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Caps("ждут меня", size: 10, color: Palette.text, weight: .bold)
-                Caps(String(format: "// %02d", waiting), size: 10, color: Palette.acid, weight: .bold)
-                Spacer()
+    private func header(_ list: [Session]) -> some View {
+        let waiting = list.filter { $0.status == .needsInput }.count
+        let running = list.filter { $0.status == .running }.count
+        return VStack(spacing: 4) {
+            HStack(alignment: .center, spacing: 10) {
+                Caps("сессии", size: 10, color: Palette.text, weight: .bold)
+                count("ждут", waiting, Palette.acid)
+                count("работают", running, Palette.crimson)
+                count("всего", list.count, Palette.dim)
+                Spacer(minLength: 4)
                 ForEach(store.hosts.filter { !$0.connected }) { h in
-                    Caps("нет связи: \(SessionStore.displayHost(h.name))", size: 7.5, color: Palette.crimson)
+                    Caps("нет связи: \(SessionStore.displayHost(h.name))", size: 7.5, color: Palette.crimson).lineLimit(1)
                 }
                 hudButton("✦ capri", accent: Palette.codex) { actions.assistant() }
-                    .help("Спросить Capri (⌃⌥Space)")
+                    .help("Спросить Capri или ответить сессии (⌃⌥Space)")
+                hudButton("окно") { actions.window() }
             }
             HStack(spacing: 0) {
                 Rectangle().fill(Palette.crimson).frame(width: 26, height: 2)
@@ -230,89 +231,39 @@ struct ExpandedView: View {
         }
     }
 
+    private func count(_ label: String, _ n: Int, _ color: Color) -> some View {
+        HStack(spacing: 3) {
+            Caps(label, size: 8, color: Palette.dim)
+            Caps("\(n)", size: 9.5, color: n > 0 ? color : Palette.dim, weight: .bold)
+        }
+        .fixedSize()
+    }
+
+    /// Строка: метка · имя · хост · что делает · состояние · сколько. Колонки фиксированной ширины — ровно.
     private func row(_ s: Session) -> some View {
-        let on = s.key == selectedKey
         let name = store.name(s)
-        return Button(action: { actions.select(s.key) }) {
+        let waiting = s.status == .needsInput
+        return Button(action: { actions.details(s.key) }) {
             HStack(spacing: 7) {
                 StatusMark(status: s.status).frame(width: 9)
-                Text(name.title).font(.system(size: 11.5, weight: .semibold)).lineLimit(1).fixedSize()
-                if let d = name.detail { Text(d).font(.mono(8.5)).foregroundColor(Palette.dim).lineLimit(1) }
-                Text(store.summary(s) ?? s.headline).font(.system(size: 10.5)).foregroundColor(Palette.text.opacity(0.72)).lineLimit(1)
-                Spacer(minLength: 4)
+                Text(name.title).font(.system(size: 11.5, weight: .semibold)).lineLimit(1).truncationMode(.tail)
+                    .frame(width: 92, alignment: .leading)
+                Text(waiting ? (store.summary(s) ?? s.headline) : (name.detail ?? SessionStore.displayHost(s.key.host)))
+                    .font(waiting ? .system(size: 10.5) : .mono(8.5))
+                    .foregroundColor(waiting ? Palette.text.opacity(0.85) : Palette.dim)
+                    .lineLimit(1).truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Caps(s.statusLabel, size: 8, color: s.statusColor, weight: .bold).fixedSize()
+                    .frame(width: 70, alignment: .trailing)
                 AgoLabel(clock: store.clock, since: s.statusSince, color: s.statusColor)
+                    .frame(width: 38, alignment: .trailing)
             }
             .padding(.horizontal, 6).padding(.vertical, 4)
-            .background(on ? Palette.crimson.opacity(0.14) : Color.clear)
-            .overlay(alignment: .leading) { Rectangle().fill(on ? s.statusColor : .clear).frame(width: 2) }
+            .background(waiting ? Palette.acid.opacity(0.07) : Color.clear)
+            .overlay(alignment: .leading) { Rectangle().fill(waiting ? Palette.acid : .clear).frame(width: 2) }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-    }
-
-    private func detail(_ s: Session) -> some View {
-        let choices = s.status == .needsInput ? (s.request?.choices ?? []) : []
-        return VStack(alignment: .leading, spacing: 5) {
-            if s.status == .needsInput, let r = s.request, r.summary.count > 60 {
-                Text(r.summary).font(r.kind == .permission ? .mono(10) : .system(size: 10.5))
-                    .lineLimit(3).padding(.horizontal, 7).padding(.vertical, 3)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.black.opacity(0.55))
-            }
-            if !choices.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 5) {
-                        ForEach(choices) { c in
-                            hudButton("\(c.index) \(short(c.label))", accent: c.index == 1 ? Palette.acid : Palette.crimson,
-                                      enabled: !store.deliveries.isBusy(s.key)) { actions.send(s.key, .choose(c.index)) }
-                                .help(c.label)
-                        }
-                    }
-                }
-            } else {
-                replyRow(s)
-            }
-            if let h = store.hint(s) { Text(h.text).font(.system(size: 9.5)).foregroundColor(h.color).lineLimit(1) }
-        }
-        .padding(.leading, 22)
-        .transition(.opacity)
-    }
-
-    private func replyRow(_ s: Session) -> some View {
-        let refusal = store.check(s.key, .text(ui.reply.isEmpty ? "x" : ui.reply))
-        return HStack(spacing: 6) {
-            HStack(spacing: 6) {
-                Text(">").font(.mono(12, .bold)).foregroundColor(Palette.crimson)
-                TextField(s.status == .running ? "сессия работает…" : "ответ в \(store.name(s).title)", text: $ui.reply)
-                    .textFieldStyle(.plain).font(.mono(11.5))
-                    .focused($replyFocused)
-                    .onSubmit { submit(s) }
-            }
-            .padding(.horizontal, 8).padding(.vertical, 4)
-            .hud(fill: Color.black.opacity(0.5), cut: 6)
-            hudButton("⏎", enabled: refusal == nil && !ui.reply.isEmpty) { submit(s) }
-        }
-    }
-
-    private var footer: some View {
-        HStack(spacing: 6) {
-            if let k = selectedKey {
-                hudButton("подробнее ⟶") { actions.details(k) }.help("Основное окно: экран сессии и история")
-                hudButton("открыть ↗", enabled: store.session(k)?.tmux != nil) { actions.open(k) }
-                    .help("Terminal с tmux attach на эту панель")
-            }
-            Spacer()
-            hudButton("окно capri") { actions.window() }
-        }
-        .padding(.top, 2)
-    }
-
-    private func submit(_ s: Session) {
-        guard !ui.reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        actions.send(s.key, .text(ui.reply))
-    }
-
-    private func short(_ label: String) -> String {
-        label.count > 16 ? String(label.prefix(15)) + "…" : label
+        .help(waiting ? "\(s.headline)\nКлик — окно на этой сессии; ответить — через ✦ capri" : "Клик — окно на этой сессии")
     }
 }

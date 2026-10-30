@@ -140,8 +140,11 @@ struct ShowArt {
 
     /// Рисунок настроения: `tick` — общий счётчик кадров `fps`, `since` — кадры с начала настроения.
     func image(_ mood: CapriMood, tick: Int, since: Int) -> NSImage? {
+        // Покой: рассматривает три круга, потом — сцена «тебя ждут» (маска, закрыла глаза, взрыв глаз), и снова.
+        let calm = clip("look").total * 3, k = tick % (calm + alert.total)
         let i: Int? = switch mood {
-        case .idle, .listening: clip("look").frame(at: tick, loop: true)
+        case .idle: k < calm ? clip("look").frame(at: k, loop: true) : alert.frame(at: k - calm, loop: false)
+        case .listening: clip("look").frame(at: tick, loop: true)
         case .speaking: clip("talk").frame(at: tick, loop: true)
         case .thinking: clip("slits").frame(at: since, loop: false)
         case .alert: alert.frame(at: since, loop: true)

@@ -83,6 +83,16 @@ final class SessionStore: ObservableObject {
 
     var waiting: [Session] { sessions.filter { $0.status == .needsInput } }
     var runningCount: Int { sessions.filter { $0.status == .running }.count }
+    /// Все живые сессии для обзора в notch: ждут меня → работают → ошибка/лимит → остальные (без закрытых),
+    /// внутри группы — стабильный порядок стора.
+    var overview: [Session] {
+        func rank(_ s: SessionStatus) -> Int {
+            switch s { case .needsInput: 0; case .running: 1; case .error, .rateLimited: 2; default: 3 }
+        }
+        return sessions.enumerated().filter { $0.element.status != .ended }
+            .sorted { (rank($0.element.status), $0.offset) < (rank($1.element.status), $1.offset) }
+            .map(\.element)
+    }
     /// Есть что показать в свёрнутом notch.
     var active: Bool { sessions.contains { $0.status == .needsInput || $0.status == .running } }
 
