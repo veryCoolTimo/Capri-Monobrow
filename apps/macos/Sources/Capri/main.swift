@@ -1,10 +1,6 @@
 import AppKit
 // Запись в пайп уже вышедшего процесса (ssh упал раньше, чем прочитал stdin) не должна убивать Capri.
 signal(SIGPIPE, SIG_IGN)
-if let i = CommandLine.arguments.firstIndex(of: "--render-art") {
-    guard i + 1 < CommandLine.arguments.count else { print("usage: Capri --render-art DIR"); exit(2) }
-    ArtRender.run(CommandLine.arguments[i + 1])
-}
 // Один экземпляр: второй запуск (из другой копии, `open -n`, терминала) просит первый показать окно и выходит.
 // Фоновый запуск (скрипты, перезапуск, автозапуск вскоре после загрузки) окно уже запущенного не трогает.
 guard SingleInstance.acquire() else {
