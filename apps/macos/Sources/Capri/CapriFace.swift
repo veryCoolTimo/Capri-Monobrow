@@ -17,7 +17,7 @@ enum CapriMood: Equatable {
     case error
 }
 
-/// Вид Capri — её глаза крупным планом (`CapriArt`). `.bust` — с полной анимацией (помощник, чат),
+/// Вид Capri — её глаза крупным планом (клипы сериала `ShowArt`, если лежат локально, иначе `CapriArt`). `.bust` — с полной анимацией (помощник, чат),
 /// `.mask` — мини в свёрнутом notch: только моргание, «тебя ждут» — много глаз. `active` — анимировать.
 struct CapriFace: View {
     enum Style { case bust, mask }
@@ -43,8 +43,12 @@ struct CapriMaskSprite: View {
 
     var body: some View {
         TimelineView(EyesSchedule(paused: !active || still || mood == .alert)) { ctx in
-            CapriArtImage(frame: mood == .alert ? .many
-                          : (!still && (EyesSchedule.blink(at: ctx.date) ?? 0) > 0.5 ? .blink : .open))
+            let blink = !still && (EyesSchedule.blink(at: ctx.date) ?? 0) > 0.5
+            if let show = ShowArt.shared {
+                CapriArtImage(image: mood == .alert ? show.all : blink ? show.shut : show.open)
+            } else {
+                CapriArtImage(frame: mood == .alert ? .many : blink ? .blink : .open)
+            }
         }
         .accessibilityLabel(Text("Capri"))
     }

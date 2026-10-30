@@ -7,3 +7,6 @@ Capri (Project Capricorn), Cyberpunk и Cyberpunk: Edgerunners принадле�
 Netflix. Capri-Monobrow — неофициальный некоммерческий фан-проект. Кадры персонажа
 (`apps/macos/Sources/Capri/Resources/Capri/`) и значок сгенерированы Codex по рефам; кадров из сериала, чужого
 фан-арта, звуков и голоса в репозитории нет.
+
+Если на Маке есть `~/.capri/art/eyes/` (личная локальная копия кадров сериала, `scripts/push-capri-art.sh`),
+Capri показывает их вместо встроенных кадров. Эти кадры в репозиторий не входят и не распространяются.

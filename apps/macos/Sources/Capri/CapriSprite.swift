@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CapriKit
 
 /// Арт Capri: её глаза крупным планом, как в сериале (зелёная полоса маски, глаза-миндалины с шипами).
 /// Кадры сгенерированы Codex по кадрам сериала (промпт и сырые кадры — локально в `work/art/v5/`, в репозитории
@@ -66,34 +67,121 @@ enum CapriArt {
     }
 }
 
+/// Клипы сериала с её глазами крупным планом — только локально, в `~/.capri/art/eyes/` (кадры сериала не входят
+/// в публичный репозиторий; кладёт `scripts/push-capri-art.sh`). `clips.json` (12 fps): `{"clips": {"look":
+/// [["000.png", 35], …], "close": …, "many": …, "slits": …}}`. Нет папки — Capri показывает кадры `CapriArt`.
+struct ShowArt {
+    let images: [NSImage]
+    let look, close, many, slits: FrameClip
+    /// «Тебя ждут»: глаза закрываются → много глаз, по кругу.
+    let alert: FrameClip
+
+    static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".capri/art/eyes")
+    static let shared: ShowArt? = load(dir)
+
+    static func load(_ dir: URL) -> ShowArt? {
+        func skip(_ why: String) -> ShowArt? {
+            NSLog("[Capri] ~/.capri/art/eyes: %@ — показываю встроенные кадры", why)
+            return nil
+        }
+        let json = dir.appendingPathComponent("clips.json")
+        guard FileManager.default.fileExists(atPath: json.path) else { return nil }
+        guard let data = try? Data(contentsOf: json),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let clips = root["clips"] as? [String: Any] else { return skip("clips.json не читается") }
+        var images: [NSImage] = [], index: [String: Int] = [:]
+        func clip(_ name: String) -> FrameClip? {
+            guard let list = clips[name] as? [[Any]], !list.isEmpty else { return nil }
+            var frames: [Int] = [], holds: [Int] = []
+            for item in list {
+                // Только PNG прямо в папке, не больше 64 рисунков по 4 МБ.
+                guard item.count == 2, let file = item[0] as? String, let hold = item[1] as? Int,
+                      file.hasSuffix(".png"), !file.hasPrefix("."), !file.contains("/") else { return nil }
+                if index[file] == nil {
+                    let url = dir.appendingPathComponent(file)
+                    guard images.count < 64,
+                          let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 4 << 20,
+                          let im = NSImage(contentsOf: url) else { return nil }
+                    index[file] = images.count
+                    images.append(im)
+                }
+                frames.append(index[file]!)
+                holds.append(hold)
+            }
+            return FrameClip(frames: frames, holds: holds)
+        }
+        guard let look = clip("look"), let close = clip("close"), let many = clip("many"), let slits = clip("slits") else {
+            return skip("нужны клипы look, close, many, slits из PNG до 4 МБ")
+        }
+        return ShowArt(images: images, look: look, close: close, many: many, slits: slits,
+                       alert: close.capped(6) + many.holdingLast(26))
+    }
+
+    /// Рисунок настроения: `tick` — общий счётчик 12 fps, `since` — тики с начала настроения.
+    func image(_ mood: CapriMood, tick: Int, since: Int) -> NSImage? {
+        let i: Int?
+        switch mood {
+        case .idle, .listening, .speaking: i = look.frame(at: tick, loop: true)
+        case .thinking, .error: i = slits.frame(at: since, loop: false)
+        case .alert: i = alert.frame(at: since, loop: true)
+        }
+        return i.map { images[$0] }
+    }
+
+    /// Один рисунок без движения («Уменьшить движение», пауза).
+    func still(_ mood: CapriMood) -> NSImage? {
+        switch mood {
+        case .idle, .listening, .speaking: open
+        case .thinking, .error: slits.frames.last.map { images[$0] }
+        case .alert: all
+        }
+    }
+
+    /// Мини-глаза: открытые, закрытые (моргание) и много глаз.
+    var open: NSImage? { look.frames.first.map { images[$0] } }
+    var shut: NSImage? { close.frames.last.map { images[$0] } }
+    var all: NSImage? { many.frames.last.map { images[$0] } }
+}
+
 /// Анимированные глаза Capri. `active` — анимировать (виден и нужен); иначе статичный кадр.
 struct CapriSprite: View {
     var mood: CapriMood
     var active = true
 
-    @State private var changedAt = Date()
+    /// Настроение и когда оно началось: пока `onChange` не сработал, новое настроение считается только что начавшимся.
+    @State private var started: (mood: CapriMood, at: Date)?
     private var still: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1 / CapriFace.fps, paused: !active || still)) { ctx in
             let animating = active && !still
             let t = ctx.date.timeIntervalSinceReferenceDate
-            let f = CapriArt.frame(mood, t: t, since: max(0, ctx.date.timeIntervalSince(changedAt)), still: !animating)
-            // Ошибка: короткий глитч-сдвиг раз в 1.7 с.
-            let jitter: CGFloat = mood == .error && animating && t.truncatingRemainder(dividingBy: 1.7) < 0.12 ? 3 : 0
-            CapriArtImage(frame: f).offset(x: jitter)
+            let since = started?.mood == mood ? max(0, ctx.date.timeIntervalSince(started!.at)) : 0
+            let tick = Int(t * CapriFace.fps), sinceTick = Int(since * CapriFace.fps)
+            let image: NSImage? = if let show = ShowArt.shared {
+                animating ? show.image(mood, tick: tick, since: sinceTick) : show.still(mood)
+            } else {
+                CapriArt.images[CapriArt.frame(mood, t: t, since: since, still: !animating)]
+            }
+            CapriShotView(image: image,
+                          glitch: animating ? CapriFX.glitch(mood, tick: tick, since: sinceTick) : nil,
+                          bolt: animating ? CapriFX.bolt(mood, tick: tick, since: sinceTick) : nil)
         }
-        .onChange(of: mood) { _ in changedAt = Date() }
+        .onAppear { started = (mood, Date()) }
+        .onChange(of: mood) { m in started = (m, Date()) }
         .accessibilityLabel(Text("Capri"))
     }
 }
 
 /// Один кадр, вписанный с сохранением пропорций.
 struct CapriArtImage: View {
-    var frame: CapriArt.Frame
+    var image: NSImage?
+    init(image: NSImage?) { self.image = image }
+    init(frame: CapriArt.Frame) { image = CapriArt.images[frame] }
+
     var body: some View {
-        if let im = CapriArt.images[frame] {
-            Image(nsImage: im).resizable().interpolation(.high).aspectRatio(contentMode: .fit)
+        if let image {
+            Image(nsImage: image).resizable().interpolation(.high).aspectRatio(contentMode: .fit)
         }
     }
 }
