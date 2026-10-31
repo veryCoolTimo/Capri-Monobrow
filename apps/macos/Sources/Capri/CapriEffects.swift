@@ -99,17 +99,19 @@ enum CapriFX {
         g.ghost = 0
         g.blocks = []
         g.patches = []
-        g.shards = (0..<(4 + Int(TickNoise.hash(tick / 2, 700) % 3))).map { k in
-            let v = { (salt: Int) in CGFloat(TickNoise.unit(tick / 2, 710 + k * 10 + salt)) }
-            let cx = v(0), cy = v(1), len = 0.4 + 0.5 * v(2), w = 0.15 + 0.2 * v(3)
-            let a = (v(4) - 0.5) * 0.9 + (v(5) < 0.5 ? .pi : 0)
-            let ux = cos(a), uy = sin(a) * 2, nx = -sin(a) / 2, ny = cos(a)
-            let t = 0.35 + 0.3 * v(6), j = 0.4 + 0.5 * v(7)
-            return [CGPoint(x: cx - ux * len / 2 + nx * w / 2, y: cy - uy * len / 2 + ny * w / 2),
-                    CGPoint(x: cx - ux * len * (0.5 - t) + nx * w * j, y: cy - uy * len * (0.5 - t) + ny * w * j),
-                    CGPoint(x: cx - ux * len * (0.42 - t) - nx * w * 0.1, y: cy - uy * len * (0.42 - t) - ny * w * 0.1),
-                    CGPoint(x: cx + ux * len / 2, y: cy + uy * len / 2),
-                    CGPoint(x: cx - ux * len / 2 - nx * w / 2, y: cy - uy * len / 2 - ny * w / 2)]
+        g.shards = (0..<(4 + Int(TickNoise.hash(tick / 2, 700) % 3))).map { (k: Int) -> [CGPoint] in
+            let v = { (salt: Int) -> CGFloat in CGFloat(TickNoise.unit(tick / 2, 710 + k * 10 + salt)) }
+            let cx: CGFloat = v(0), cy: CGFloat = v(1), len: CGFloat = 0.4 + 0.5 * v(2), w: CGFloat = 0.15 + 0.2 * v(3)
+            let a: CGFloat = (v(4) - 0.5) * 0.9 + (v(5) < 0.5 ? CGFloat.pi : 0)
+            let ux: CGFloat = cos(a), uy: CGFloat = sin(a) * 2, nx: CGFloat = -sin(a) / 2, ny: CGFloat = cos(a)
+            let t: CGFloat = 0.35 + 0.3 * v(6), j: CGFloat = 0.4 + 0.5 * v(7)
+            // Точка клина: `along` — вдоль (доли длины), `across` — поперёк (доли ширины).
+            func at(_ along: CGFloat, _ across: CGFloat) -> CGPoint {
+                let dx: CGFloat = ux * len * along + nx * w * across
+                let dy: CGFloat = uy * len * along + ny * w * across
+                return CGPoint(x: cx + dx, y: cy + dy)
+            }
+            return [at(-0.5, 0.5), at(t - 0.5, j), at(t - 0.42, -0.1), at(0.5, 0), at(-0.5, -0.5)]
         }
         g.smears = (0..<(4 + Int(TickNoise.hash(tick, 800) % 4))).map { k in
             (y: u(801 + k * 4) * 0.95, h: 0.01 + 0.08 * u(802 + k * 4), src: u(803 + k * 4), tint: 0)

@@ -24,6 +24,8 @@ final class CodexService: ObservableObject {
         var text: String
         /// Предложенные помощником действия «ответь сессии» — ждут подтверждения человека.
         var proposals: [Proposal] = []
+        /// Музыка по просьбе: «▶ ищу «X»…» → «♪ Artist — Track» / «не нашла».
+        var music: String?
     }
 
     struct Proposal: Identifiable, Equatable {
@@ -52,6 +54,11 @@ final class CodexService: ObservableObject {
     @Published private(set) var drafting: SessionKey?
 
     var summariesEnabled: () -> Bool = { false }
+    /// Музыкальная просьба человека → `CharacterCenter` (а он — `MusicController`): команда, вопрос, сообщение чата.
+    var onMusic: ((MusicCommand, String, UUID) -> Void)?
+    /// Музыка сейчас известна: голые «стоп», «дальше» — про трек.
+    var musicKnown: () -> Bool = { false }
+    var log: ((String) -> Void)?
     /// Хосты, содержимое сессий которых в Codex не уходит.
     var privateHosts: () -> Set<String> = { [] }
 
@@ -388,6 +395,14 @@ final class CodexService: ObservableObject {
         // Неподтверждённые действия прошлых ответов больше не актуальны.
         for i in chat.indices { for j in chat[i].proposals.indices where chat[i].proposals[j].state == .pending { chat[i].proposals[j].state = .cancelled } }
         chat.append(ChatMessage(role: .user, text: q))
+        // «Включи X», «пауза», «дальше» — сразу, без Codex.
+        if let cmd = MusicCommand.parse(q, known: musicKnown()), onMusic != nil {
+            var m = ChatMessage(role: .local, text: cmd.reply)
+            m.music = Self.musicStarting(cmd)
+            chat.append(m)
+            onMusic?(cmd, q, m.id)
+            return
+        }
         guard isReady else {
             var text = Assistant.localAnswer(sessions: store.sessions, names: store.names)
             text += state == .signedOut ? " Чтобы отвечать на другое, войдите в Codex (меню ✦)." : " Codex сейчас не подключён."
@@ -424,7 +439,17 @@ final class CodexService: ObservableObject {
                     return Proposal(key: s.key, title: self.store.name(s).title, action: p.action, choiceLabel: label,
                                     fingerprint: s.requestFingerprint, status: s.status)
                 }
-                self.chat[i].text = parsed.text.isEmpty && self.chat[i].proposals.isEmpty ? "(пустой ответ)" : parsed.text
+                // Музыку от модели — только если человек сам о ней просил (текст с экранов сессий не включает треки).
+                if let cmd = parsed.music.first {
+                    if MusicCommand.isMusicRequest(q), self.onMusic != nil {
+                        self.chat[i].music = Self.musicStarting(cmd)
+                        self.onMusic?(cmd, q, id)
+                    } else {
+                        self.log?("assistant: музыкальный блок без музыкальной просьбы — отброшен")
+                    }
+                }
+                self.chat[i].text = parsed.text.isEmpty && self.chat[i].proposals.isEmpty
+                    ? (self.chat[i].music != nil ? cmdReply(parsed.music.first) : "(пустой ответ)") : parsed.text
                 self.speak(for: self.chat[i].text)
             case .failure(let e): self.chat[i] = ChatMessage(role: .error, text: Self.message(e))
             }
@@ -463,6 +488,23 @@ final class CodexService: ObservableObject {
         }
     }
 
+    /// Строка музыки под ответом, пока ждём плеер.
+    static func musicStarting(_ cmd: MusicCommand) -> String {
+        switch cmd {
+        case .play(let q): "▶ ищу «\(q)»…"
+        case .playURI: "▶ включаю по ссылке…"
+        case .pause: "❚❚ пауза…"
+        default: "▶ \(cmd.reply.lowercased())"
+        }
+    }
+
+    /// Итог музыки (`CharacterCenter`): строка под ответом и, если нужно, сам текст ответа.
+    func setMusic(_ message: UUID, status: String, text: String? = nil) {
+        guard let i = chat.firstIndex(where: { $0.id == message }) else { return }
+        chat[i].music = status
+        if let text { chat[i].text = text }
+    }
+
     func cancel(_ message: UUID, _ proposal: UUID) {
         guard let i = chat.firstIndex(where: { $0.id == message }),
               let j = chat[i].proposals.firstIndex(where: { $0.id == proposal }),
@@ -491,3 +533,6 @@ final class CodexService: ObservableObject {
         }
     }
 }
+
+/// Текст ответа, если модель прислала только музыкальный блок.
+private func cmdReply(_ cmd: MusicCommand?) -> String { cmd?.reply ?? "" }

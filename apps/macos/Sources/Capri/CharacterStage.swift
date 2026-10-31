@@ -4,9 +4,10 @@ import Combine
 import CapriKit
 
 // Сцены персонажа на рабочем столе. Панель — рецепт NotchPanel: без рамки, не активирует приложение, не становится
-// ключевой, прозрачная, клики проходят насквозь (кроме «×» в сцене «окно»). Есть только во время сцены (≤ 8 с);
-// вне сцены — `orderOut`, TimelineView снят, CPU ≈ 0. Полноэкранные пространства — нет (`.fullScreenAuxiliary` не
-// ставим). Компьютером Capri не управляет: курсор, текст и окно — рисунок в этой панели.
+// ключевой, прозрачная, клики проходят насквозь — кроме «горячих» точек спокойной фазы (`SceneLayout.hotspots`:
+// глаза и заголовок — тянуть, «×», «📌», строки, кнопки). Есть только во время сцены; вне сцены — `orderOut`,
+// TimelineView и мониторы мыши сняты, CPU ≈ 0. Полноэкранные пространства — нет (`.fullScreenAuxiliary` не ставим).
+// Компьютером Capri не управляет: курсор, текст и окно — рисунок в этой панели.
 
 final class StagePanel: NSPanel {
     override var canBecomeKey: Bool { false }
@@ -14,12 +15,58 @@ final class StagePanel: NSPanel {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
-/// Тексты сцены — из живых данных.
+/// Строка окна сессий.
+struct SceneRow: Equatable {
+    var key: SessionKey
+    var name: String
+    var detail: String
+    var status: SessionStatus
+    /// «3м», «1ч» — сколько в этом статусе.
+    var since: String
+}
+
+/// Тексты сцены — из живых данных (обновляются во время сцены: `StageController.update(content:)`).
 struct SceneContent: Equatable {
     /// Строка статуса окна: «2 ждут · votek2», «всё тихо», «♪ Artist — Track».
     var status = "всё тихо"
     /// Строки «захвата».
     var lines = ["> capri attach", "ACCESS ▮▮▮"]
+    /// Окно сессий: строки и сколько ждут.
+    var rows: [SceneRow] = []
+    var waiting = 0
+    /// Окно ответа: текст после переноса (до 6 строк) и предложение помощника.
+    var answer: [String] = []
+    var proposal: SceneProposal?
+    /// Ответ сессии (`reply`): имя сессии и судьба ответа (nil — ждём подтверждения).
+    var replyName = ""
+    var delivered: Bool?
+    /// Музыка: «Artist — Track» (nil — неизвестно), играет ли, что ищем («включи X») и сообщение («не нашла»).
+    var track: String?
+    var trackPlaying = false
+    var query: String?
+    var note: String?
+
+    /// Подпись `reply`: «→ votek2 ✓» / «→ votek2 …» / «→ votek2 · не дошло».
+    var caption: String {
+        switch delivered {
+        case true?: "→ \(replyName) ✓"
+        case false?: "→ \(replyName) · не дошло"
+        case nil: "→ \(replyName) …"
+        }
+    }
+}
+
+/// Неподтверждённое действие помощника в окне ответа.
+struct SceneProposal: Equatable {
+    var message: UUID
+    var id: UUID
+    /// «отправлю votek2: 1»
+    var title: String
+    /// `pending`, `sending`, `sent`, `failed`, `cancelled`.
+    var state: String
+    /// Текст ответа в окне обрезан — отправлять отсюда нельзя (человек не видит, что одобряет): кнопка
+    /// «прочитать ↗» открывает помощника с полным текстом.
+    var clipped = false
 }
 
 /// Идущая сцена.
@@ -32,15 +79,71 @@ struct SceneRun: Equatable {
     var size: CGSize
     var clips: Set<String>
     var content: SceneContent
+    /// Время таймлайна, когда сцену оборвали.
     var abortedAt: Double?
     /// Для снимков: прямоугольник «окна под панелью» (подложка).
     var backdropWindow: CGRect?
+    /// Удержание (наведение, перетаскивание, «📌»).
+    var clock = SceneClock()
+    /// Куда сцену отнесли от исходного места.
+    var offset = CGVector.zero
+    /// Строк в окне сессий — по числу на старте (окно не меняет размер посреди сцены).
+    var rowsCap = 0
+    /// Ответ продолжает окно «думает».
+    var continued = false
+    /// Время таймлайна: предложение отправлено (`answer`) / ответ не дошёл (`reply`).
+    var burstAt: Double?
+    var failedAt: Double?
+    /// Горячая точка под курсором — подсветка строки/кнопки.
+    var hover: SceneHotspot.Kind?
+    /// Окно музыки: смены состояния.
+    var marks: [SceneMusicMark] = []
+    /// ⏮ ⏯ ⏭ под глазами показаны (курсор на глазах или на кнопках).
+    var controls = false
 
-    var end: Double { abortedAt.map { $0 + SceneTimeline.recallDuration } ?? SceneTimeline.duration(kind) }
+    var options: SceneOptions {
+        var o = SceneOptions(text: content.status.count, lines: content.lines.map(\.count), rows: min(content.rows.count, rowsCap),
+                     waiting: content.waiting, answerLines: content.answer.count, answerChars: content.answer.reduce(0) { $0 + $1.count },
+                     proposal: content.proposal != nil, continued: continued, burstAt: burstAt, caption: content.caption.count,
+                     failedAt: failedAt)
+        o.musicMarks = marks
+        o.musicKnown = content.track != nil
+        o.controls = controls
+        return o
+    }
 
+    /// Конец таймлайна.
+    var end: Double { abortedAt.map { $0 + SceneTimeline.recallDuration } ?? SceneTimeline.duration(kind, options) }
+
+    /// Секунды стены от начала сцены.
+    func wall(_ date: Date = Date()) -> Double { date.timeIntervalSince(start) }
+
+    /// Время таймлайна по стене.
+    func time(wall w: Double) -> Double { clock.time(w) }
+
+    /// Кадр по стене: таймлайн с удержанием; в спокойной фазе клип глаз идёт по стене (не замирает). Окно музыки
+    /// считает клипы от стены само (`SceneOptions.lag`): смена состояния во время удержания начинается с клика.
+    func frame(wall w: Double) -> SceneFrame {
+        let t = clock.time(w)
+        var o = options
+        if kind == .music { o.lag = clock.lag(w) }
+        var f = SceneTimeline.frame(kind, t: t, geometry: geometry, clips: clips, options: o, abortedAt: abortedAt)
+        if kind != .music, abortedAt == nil, SceneTimeline.calm(kind, o)?.contains(t) == true { f.clipT += clock.lag(w) }
+        return f
+    }
+
+    /// Кадр по времени таймлайна (листы, без удержания).
     func frame(at t: Double) -> SceneFrame {
-        SceneTimeline.frame(kind, t: t, geometry: geometry, clips: clips, text: content.status.count,
-                            lines: content.lines.map(\.count), abortedAt: abortedAt)
+        SceneTimeline.frame(kind, t: t, geometry: geometry, clips: clips, options: options, abortedAt: abortedAt)
+    }
+
+    func hotspots(wall w: Double) -> [SceneHotspot] {
+        SceneLayout.hotspots(kind, t: clock.time(w), geometry: geometry, clips: clips, options: options, abortedAt: abortedAt)
+    }
+
+    /// Сцена в спокойной фазе (можно держать).
+    func calm(wall w: Double) -> Bool {
+        abortedAt == nil && SceneTimeline.calm(kind, options)?.contains(clock.time(w)) == true
     }
 }
 
@@ -48,18 +151,24 @@ final class StageModel: ObservableObject {
     @Published var run: SceneRun?
 }
 
-/// Расписание кадров сцены: 24 fps, в спокойной части (`SceneTimeline.calm`) — 12 fps. Панель сцены большая
-/// (notch ∪ цель), каждый кадр перерисовывает её целиком — лишние кадры в покое стоят батареи.
+/// Расписание кадров сцены по стене: 24 fps, в спокойной части (`SceneTimeline.calm`) — 12 fps. Панель сцены
+/// большая (notch ∪ цель), каждый кадр перерисовывает её целиком — лишние кадры в покое стоят батареи.
+/// Пока сцену держат, конца нет, но и кадров меньше — 4 fps (глаза дышат медленно, окно стоит); отпустили —
+/// `SceneRun` меняется, и расписание пересоздаётся. Наведение и подсветка тоже меняют `SceneRun` — отклик сразу.
 struct SceneSchedule: TimelineSchedule {
     var run: SceneRun
+    static let frozenInterval = 1.0 / 4
 
     func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
-        var t = max(0, startDate.timeIntervalSince(run.start))
-        let end = run.end + 0.1
+        var w = max(0, startDate.timeIntervalSince(run.start))
+        let o = run.options
+        let frozen = run.clock.frozen
+        let wallEnd = frozen ? Double.infinity : run.end + run.clock.held + 0.1
         return AnyIterator {
-            guard t <= end else { return nil }
-            let date = run.start.addingTimeInterval(t)
-            t += SceneTimeline.frameInterval(run.kind, t: t, aborted: run.abortedAt != nil)
+            guard w <= wallEnd else { return nil }
+            let date = run.start.addingTimeInterval(w)
+            let step = SceneTimeline.frameInterval(run.kind, t: run.clock.time(w), aborted: run.abortedAt != nil, options: o)
+            w += frozen ? max(step, Self.frozenInterval) : step
             return date
         }
     }
@@ -72,8 +181,8 @@ struct SceneView: View {
     var body: some View {
         if let run = model.run {
             TimelineView(SceneSchedule(run: run)) { ctx in
-                let t = ctx.date.timeIntervalSince(run.start)
-                SceneCanvas(run: run, t: t, frame: run.frame(at: t))
+                let w = run.wall(ctx.date)
+                SceneCanvas(run: run, t: w, frame: run.frame(wall: w))
             }
         } else {
             Color.clear
@@ -169,19 +278,30 @@ struct SceneCanvas: View {
             let bar = CGRect(x: r.minX, y: r.minY, width: r.width, height: 22)
             c.fill(Path(CGRect(x: bar.minX, y: bar.maxY - 1, width: bar.width, height: 1)), with: .color(pink.opacity(0.7)))
             c.fill(Path(CGRect(x: bar.minX + 1, y: bar.minY + 1, width: 3, height: bar.height - 2)), with: .color(pink))
-            c.draw(Text("CAPRI//SYS" + (w.caret ? " ▮" : "  ")).font(.mono(9, .bold)).foregroundColor(pink),
+            c.draw(Text(StageWindows.title(run.kind) + (w.caret ? " ▮" : "  ")).font(.mono(9, .bold)).foregroundColor(pink),
                    at: CGPoint(x: bar.minX + 10, y: bar.midY), anchor: .leading)
             let x = local(SceneTimeline.closeRect(w.rect))
-            c.stroke(Path(x.insetBy(dx: 0.5, dy: 0.5)), with: .color(pink.opacity(0.8)), lineWidth: 1)
+            c.stroke(Path(x.insetBy(dx: 0.5, dy: 0.5)), with: .color(pink.opacity(run.hover == .close ? 1 : 0.8)), lineWidth: 1)
+            if run.hover == .close { c.fill(Path(x), with: .color(pink.opacity(0.25))) }
             var cross = Path()
             cross.move(to: CGPoint(x: x.minX + 5, y: x.minY + 5)); cross.addLine(to: CGPoint(x: x.maxX - 5, y: x.maxY - 5))
             cross.move(to: CGPoint(x: x.maxX - 5, y: x.minY + 5)); cross.addLine(to: CGPoint(x: x.minX + 5, y: x.maxY - 5))
             c.stroke(cross, with: .color(pink), lineWidth: 1.4)
-            // Строка статуса, печатается побуквенно.
-            let text = String(run.content.status.prefix(w.typed))
-            let caret = w.typed < run.content.status.count || w.caret ? "▮" : " "
-            c.draw(Text("> " + text + caret).font(.mono(11, .semibold)).foregroundColor(Palette.text),
-                   at: CGPoint(x: r.minX + 12, y: r.maxY - 18), anchor: .leading)
+            StageWindows.drawPin(local(SceneTimeline.pinRect(w.rect)), pinned: run.clock.pinned, hover: run.hover == .pin, c)
+            if run.kind == .window {
+                // Строка статуса, печатается побуквенно; кликабельна — основное окно.
+                let text = String(run.content.status.prefix(w.typed))
+                let caret = w.typed < run.content.status.count || w.caret ? "▮" : " "
+                if run.hover == .button("status") {
+                    let sr = local(SceneTimeline.statusRect(w.rect))
+                    c.fill(Path(sr), with: .color(pink.opacity(0.14)))
+                    c.fill(Path(CGRect(x: sr.minX, y: sr.minY, width: 2, height: sr.height)), with: .color(Palette.acid))
+                }
+                c.draw(Text("> " + text + caret).font(.mono(11, .semibold)).foregroundColor(Palette.text),
+                       at: CGPoint(x: r.minX + 12, y: r.maxY - 18), anchor: .leading)
+            } else {
+                StageWindows(run: run, window: w, local: { self.local($0) }, localPoint: { self.local($0) }, t: t).draw(c)
+            }
             // Уголки-скобки HUD.
             var ticks = Path()
             for (px, py, sx, sy) in [(r.minX, r.maxY, 1.0, -1.0), (r.maxX, r.maxY, -1.0, -1.0)] {
@@ -317,6 +437,25 @@ struct SceneCanvas: View {
         }
         if let w = frame.window, w.melt > 0 { drawMelt(w, ctx) }
         if let k = frame.takeover { drawTakeoverFront(k, ctx) }
+        for ring in frame.rings {
+            // «Отправила»: кольцо-импульс от глаз.
+            let p = local(ring.center)
+            let rr = 20 + 70 * ring.progress
+            var c = ctx
+            c.opacity = Double(1 - ring.progress)
+            c.stroke(Path(ellipseIn: CGRect(x: p.x - rr, y: p.y - rr * 0.6, width: 2 * rr, height: 1.2 * rr)), with: .color(CapriFX.hackPink), lineWidth: 2.5)
+            c.stroke(Path(ellipseIn: CGRect(x: p.x - rr * 0.7, y: p.y - rr * 0.42, width: 1.4 * rr, height: 0.84 * rr)), with: .color(Palette.acid), lineWidth: 1)
+        }
+        if run.controls, run.content.track != nil, !run.kind.boxed, frame.eyes != nil,
+           run.abortedAt == nil, SceneTimeline.calm(run.kind, run.options)?.contains(run.clock.time(t)) == true {
+            // ⏮ ⏯ ⏭ под глазами (наведение на глаза).
+            let rects = SceneTimeline.eyeControls(run.geometry.target).map { ($0.id, local($0.rect)) }
+            StageWindows.drawEyeControls(rects, playing: run.content.trackPlaying, hover: run.hover, ctx)
+        }
+        if let cap = frame.caption, cap.typed > 0 {
+            StageWindows.drawCaption(String(run.content.caption.prefix(cap.typed)), full: run.content.caption.count == cap.typed,
+                                     at: local(cap.anchor), failed: cap.failed, ctx)
+        }
         for n in frame.notes {
             let glyph = ["♪", "♫", "♬"][n.glyph % 3]
             var c = ctx
@@ -423,44 +562,96 @@ enum SceneArt {
     }
 }
 
-/// Прозрачная кнопка «×» (единственная кликабельная точка сцены).
-final class StageCloseView: NSView {
-    var onClick: (() -> Void)?
+/// Ловит клики по горячим точкам сцены. Панель принимает мышь, только когда курсор над горячей точкой
+/// (иначе `ignoresMouseEvents`), так что всё, что сюда пришло, — по горячей точке. Панель не становится ключевой
+/// и не активирует Capri (`nonactivatingPanel`, `acceptsFirstMouse`).
+final class StageHitView: NSView {
+    weak var stage: StageController?
+    private var down: SceneHotspot?
+    private var last: CGPoint?
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent) { onClick?() }
+    override func hitTest(_ point: NSPoint) -> NSView? { frame.contains(point) ? self : nil }
+
+    override func mouseDown(with event: NSEvent) {
+        let p = NSEvent.mouseLocation
+        down = stage?.spot(at: p)
+        last = p
+        // Окно появилось само под курсором: кнопки и строки нажимаются, только когда на них навели (≥ 0.4 с) —
+        // клик, предназначенный приложению под сценой, не должен отправить ответ или тронуть плеер.
+        if let d = down, stage?.armed(d.kind) != true { down = nil; return }
+        if down?.kind == .drag { stage?.beginDrag() }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard down?.kind == .drag, let l = last else { return }
+        let p = NSEvent.mouseLocation
+        stage?.drag(by: CGVector(dx: p.x - l.x, dy: p.y - l.y))
+        last = p
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer { down = nil; last = nil }
+        guard let d = down else { return }
+        if d.kind == .drag { stage?.endDrag(); return }
+        // Кнопка — по отпусканию над ней же (увёл мышь — передумал).
+        if stage?.spot(at: NSEvent.mouseLocation)?.kind == d.kind { stage?.activate(d.kind, modifiers: event.modifierFlags) }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        // Как у notch: общее меню с «Выйти».
+        guard let menu = stage?.makeMenu?() else { return }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
 }
 
-/// Показ сцен: панель, таймер конца, «×», обрыв. Решения «можно ли» — у `CharacterDirector`.
+/// Показ сцен: панель, часы и конец сцены, горячие точки, перетаскивание, «📌», обрыв. Решения «можно ли» — у
+/// `CharacterDirector`, что делают кнопки окон — у `CharacterCenter` (`onAction`).
 final class StageController {
     let model = StageModel()
     private var panel: StagePanel?
-    private var closeView: StageCloseView?
+    private var hitView: StageHitView?
     private var endWork: DispatchWorkItem?
-    private var mouseTimer: Timer?
+    /// Мониторы мыши — только пока идёт сцена с горячими точками.
+    private var monitors: [Any] = []
+    private var dragging = false
+    /// Над какой точкой мышь и с каких пор (для `armed`).
+    private var hoverSince: (kind: SceneHotspot.Kind, at: Date)?
+    static let armDelay = 0.4
     /// Глаза в notch (глобально).
     var home: () -> CGRect? = { nil }
     var screen: () -> NSScreen? = { nil }
     var content: () -> SceneContent = { SceneContent() }
     /// Сцена началась/кончилась — notch прячет/показывает свои глаза.
     var onRunning: ((Bool) -> Void)?
+    /// Клик по строке/кнопке окна (кроме «×» и «📌» — их обрабатывает сцена сама).
+    var onAction: ((SceneKind, SceneHotspot.Kind, NSEvent.ModifierFlags) -> Void)?
+    /// Меню по правому клику (общее меню Capri с «Выйти»).
+    var makeMenu: (() -> NSMenu)?
     var log: ((String) -> Void)?
     private(set) var suppressed = false
     private(set) var lastTarget = ""
 
     var running: Bool { model.run != nil }
+    var kind: SceneKind? { model.run?.kind }
+    var pinned: Bool { model.run?.clock.pinned ?? false }
 
-    /// Время от начала сцены.
-    var elapsed: Double? { model.run.map { Date().timeIntervalSince($0.start) } }
+    /// Время таймлайна сейчас.
+    var elapsed: Double? { model.run.map { $0.time(wall: $0.wall()) } }
 
     // MARK: геометрия
 
-    /// Сцена на экране notch; `variant` — `corner|window` (телепорт), `terminal|corner` (захват).
-    func makeRun(_ kind: SceneKind, variant: String? = nil, backdrop: Bool = false) -> SceneRun? {
+    /// Сцена на экране notch; `variant` — `corner|window` (телепорт), `terminal|corner` (захват, ответ);
+    /// `terminal` — рамка окна терминала (AppKit) для `reply`; `around` — окно, на месте которого раскрыться.
+    func makeRun(_ kind: SceneKind, variant: String? = nil, backdrop: Bool = false, terminal: CGRect? = nil,
+                 content given: SceneContent? = nil, around: CGRect? = nil) -> SceneRun? {
         guard let screen = screen() else { return nil }
         let visible = screen.visibleFrame
         let home = self.home() ?? CGRect(x: screen.frame.midX - 120, y: screen.frame.maxY - 22, width: 32, height: 16)
         let corner = SceneLayout.corner(visible, size: SceneTimeline.eyesSize)
         let front = Self.frontWindow(on: screen)
+        let content = given ?? self.content()
+        let rowsCap = max(1, min(SceneTimeline.sessionsMaxRows, content.rows.count))
         var target = corner, area: CGRect?, backdropWindow: CGRect?
         lastTarget = "corner"
         switch kind {
@@ -475,6 +666,20 @@ final class StageController {
         case .window:
             area = SceneLayout.windowForm(visible)
             target = SceneTimeline.eyesInWindow(area!)
+        case .sessions, .thinking, .answer, .music:
+            var o = SceneOptions(rows: rowsCap, answerLines: content.answer.count)
+            o.proposal = content.proposal != nil
+            let size = SceneTimeline.windowSize(kind, o)
+            area = around.map { SceneLayout.resized($0, to: size, visible: visible) } ?? SceneLayout.windowForm(visible, kind: kind, options: o)
+            target = SceneTimeline.eyesIn(kind, window: area!)
+        case .reply:
+            var w = variant == "corner" ? nil : terminal
+            if w == nil, variant != "corner", backdrop {
+                w = CGRect(x: visible.maxX - 860, y: visible.minY + 80, width: 760, height: 460)
+            }
+            if let w {
+                target = SceneLayout.atTerminal(w, visible: visible); lastTarget = "terminal"; backdropWindow = w
+            }
         case .takeover:
             var w: CGRect?
             if variant != "corner", let f = front, f.terminal || variant == "terminal" { w = f.rect }
@@ -489,10 +694,16 @@ final class StageController {
             break
         }
         let g = SceneGeometry(home: home, target: target, area: area, visible: visible, cursor: NSEvent.mouseLocation)
+        guard let (origin, size) = Self.panelFrame(g, screen: screen) else { return nil }
+        return SceneRun(kind: kind, start: Date(), geometry: g, origin: origin, size: size, clips: SceneArt.clips, content: content,
+                        abortedAt: nil, backdropWindow: backdrop ? backdropWindow : nil, rowsCap: rowsCap)
+    }
+
+    /// Панель — всё, что сцена может занять, в пределах экрана.
+    static func panelFrame(_ g: SceneGeometry, screen: NSScreen) -> (CGPoint, CGSize)? {
         let bounds = g.bounds.intersection(screen.frame).integral
         guard !bounds.isNull, bounds.width > 0 else { return nil }
-        return SceneRun(kind: kind, start: Date(), geometry: g, origin: bounds.origin, size: bounds.size,
-                        clips: SceneArt.clips, content: content(), abortedAt: nil, backdropWindow: backdrop ? backdropWindow : nil)
+        return (bounds.origin, bounds.size)
     }
 
     struct FrontWindow { var rect: CGRect; var terminal: Bool; var pid: Int32 }
@@ -516,21 +727,46 @@ final class StageController {
     // MARK: показ
 
     @discardableResult
-    func play(_ kind: SceneKind, variant: String? = nil) -> Bool {
+    func play(_ kind: SceneKind, variant: String? = nil, terminal: CGRect? = nil, content: SceneContent? = nil, around: CGRect? = nil) -> Bool {
         guard !suppressed else { log?("scene \(kind.rawValue): skip fullscreen"); return false }
         stop()
-        guard let run = makeRun(kind, variant: variant) else { log?("scene \(kind.rawValue): no screen"); return false }
+        guard let run = makeRun(kind, variant: variant, terminal: terminal, content: content, around: around) else {
+            log?("scene \(kind.rawValue): no screen"); return false
+        }
+        show(run)
+        log?("scene \(kind.rawValue) → \(lastTarget) frame=\(NSStringFromRect(panel?.frame ?? .zero))")
+        return true
+    }
+
+    /// «Думает» → ответ в том же окне (где бы оно ни стояло): глитч-переход вместо прилёта.
+    @discardableResult
+    func morph(to kind: SceneKind, content: SceneContent) -> Bool {
+        guard let old = model.run, old.abortedAt == nil, let area = old.geometry.area else { return play(kind, content: content) }
+        guard var run = makeRun(kind, content: content, around: area) else { return false }
+        run.continued = true
+        run.geometry.home = old.geometry.home
+        endWork?.cancel()
+        removeMonitors()
+        model.run = nil
+        show(run)
+        log?("scene \(old.kind.rawValue) → \(kind.rawValue) (в том же окне)")
+        return true
+    }
+
+    private func show(_ run: SceneRun) {
         let panel = self.panel ?? makePanel()
         self.panel = panel
         panel.setFrame(CGRect(origin: run.origin, size: run.size), display: false)
-        panel.ignoresMouseEvents = true
+        setIgnores(true)
         model.run = run
         panel.orderFrontRegardless()
         onRunning?(true)
-        log?("scene \(kind.rawValue) → \(lastTarget) frame=\(NSStringFromRect(panel.frame))")
-        scheduleEnd(after: run.end)
-        if kind == .window { startCloseTracking() }
-        return true
+        reschedule()
+        if run.kind != .takeover { installMonitors() }
+        // Курсор уже может стоять там, где появится кнопка: проверить в начале спокойной фазы.
+        if let calm = SceneTimeline.calm(run.kind, run.options) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + calm.lowerBound + 0.02) { [weak self] in self?.track() }
+        }
     }
 
     private func makePanel() -> StagePanel {
@@ -538,77 +774,249 @@ final class StageController {
         p.isOpaque = false
         p.backgroundColor = .clear
         p.hasShadow = false
-        // Над notch (mainMenu + 3): глаза уходят из notch и возвращаются в него. Клики всё равно проходят насквозь.
+        // Над notch (mainMenu + 3): глаза уходят из notch и возвращаются в него. Клики проходят насквозь, кроме
+        // горячих точек.
         p.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 4)
         p.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         p.hidesOnDeactivate = false
         p.isReleasedWhenClosed = false
         p.ignoresMouseEvents = true
+        p.acceptsMouseMovedEvents = true
+        p.becomesKeyOnlyIfNeeded = true
         p.animationBehavior = .none
         let container = NSView()
         let host = NSHostingView(rootView: SceneView(model: model))
         host.sizingOptions = []
         host.autoresizingMask = [.width, .height]
         container.addSubview(host)
-        let close = StageCloseView()
-        close.isHidden = true
-        close.onClick = { [weak self] in self?.log?("scene: × clicked"); self?.stop() }
-        container.addSubview(close)
-        closeView = close
+        let hit = StageHitView()
+        hit.stage = self
+        hit.autoresizingMask = [.width, .height]
+        container.addSubview(hit)
+        hitView = hit
         p.contentView = container
         return p
     }
 
-    private func scheduleEnd(after seconds: Double) {
+    private func setIgnores(_ value: Bool) {
+        if let panel, panel.ignoresMouseEvents != value { panel.ignoresMouseEvents = value }
+    }
+
+    /// Конец сцены по часам: идёт — таймер на остаток; стоит — проверка, когда кончится удержание.
+    private func reschedule() {
         endWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.stop() }
-        endWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + max(0.05, seconds) + 0.05, execute: work)
-    }
-
-    /// «×» кликабелен только пока над ним мышь (опрос 30 раз в секунду только во время сцены «окно» — окно, когда
-    /// клик мимо «×» ловит панель, ≤ 33 мс).
-    private func startCloseTracking() {
-        mouseTimer?.invalidate()
-        let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.trackClose() }
-        RunLoop.main.add(t, forMode: .common)
-        mouseTimer = t
-    }
-
-    private func trackClose() {
-        guard let run = model.run, let panel, let w = run.geometry.area, let t = elapsed else { return }
-        let f = run.frame(at: t)
-        let x = SceneTimeline.closeRect(w)
-        let active = f.window?.chrome == true && run.abortedAt == nil
-        let over = active && x.insetBy(dx: -3, dy: -3).contains(NSEvent.mouseLocation)
-        if let cv = closeView {
-            let local = CGRect(x: x.minX - run.origin.x - 3, y: x.minY - run.origin.y - 3, width: x.width + 6, height: x.height + 6)
-            if cv.frame != local { cv.frame = local }
-            cv.isHidden = !active
+        endWork = nil
+        guard var run = model.run else { return }
+        let w = run.wall()
+        if run.clock.update(w) { model.run = run }
+        run = model.run!
+        let delay: Double
+        let finish: Bool
+        if let rem = run.clock.remaining(w, end: run.end) {
+            delay = rem; finish = true
+        } else if let next = run.clock.nextCheck() {
+            delay = next - w; finish = false
+        } else {
+            return    // держат мышью — придёт событие мыши
         }
-        if panel.ignoresMouseEvents == over { panel.ignoresMouseEvents = !over }
+        let work = DispatchWorkItem { [weak self] in
+            if finish { self?.stop() } else { self?.reschedule() }
+        }
+        endWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0.05, delay) + 0.05, execute: work)
     }
 
-    /// Обрыв (кто-то ждёт ответа, notch раскрыли): молния домой за 0.35 с.
-    func abort(_ why: String) {
-        guard var run = model.run, run.abortedAt == nil, let t = elapsed else { return }
-        guard t < SceneTimeline.duration(run.kind) - SceneTimeline.recallDuration else { return }
-        run.abortedAt = t
+    // MARK: мышь
+
+    /// Мониторы движения мыши (как у notch: разрешений не требуют) — только на время сцены.
+    private func installMonitors() {
+        removeMonitors()
+        let moves: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged]
+        if let m = NSEvent.addGlobalMonitorForEvents(matching: moves, handler: { [weak self] _ in self?.track() }) { monitors.append(m) }
+        if let m = NSEvent.addLocalMonitorForEvents(matching: moves, handler: { [weak self] e in self?.track(); return e }) { monitors.append(m) }
+    }
+
+    private func removeMonitors() {
+        for m in monitors { NSEvent.removeMonitor(m) }
+        monitors.removeAll()
+    }
+
+    /// Можно ли нажать: «×», «📌» и перетаскивание — сразу; кнопки и строки — после `armDelay` наведения.
+    func armed(_ kind: SceneHotspot.Kind) -> Bool {
+        switch kind {
+        case .close, .pin, .drag: return true
+        default:
+            guard let h = hoverSince, h.kind == kind else { return false }
+            return Date().timeIntervalSince(h.at) >= Self.armDelay
+        }
+    }
+
+    /// Горячая точка под точкой `p` сейчас.
+    func spot(at p: CGPoint) -> SceneHotspot? {
+        guard let run = model.run else { return nil }
+        return SceneLayout.hit(run.hotspots(wall: run.wall()), p)
+    }
+
+    static func isMusicButton(_ k: SceneHotspot.Kind) -> Bool {
+        if case .button(let id) = k { return MusicCommand(button: id) != nil }
+        return false
+    }
+
+    /// Курсор сдвинулся: панель ловит мышь только над горячей точкой; наведение держит сцену. Наведение на глаза
+    /// (не в окне) показывает под ними ⏮ ⏯ ⏭, если музыка известна.
+    private func track() {
+        guard var run = model.run, !dragging, run.abortedAt == nil else { return }
+        let w = run.wall()
+        let p = NSEvent.mouseLocation
+        var over = SceneLayout.hit(run.hotspots(wall: w), p)
+        var controlsChanged = false
+        if !run.kind.boxed, run.content.track != nil {
+            let want = over.map { $0.kind == .drag || Self.isMusicButton($0.kind) } ?? false
+            if want != run.controls {
+                run.controls = want
+                controlsChanged = true
+                over = SceneLayout.hit(run.hotspots(wall: w), p)
+            }
+        }
+        setIgnores(over == nil)
+        if over?.kind != hoverSince?.kind { hoverSince = over.map { ($0.kind, Date()) } }
+        let holding = over != nil
+        guard controlsChanged || holding != run.clock.holding || over?.kind != run.hover else { return }
+        if holding != run.clock.holding { run.clock.hold(holding, wall: w, calm: run.calm(wall: w)) }
+        run.hover = over?.kind
         model.run = run
-        panel?.ignoresMouseEvents = true
-        closeView?.isHidden = true
+        reschedule()
+    }
+
+    /// Горячих точек стало меньше (строки, кнопки) под неподвижной мышью: пересчитать, ловит ли панель клик —
+    /// иначе клик по уже пустому месту проглотит `StageHitView`. Наведение и кнопки не трогаем (это `track`).
+    private func refreshIgnores() {
+        guard let run = model.run, !dragging, run.abortedAt == nil else { return }
+        setIgnores(SceneLayout.hit(run.hotspots(wall: run.wall()), NSEvent.mouseLocation) == nil)
+    }
+
+    func beginDrag() {
+        guard var run = model.run else { return }
+        dragging = true
+        let w = run.wall()
+        run.clock.hold(true, wall: w, calm: run.calm(wall: w))
+        run.hover = .drag
+        model.run = run
+        reschedule()
+    }
+
+    /// Перетаскивание: цель и окно едут (не за экран), панель пересчитывается.
+    func drag(by d: CGVector) {
+        // После обрыва `StageHitView` ещё шлёт перетаскивание — сцена уже летит домой, не двигаем.
+        guard dragging, var run = model.run, run.abortedAt == nil, let screen = screen() else { return }
+        let before = run.geometry.area ?? run.geometry.target
+        run.geometry = run.geometry.moved(by: d)
+        let after = run.geometry.area ?? run.geometry.target
+        run.offset.dx += after.minX - before.minX
+        run.offset.dy += after.minY - before.minY
+        guard let (origin, size) = Self.panelFrame(run.geometry, screen: screen) else { return }
+        run.origin = origin
+        run.size = size
+        model.run = run
+        panel?.setFrame(CGRect(origin: origin, size: size), display: true)
+    }
+
+    func endDrag() {
+        guard dragging else { return }
+        dragging = false
+        guard var run = model.run else { return }
+        run.clock.hold(false, wall: run.wall(), calm: false)
+        model.run = run
+        log?("scene drag → offset \(Int(run.offset.dx)),\(Int(run.offset.dy))")
+        track()
+        reschedule()
+    }
+
+    /// Клик по горячей точке.
+    func activate(_ kind: SceneHotspot.Kind, modifiers: NSEvent.ModifierFlags = []) {
+        guard var run = model.run else { return }
+        switch kind {
+        case .close:
+            log?("scene: × clicked")
+            stop()
+        case .pin:
+            let w = run.wall()
+            run.clock.pin(!run.clock.pinned, wall: w, calm: run.calm(wall: w))
+            model.run = run
+            log?("scene pin \(run.clock.pinned)")
+            reschedule()
+        case .drag:
+            break
+        default:
+            log?("scene \(run.kind.rawValue): click \(kind)")
+            onAction?(run.kind, kind, modifiers)
+        }
+    }
+
+    /// Живые данные во время сцены (строки сессий, состояние предложения, «доставлено»).
+    func update(content: SceneContent) {
+        guard var run = model.run, run.content != content else { return }
+        run.content = content
+        model.run = run
+        reschedule()
+        refreshIgnores()
+    }
+
+    /// ⏮ ⏯ ⏭ под глазами без мыши (`stage controls on|off`).
+    func setControls(_ on: Bool) {
+        guard var run = model.run, run.controls != on else { return }
+        run.controls = on
+        model.run = run
+        refreshIgnores()
+    }
+
+    /// Окно музыки: новое состояние (ищет, играет, пауза, не вышло). До конца прилёта — с конца прилёта.
+    func mark(music state: SceneMusicState) {
+        guard var run = model.run, run.kind == .music, run.abortedAt == nil, run.marks.last?.state != state else { return }
+        let w = run.wall()
+        let t = run.clock.time(w)
+        let start = SceneTimeline.calm(.music, run.options)?.lowerBound ?? 0
+        let shift = max(0, start - t)
+        run.marks.append(SceneMusicMark(t: t + shift, wall: w + shift, state: state))
+        model.run = run
+        log?("scene music: \(state.rawValue)")
+        reschedule()
+        refreshIgnores()
+    }
+
+    /// Отметить момент таймлайна: предложение отправлено (`answer`) / ответ не дошёл (`reply`).
+    func mark(burst: Bool = false, failed: Bool = false) {
+        guard var run = model.run, let t = elapsed else { return }
+        if burst, run.burstAt == nil { run.burstAt = t }
+        if failed, run.failedAt == nil { run.failedAt = t }
+        model.run = run
+    }
+
+    /// Обрыв (кто-то ждёт ответа, notch раскрыли): молния домой за 0.35 с. Держание и «📌» снимаются.
+    func abort(_ why: String) {
+        guard var run = model.run, run.abortedAt == nil else { return }
+        let w = run.wall()
+        run.clock.release(w)
+        let t = run.clock.time(w)
+        guard t < SceneTimeline.duration(run.kind, run.options) - SceneTimeline.recallDuration else { return }
+        run.abortedAt = t
+        run.hover = nil
+        dragging = false
+        model.run = run
+        setIgnores(true)
+        removeMonitors()
         log?("scene abort (\(why)) at \(String(format: "%.2f", t))")
-        scheduleEnd(after: run.end - t)
+        reschedule()
     }
 
     /// Сразу убрать панель.
     func stop() {
         endWork?.cancel(); endWork = nil
-        mouseTimer?.invalidate(); mouseTimer = nil
+        removeMonitors()
+        dragging = false
         let was = model.run != nil
         model.run = nil
-        panel?.ignoresMouseEvents = true
-        closeView?.isHidden = true
+        setIgnores(true)
         panel?.orderOut(nil)
         if was { onRunning?(false); log?("scene end") }
     }
@@ -620,12 +1028,30 @@ final class StageController {
     }
 
     var status: [String: Any] {
-        var out: [String: Any] = ["running": running, "suppressed": suppressed]
-        if let run = model.run, let t = elapsed {
+        var out: [String: Any] = ["running": running, "suppressed": suppressed, "tracking": !monitors.isEmpty]
+        if let run = model.run {
+            let w = run.wall()
+            let t = run.time(wall: w)
             out["scene"] = run.kind.rawValue
             out["t"] = (t * 100).rounded() / 100
-            out["phase"] = run.frame(at: t).phase
+            out["wall"] = (w * 100).rounded() / 100
+            out["phase"] = run.frame(wall: w).phase
+            out["clip"] = run.frame(wall: w).clip
             out["target"] = lastTarget
+            out["offset"] = [Int(run.offset.dx), Int(run.offset.dy)]
+            out["held"] = run.clock.frozen
+            out["pinned"] = run.clock.pinned
+            let spots = run.hotspots(wall: w)
+            out["hotspots"] = spots.count
+            out["spots"] = spots.map { s in "\(s.kind) \(Int(s.rect.minX)),\(Int(s.rect.minY)) \(Int(s.rect.width))x\(Int(s.rect.height))" }
+            out["rows"] = run.content.rows.count
+            out["answerLines"] = run.content.answer.count
+            out["caption"] = run.content.caption.count
+            out["controls"] = run.controls
+            if run.kind == .music {
+                out["music"] = run.marks.map { "\($0.state.rawValue)@\((($0.t * 10).rounded() / 10))" }
+                out["musicState"] = SceneTimeline.musicState(at: t, run.marks).state.rawValue
+            }
         }
         if let p = panel {
             out["frame"] = NSStringFromRect(p.frame)
@@ -641,11 +1067,41 @@ final class StageController {
 
     /// Кадры сцены в сетку: `~/.capri/tmp/scene-<name>.png` (весь кадр) и `scene-<name>-detail.png` (вокруг цели, 1×).
     @MainActor
-    func sheet(_ kind: SceneKind, variant: String?, name: String) -> [URL] {
-        guard var run = makeRun(kind, variant: variant, backdrop: true) else { return [] }
+    func sheet(_ kind: SceneKind, variant: String?, name: String, content: SceneContent? = nil) -> [URL] {
+        guard var run = makeRun(kind, variant: variant, backdrop: true, content: content) else { return [] }
         run.start = Date()
-        let d = SceneTimeline.duration(kind)
-        var times: [Double] = (0..<16).map { Double($0) * d / 16 }
+        // Ответ терминалу на листе — «доставлено».
+        if kind == .reply, run.content.delivered == nil { run.content.delivered = variant != "fail" }
+        if kind == .reply, variant == "fail" { run.failedAt = 2.0 }
+        if kind == .answer, variant == "sent" { run.burstAt = 4.0 }
+        if kind == .music {
+            // Лист: ищет → (играет, пауза, снова играет) / не нашла / открыла поиск.
+            if run.content.track == nil { run.content.track = "Test Artist — Test Track" }
+            if run.content.query == nil { run.content.query = "test track" }
+            run.content.trackPlaying = true
+            run.marks = [SceneMusicMark(t: 1.0, state: .searching)]
+            switch variant {
+            case "fail": run.marks.append(SceneMusicMark(t: 2.5, state: .failed))
+            case "search":
+                run.content.note = "открыла поиск в Spotify"
+                run.marks.append(SceneMusicMark(t: 2.5, state: .info))
+            default:
+                run.marks += [SceneMusicMark(t: 2.5, state: .playing), SceneMusicMark(t: 4.5, state: .paused),
+                              SceneMusicMark(t: 5.2, state: .playing)]
+            }
+        }
+        if variant == "controls", !kind.boxed {
+            // Наведение на глаза: ⏮ ⏯ ⏭ под ними.
+            if run.content.track == nil { run.content.track = "Test Artist — Test Track" }
+            run.content.trackPlaying = true
+            run.controls = true
+            run.hover = .button("toggle")
+        }
+        let d = SceneTimeline.duration(kind, run.options)
+        // Длинные сцены («думает» — минута): первые 10 с и уход.
+        let span = min(d, 10)
+        var times: [Double] = (0..<16).map { Double($0) * span / 16 }
+        if d > span { times += [d - 0.85, d - 0.6, d - 0.35, d - 0.1] }
         times += Self.keyTimes(kind)
         times = Array(Set(times.map { ($0 * 100).rounded() / 100 })).sorted()
         var frames: [(Double, CGImage)] = []
@@ -657,7 +1113,9 @@ final class StageController {
         }
         guard !frames.isEmpty else { return [] }
         // Деталь: вокруг цели/области и notch не трогаем.
-        let focus = (run.geometry.area ?? run.geometry.target).insetBy(dx: -70, dy: -70)
+        var focus = (run.geometry.area ?? run.geometry.target).insetBy(dx: -70, dy: -70)
+        // Подпись `reply` — слева от глаз.
+        if kind == .reply { focus = focus.union(focus.offsetBy(dx: -220, dy: 0)) }
         let crop = CGRect(x: focus.minX - run.origin.x, y: run.size.height - (focus.maxY - run.origin.y),
                           width: focus.width, height: focus.height).intersection(CGRect(origin: .zero, size: run.size)).integral
         let full = grid(frames.map { ($0.0, $0.1) }, scale: min(0.45, 640 / max(run.size.width, run.size.height)))
@@ -680,6 +1138,11 @@ final class StageController {
         case .window: [0.3, 0.45, 0.7, 0.85, 0.95, 1.5, 2.5, 7.1, 7.3, 7.5, 7.7]
         case .takeover: [0.6, 0.9, 1.3, 1.9, 2.3, 2.8, 3.4, 3.9, 4.1, 4.4]
         case .vibe: [0.3, 0.5, 1.0, 1.3, 2.0, 3.0, 6.6]
+        case .sessions: [0.3, 0.7, 0.9, 1.2, 1.5, 3.0, 7.3, 7.5, 7.7]
+        case .thinking: [0.7, 0.9, 1.2, 1.5, 2.6, 3.4]
+        case .answer: [0.7, 0.9, 1.2, 2.0, 4.2, 4.6]
+        case .reply: [0.15, 0.4, 0.7, 1.0, 1.2, 1.7, 2.2, 3.0, 3.5, 3.8]
+        case .music: [0.7, 0.9, 1.2, 2.6, 2.8, 3.1, 4.6, 4.8, 5.4, 6.2]
         }
     }
 

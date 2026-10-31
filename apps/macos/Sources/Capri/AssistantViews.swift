@@ -30,6 +30,12 @@ struct ChatMessageBody: View {
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let m = message.music {
+                // Музыка по просьбе: ищет → что заиграло / не нашла.
+                Text(m).font(.mono(size * 0.85, .semibold))
+                    .foregroundColor(m.hasPrefix("✗") ? Palette.crimson : m.hasPrefix("♪") ? Palette.acid : Palette.codex)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            }
             ForEach(message.proposals) { p in ProposalCard(codex: codex, message: message.id, proposal: p) }
         }
     }
@@ -67,7 +73,7 @@ struct AssistantView: View {
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 6) {
                         Text(">").font(.mono(13, .bold)).foregroundColor(Palette.codex)
-                        TextField(codex.chatBusy ? "Capri думает…" : "спроси Capri: что ждёт? что сделала web? ответь…",
+                        TextField(codex.chatBusy ? "Capri думает…" : "спроси Capri: что ждёт? ответь… включи …",
                                   text: $ui.assistantText)
                             .textFieldStyle(.plain).font(.system(size: 12.5))
                             .focused($focused)

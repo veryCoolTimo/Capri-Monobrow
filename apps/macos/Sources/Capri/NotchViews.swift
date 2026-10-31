@@ -23,10 +23,35 @@ final class NotchUI: ObservableObject {
     /// Что играет («Artist — Track») и играет ли сейчас; nil — ничего или неизвестно.
     @Published var music: String?
     @Published var musicPlaying = false
+    /// Строка трека видна сама: 4 с после старта или смены трека (`NowPlayingState.revealUntil`).
+    @Published var musicReveal = false
+    /// Курсор над глазами Capri или над полосой музыки в раскрытом notch — строка трека видна.
+    @Published var musicHover = false
+    /// Полоса музыки в раскрытом notch, в координатах его SwiftUI-слоя (сверху вниз). Не публикуется: нужна
+    /// только контроллеру для наведения.
+    var musicStripRect: CGRect?
+    /// Кнопки ⏮ ⏯ ⏭ в peek, в координатах его слоя: клик по peek раскрывает notch — по кнопкам ловим сами.
+    var peekMusicRects: [String: CGRect] = [:]
     /// Notch раскрыт (кивает, пока раскрыт и играет музыка).
     @Published var expandedOpen = false
     /// «Спрятать персонажа на час» — в notch не кивает.
     @Published var characterHidden = false
+}
+
+/// Включён ли слой notch. Скрытый слой (свёрнутый notch) снимает содержимое целиком — вместе с подписками
+/// на `store`/`clock`/`codex`, иначе спрятанный вид пересчитывал бы `body` на каждое изменение сессий.
+final class HostGate: ObservableObject {
+    @Published var live = false
+}
+
+/// Содержимое слоя notch, пока слой включён (`HostGate`); выключен — пусто, без подписок.
+struct Gated<Content: View>: View {
+    @ObservedObject var gate: HostGate
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        if gate.live { content() } else { Color.clear }
+    }
 }
 
 /// Действия notch → контроллер.
@@ -42,6 +67,8 @@ struct NotchActions {
     var window: () -> Void
     /// Основное окно на разговоре с Capri.
     var conversation: () -> Void
+    /// ⏮ ⏯ ⏭ у строки трека.
+    var music: (MusicCommand) -> Void = { _ in }
 }
 
 func agoText(_ seconds: Double) -> String {
@@ -103,21 +130,79 @@ func hudButton(_ title: String, accent: Color = Palette.crimson, enabled: Bool =
     .opacity(enabled ? 1 : 0.4)
 }
 
-/// «♪ Artist — Track» в раскрытом notch (только пока играет или 5 с после паузы).
+/// «♪ Artist — Track» в раскрытом notch (только пока играет или 5 с после паузы). Текст виден 4 с после смены
+/// трека и пока курсор над глазами или над этой полосой (`revealed`); иначе — только мини-эквалайзер (цель
+/// наведения). Место строка занимает всегда — высота капли не прыгает.
 struct MusicLine: View {
     var line: String
     var playing: Bool
-    /// Анимировать эквалайзер (только пока notch раскрыт — свёрнутый хост не удаляется, лишь прячется).
+    /// Анимировать эквалайзер (только пока notch раскрыт).
     var animating: Bool
+    var revealed = true
+    /// ⏮ ⏯ ⏭ — видны вместе со строкой (4 с после смены трека и при наведении).
+    var onCommand: ((MusicCommand) -> Void)?
     var body: some View {
         HStack(spacing: 6) {
             EqualizerBars(color: playing ? Palette.crimson : Palette.dim, animating: playing && animating, height: 8)
             Text("♪ " + line).font(.mono(9.5, .semibold)).foregroundColor(playing ? Palette.text.opacity(0.85) : Palette.dim)
                 .lineLimit(1).truncationMode(.tail)
+                .opacity(revealed ? 1 : 0)
+                .animation(.easeInOut(duration: 0.2), value: revealed)
             Spacer(minLength: 0)
+            if let onCommand {
+                MusicButtons(playing: playing, action: onCommand)
+                    .opacity(revealed ? 1 : 0)
+                    .allowsHitTesting(revealed)
+                    .animation(.easeInOut(duration: 0.2), value: revealed)
+            }
         }
         .help("Что играет в Spotify или Музыке")
     }
+}
+
+/// ⏮ ⏯ ⏭ — Capri сама управляет плеером (AppleScript, только по этому клику).
+struct MusicButtons: View {
+    var playing: Bool
+    /// nil — только рисунок (peek: клики ловит контроллер по рамкам `PeekMusicKey`).
+    var action: ((MusicCommand) -> Void)?
+    var size: CGFloat = 9
+
+    var body: some View {
+        HStack(spacing: 4) {
+            button("prev", "backward.end.fill", .previous)
+            button("toggle", playing ? "pause.fill" : "play.fill", .toggle)
+            button("next", "forward.end.fill", .next)
+        }
+    }
+
+    @ViewBuilder
+    private func button(_ id: String, _ symbol: String, _ cmd: MusicCommand) -> some View {
+        let label = Image(systemName: symbol).font(.system(size: size, weight: .bold))
+            .foregroundColor(id == "toggle" ? Palette.text : Palette.text.opacity(0.8))
+            .frame(width: size * 2.4, height: size * 1.8)
+            .hud(stroke: CapriFX.hackPink.opacity(id == "toggle" ? 0.8 : 0.45), fill: CapriFX.hackPink.opacity(id == "toggle" ? 0.14 : 0.04), cut: 4)
+            .contentShape(Rectangle())
+        if let action {
+            Button { action(cmd) } label: { label }.buttonStyle(.plain)
+                .help(id == "toggle" ? "Пауза / играть" : id == "next" ? "Следующий трек" : "Предыдущий трек")
+        } else {
+            label.background(GeometryReader { g in
+                Color.clear.preference(key: PeekMusicKey.self, value: [id: g.frame(in: .named(PeekLineView.space))])
+            })
+        }
+    }
+}
+
+/// Рамки кнопок музыки в peek (координаты слоя peek).
+struct PeekMusicKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) { value.merge(nextValue()) { $1 } }
+}
+
+/// Прямоугольник полосы музыки в координатах слоя (для наведения).
+struct MusicStripKey: PreferenceKey {
+    static var defaultValue: CGRect? = nil
+    static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) { value = nextValue() ?? value }
 }
 
 // MARK: - Свёрнутый вид
@@ -180,6 +265,7 @@ struct SessionBar: View {
 struct PeekLineView: View {
     @ObservedObject var store: SessionStore
     @ObservedObject var ui: NotchUI
+    static let space = "notchPeek"
     var body: some View {
         let waiting = store.waiting
         let focus = ui.alertKey.flatMap { k in waiting.first { $0.key == k } } ?? waiting.first
@@ -191,6 +277,16 @@ struct PeekLineView: View {
                 Text(store.summary(s) ?? s.headline).font(.system(size: 12, weight: .medium)).foregroundColor(Palette.text).lineLimit(1)
                 Spacer(minLength: 0)
                 if waiting.count > 1 { Caps("+\(waiting.count - 1)", size: 9, color: Palette.dim) }
+            } else if let line = ui.music {
+                // Никто не ждёт — что играет (наведение на глаза).
+                EqualizerBars(color: ui.musicPlaying ? Palette.crimson : Palette.dim, animating: false, height: 8)
+                Text("♪ " + line).font(.mono(10, .semibold))
+                    .foregroundColor(ui.musicPlaying ? Palette.text.opacity(0.85) : Palette.dim)
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 4)
+                MusicButtons(playing: ui.musicPlaying, action: nil, size: 8.5)
+                Caps("работают · \(store.runningCount)", size: 9, color: store.runningCount > 0 ? Palette.crimson : Palette.dim)
+                    .fixedSize()
             } else {
                 Caps("ждут меня · 0", size: 9, color: Palette.dim)
                 Spacer(minLength: 0)
@@ -200,6 +296,9 @@ struct PeekLineView: View {
         }
         .padding(.horizontal, 18)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .coordinateSpace(name: PeekLineView.space)
+        .onPreferenceChange(PeekMusicKey.self) { ui.peekMusicRects = $0 }
+        .onDisappear { ui.peekMusicRects = [:] }
     }
 }
 
@@ -213,6 +312,8 @@ struct ExpandedView: View {
     var actions: NotchActions
 
     static let maxRows = 5
+    /// Координаты всего слоя (как у NSHostingView, сверху вниз).
+    static let space = "notchExpanded"
 
     var body: some View {
         let list = store.overview
@@ -220,7 +321,11 @@ struct ExpandedView: View {
         VStack(alignment: .leading, spacing: 6) {
             header(list)
             if let line = ui.music {
-                MusicLine(line: line, playing: ui.musicPlaying, animating: ui.expandedOpen)
+                MusicLine(line: line, playing: ui.musicPlaying, animating: ui.expandedOpen,
+                          revealed: ui.musicReveal || ui.musicHover, onCommand: actions.music)
+                    .background(GeometryReader { g in
+                        Color.clear.preference(key: MusicStripKey.self, value: g.frame(in: .named(ExpandedView.space)))
+                    })
             }
             if rows.isEmpty {
                 Text("Сессий нет").font(.system(size: 12, weight: .medium)).foregroundColor(Palette.dim)
@@ -242,7 +347,10 @@ struct ExpandedView: View {
         .padding(.horizontal, 14).padding(.top, 4).padding(.bottom, 10)
         .fixedSize(horizontal: false, vertical: true)
         .reportHeight { ui.expandedHeight = $0 }
+        .onPreferenceChange(MusicStripKey.self) { ui.musicStripRect = $0 }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .coordinateSpace(name: ExpandedView.space)
+        .onDisappear { ui.musicStripRect = nil }
     }
 
     private func header(_ list: [Session]) -> some View {

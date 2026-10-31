@@ -411,7 +411,7 @@ struct ScreenPane: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Caps("экран", size: 8, color: Palette.text, weight: .bold)
-                if let snap { ScreenAge(clock: clock, ts: snap.ts) }
+                if snap != nil { ScreenAge(clock: clock, details: details, session: s) }
                 Spacer()
                 if snap != nil { Caps("\(lines.count) строк", size: 7.5) }
             }
@@ -456,8 +456,11 @@ struct HistoryPane: View {
 /// «обновлён N с назад» — подписан только на часы.
 struct ScreenAge: View {
     @ObservedObject var clock: Clock
-    var ts: Double
+    /// Время снимка читаем на каждом тике: повтор того же экрана `details` не публикует.
+    var details: DetailStore
+    var session: Session
     var body: some View {
+        let ts = details.screenTime(session) ?? details.screen(session)?.ts ?? clock.now
         let age = max(0, Int(clock.now - ts))
         Caps(age < 3 ? "живой" : "снят \(agoText(Double(age))) назад", size: 7.5, color: age < 15 ? Palette.dim : Palette.crimson)
     }

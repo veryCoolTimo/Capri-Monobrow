@@ -34,6 +34,9 @@ extension NotchController {
         let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
         let arg = parts.count > 1 ? parts[1] : ""
         NSLog("[Capri] control: %@", parts.first ?? "")
+        // Команды из файла — не действие человека: настоящий плеер (`--real-music`) они не трогают.
+        MusicController.inControlCommand = true
+        defer { MusicController.inControlCommand = false }
         switch parts.first {
         case "expand": go(.expanded, reason: "control")
         case "assistant": go(.assistant, reason: "control")
@@ -49,6 +52,10 @@ extension NotchController {
         case "text": if let k = ui.selected { ui.reply = arg; send(k, .text(arg)) }
         case "open": if let k = ui.selected { open(k) }
         case "snapshot": snapshot()
+        // Наведение на глаза/полосу музыки без мыши: `musichover on|off`.
+        case "musichover": if state == .expanded { ui.musicHover = arg != "off" }
+        // Клик по ⏮ ⏯ ⏭ peek/notch без мыши: `musicbutton prev|toggle|next` (тот же путь, что клик).
+        case "musicbutton": if let cmd = MusicCommand(button: arg) { onMusic?(cmd, state == .peek ? "peek" : "notch") }
         case "dump": dumpState()
         default: if let cmd = parts.first { onDebug?(cmd, arg) }
         }
@@ -70,6 +77,14 @@ extension NotchController {
                                   "frontmostPid": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0,
                                   "frontmostIsCapri": NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier,
                                   "notchKey": container.window?.isKeyWindow ?? false]
+        if !peekMusicScreenRects.isEmpty {
+            out["peekMusic"] = peekMusicScreenRects.mapValues { r in [r.minX, r.minY, r.width, r.height].map { Int($0) } }
+        }
+        if let r = musicStripScreenRect, let e = eyesRect {
+            // Полоса музыки и глаза (экран) — проверка наведения без мыши.
+            out["musicStrip"] = [r.minX, r.minY, r.width, r.height].map { Int($0) }
+            out["eyes"] = [e.minX, e.minY, e.width, e.height].map { Int($0) }
+        }
         for (k, v) in dumpExtra?() ?? [:] { out[k] = v }
         if let d = try? JSONSerialization.data(withJSONObject: out, options: [.prettyPrinted, .sortedKeys]) {
             try? d.write(to: CapriPaths.tmp.appendingPathComponent("state.json"))

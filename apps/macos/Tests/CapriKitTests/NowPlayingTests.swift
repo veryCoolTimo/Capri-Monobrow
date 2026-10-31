@@ -69,4 +69,28 @@ final class NowPlayingTests: XCTestCase {
         XCTAssertEqual(s.apply(.stopped, now: 701), .none)
         XCTAssertEqual(s.apply(.playing(a), now: 700 + 601), .started(afterSilence: true))
     }
+
+    func testRevealFourSecondsAfterStartOrChange() {
+        let a = Track(source: .spotify, id: "spotify:track:a", name: "A", artist: "X")
+        let b = Track(source: .spotify, id: "spotify:track:b", name: "B", artist: "X")
+        var s = NowPlayingState(now: 0)
+        XCTAssertFalse(s.revealed(now: 1))
+        _ = s.apply(.playing(a), now: 100)
+        XCTAssertEqual(s.revealUntil, 100 + NowPlayingState.revealSeconds)
+        XCTAssertTrue(s.revealed(now: 103.9))
+        XCTAssertFalse(s.revealed(now: 104))
+        // Тот же трек ещё раз (позиция, громкость) — не смена, строка не всплывает.
+        _ = s.apply(.playing(a), now: 110)
+        XCTAssertFalse(s.revealed(now: 110))
+        _ = s.apply(.playing(b), now: 120)
+        XCTAssertTrue(s.revealed(now: 121))
+        // Пауза не продлевает показ, продолжение после паузы — показывает снова.
+        _ = s.apply(.paused(b), now: 130)
+        XCTAssertFalse(s.revealed(now: 130))
+        _ = s.apply(.playing(b), now: 140)
+        XCTAssertTrue(s.revealed(now: 141))
+        _ = s.apply(.stopped, now: 142)
+        XCTAssertNil(s.revealUntil)
+        XCTAssertFalse(s.revealed(now: 142))
+    }
 }

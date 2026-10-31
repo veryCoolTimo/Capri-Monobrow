@@ -14,7 +14,10 @@ final class DetailStore: ObservableObject {
         var raw: [String]
         var ts: Double
     }
+    /// Публикуется только при смене текста экрана: повтор того же снимка окно не перерисовывает.
     @Published private(set) var screens: [String: Screen] = [:]
+    /// Время последнего снимка панели (в том числе повтора) — не публикуется, его читает `ScreenAge` по часам.
+    private var seenAt: [String: Double] = [:]
     @Published private(set) var history = SessionHistory()
     /// Разобранные строки последнего показанного снимка (не публикуется: кэш для отрисовки).
     private var parsed: [String: (raw: [String], lines: [ScreenLine])] = [:]
@@ -27,6 +30,11 @@ final class DetailStore: ObservableObject {
 
     func rawScreen(_ s: Session) -> [String]? { screen(s)?.raw }
 
+    /// Когда экран сессии снимали последний раз (повтор неизменного экрана тоже считается).
+    func screenTime(_ s: Session) -> Double? {
+        s.tmux.flatMap { seenAt[Self.screenKey(host: s.key.host, pane: $0.pane)] }
+    }
+
     func lines(_ s: Session) -> [ScreenLine]? {
         guard let pane = s.tmux?.pane else { return nil }
         let key = Self.screenKey(host: s.key.host, pane: pane)
@@ -38,7 +46,15 @@ final class DetailStore: ObservableObject {
     }
 
     func setScreen(host: String, pane: String, lines: [String], ts: Double) {
-        screens[Self.screenKey(host: host, pane: pane)] = Screen(raw: lines, ts: ts)
+        let key = Self.screenKey(host: host, pane: pane)
+        seenAt[key] = ts
+        if screens[key]?.raw != lines { screens[key] = Screen(raw: lines, ts: ts) }
+    }
+
+    /// Тот же экран снят ещё раз.
+    func screenSeen(host: String, pane: String, ts: Double) {
+        let key = Self.screenKey(host: host, pane: pane)
+        if screens[key] != nil { seenAt[key] = ts }
     }
 
     func record(host: String, event: CapriEvent) { history.record(host: host, event: event) }
@@ -50,7 +66,7 @@ final class DetailStore: ObservableObject {
     func prune(sessions: [SessionKey: Session], panes: [String: [PaneInfo]]) {
         let alive = Set(panes.flatMap { host, list in list.map { Self.screenKey(host: host, pane: $0.pane) } })
         let dead = screens.keys.filter { !alive.contains($0) }
-        if !dead.isEmpty { for k in dead { screens[k] = nil; parsed[k] = nil } }
+        if !dead.isEmpty { for k in dead { screens[k] = nil; parsed[k] = nil; seenAt[k] = nil } }
         let keys = Set(sessions.keys)
         if history.entries.keys.contains(where: { !keys.contains($0) }) { history.keep(only: keys) }
     }
@@ -103,6 +119,8 @@ final class SessionStore: ObservableObject {
 
     var onNeedsInput: ((Session) -> Void)?
     var onDelivered: ((SessionKey) -> Void)?
+    /// Хост принял ответ, отправленный через Capri (карточка помощника, notch, основное окно) — сцена `reply`.
+    var onSent: ((SessionKey, ReplyAction) -> Void)?
     /// Человек сам ответил сессии (новый промпт в ней или ответ через Capri).
     var onUserResponded: ((SessionKey) -> Void)?
 
@@ -143,7 +161,7 @@ final class SessionStore: ObservableObject {
                 deliveries.clear(k)
             }
             for k in deliveries.items.keys where removed.contains(k.host) { deliveries.clear(k) }
-            for h in removed { state.hosts[h] = nil }
+            for h in removed { state.hosts[h] = nil; state.forget(host: h) }
             details.prune(sessions: state.sessions, panes: state.hosts.compactMapValues(\.panes))
             publishSessions()
         }
@@ -179,6 +197,8 @@ final class SessionStore: ObservableObject {
             }
         case let .screen(host, pane, _, lines, ts):
             details.setScreen(host: host, pane: pane, lines: lines, ts: ts)
+        case let .screenSame(host, pane, ts):
+            details.screenSeen(host: host, pane: pane, ts: ts)
         case let .event(host, event, replay):
             details.record(host: host, event: event)
             if !replay, event.event == "UserPromptSubmit", let id = event.sessionId {
@@ -249,6 +269,7 @@ final class SessionStore: ObservableObject {
             self.details.note(key, kind: .reply, text: Self.describe(action, s))
             self.confirmDeliveries()
             completion?(true)
+            self.onSent?(key, action)
         }
     }
 

@@ -57,10 +57,14 @@ final class NotchPanel: NSPanel {
 final class FadingHost<Content: View>: NSHostingView<Content> {
     var restingOrigin: CGPoint = .zero
     var shownState = false
+    /// Слой с `Gated`-содержимым: включается до показа, выключается, когда погас (скрытый вид не живёт).
+    var gate: HostGate?
 
     func set(shown: Bool, delay: TimeInterval, duration: TimeInterval, lift: CGFloat) {
         guard shown != shownState else { return }
         shownState = shown
+        // Включаем сразу, а не после задержки: первый рендер успевает до начала проявления.
+        if shown, gate?.live == false { gate?.live = true }
         let work = { [weak self] in
             guard let self, self.shownState == shown else { return }
             if shown { self.isHidden = false }
@@ -76,6 +80,7 @@ final class FadingHost<Content: View>: NSHostingView<Content> {
                 // он не должен просвечивать и ловить клики.
                 guard let self, !self.shownState else { return }
                 self.isHidden = true
+                if self.gate?.live == true { self.gate?.live = false }
             })
         }
         if delay > 0 { DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work) } else { work() }
@@ -83,6 +88,7 @@ final class FadingHost<Content: View>: NSHostingView<Content> {
 
     func reset(shown: Bool, lift: CGFloat) {
         shownState = shown
+        if let gate, gate.live != shown { gate.live = shown }
         isHidden = !shown
         alphaValue = shown ? 1 : hiddenContentAlpha
         setFrameOrigin(shown ? restingOrigin : CGPoint(x: restingOrigin.x, y: restingOrigin.y + lift))
@@ -105,6 +111,8 @@ final class NotchController: NSObject {
     var onStateChange: ((NotchState) -> Void)?
     /// Дополнительные поля `dump` (персонаж, музыка).
     var dumpExtra: (() -> [String: Any])?
+    /// ⏮ ⏯ ⏭ в раскрытом notch и peek → `CharacterCenter` → `MusicController` (второе — где нажали).
+    var onMusic: ((MusicCommand, String) -> Void)?
     /// Показать крылья свёрнутого notch, даже если сессий нет (кивание под музыку).
     var forceWings = false { didSet { if forceWings != oldValue { storeChanged() } } }
 
@@ -116,9 +124,9 @@ final class NotchController: NSObject {
     private let glitchSlice = CALayer()
     private var contentView: NSView!
     private var topRow: FadingHost<TopRowView>!
-    private var peekLine: FadingHost<PeekLineView>!
-    private var expandedHost: FadingHost<ExpandedView>!
-    private var assistantHost: FadingHost<AssistantView>!
+    private var peekLine: FadingHost<Gated<PeekLineView>>!
+    private var expandedHost: FadingHost<Gated<ExpandedView>>!
+    private var assistantHost: FadingHost<Gated<AssistantView>>!
     private(set) var screen: NSScreen!
     private var notch = NotchScreen(frame: .zero, visibleFrame: .zero, safeAreaTop: 0, auxiliaryTopLeft: nil, auxiliaryTopRight: nil)
     private var host: CGRect = .zero
@@ -197,11 +205,20 @@ final class NotchController: NSObject {
             conversation: { [weak self] in
                 self?.go(.collapsed, reason: "conversation")
                 self?.onConversation?()
-            })
+            },
+            music: { [weak self] cmd in self?.onMusic?(cmd, "notch") })
         topRow = FadingHost(rootView: TopRowView(store: store, ui: ui, codex: codex, notchWidth: 0))
-        peekLine = FadingHost(rootView: PeekLineView(store: store, ui: ui))
-        expandedHost = FadingHost(rootView: ExpandedView(store: store, ui: ui, actions: actions))
-        assistantHost = FadingHost(rootView: AssistantView(codex: codex, store: store, ui: ui, actions: actions))
+        // Скрытые слои снимают содержимое (`Gated`): свёрнутый notch не пересчитывает их на каждое изменение.
+        let (st, nui, cx) = (store, ui, codex)
+        let gates = (peek: HostGate(), expanded: HostGate(), assistant: HostGate())
+        peekLine = FadingHost(rootView: Gated(gate: gates.peek) { PeekLineView(store: st, ui: nui) })
+        expandedHost = FadingHost(rootView: Gated(gate: gates.expanded) { ExpandedView(store: st, ui: nui, actions: actions) })
+        assistantHost = FadingHost(rootView: Gated(gate: gates.assistant) {
+            AssistantView(codex: cx, store: st, ui: nui, actions: actions)
+        })
+        peekLine.gate = gates.peek
+        expandedHost.gate = gates.expanded
+        assistantHost.gate = gates.assistant
         topRow.sizingOptions = []
         peekLine.sizingOptions = []
         expandedHost.sizingOptions = []
@@ -365,6 +382,7 @@ final class NotchController: NSObject {
         let growing = NotchState.allCases.firstIndex(of: target)! > NotchState.allCases.firstIndex(of: from)!
         state = target
         ui.expandedOpen = target == .expanded
+        if target != .expanded, ui.musicHover { ui.musicHover = false }
         onStateChange?(target)
         if suppressed {
             if target != .collapsed { setPanelVisible(true) }   // кликабельность — updateMouseThrough() в конце go()
@@ -588,9 +606,14 @@ final class NotchController: NSObject {
         global(state).insetBy(dx: -2, dy: -2).contains(p)
     }
 
+    /// Только при смене: запись свойства на каждое движение мыши (глобальный монитор) — лишний вызов WindowServer.
+    private func setIgnoresMouse(_ value: Bool) {
+        if panel.ignoresMouseEvents != value { panel.ignoresMouseEvents = value }
+    }
+
     private func updateMouseThrough() {
-        if suppressed && state == .collapsed { panel.ignoresMouseEvents = true; return }
-        panel.ignoresMouseEvents = !shapeContains(NSEvent.mouseLocation)
+        if suppressed && state == .collapsed { setIgnoresMouse(true); return }
+        setIgnoresMouse(!shapeContains(NSEvent.mouseLocation))
     }
 
     private func mouseMoved() {
@@ -600,8 +623,11 @@ final class NotchController: NSObject {
             collapseWork?.cancel()
             return
         }
-        let inside = shapeContains(NSEvent.mouseLocation)
-        panel.ignoresMouseEvents = !inside
+        let p = NSEvent.mouseLocation
+        let inside = shapeContains(p)
+        setIgnoresMouse(!inside)
+        let overMusic = state == .expanded && inside && (onCapriEyes(p) || musicStripContains(p))
+        if ui.musicHover != overMusic { ui.musicHover = overMusic }
         guard inside != hovering else { return }
         hovering = inside
         if inside {
@@ -615,6 +641,27 @@ final class NotchController: NSObject {
             collapseWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
         }
+    }
+
+    /// Курсор над полосой музыки раскрытого notch (её рамку сообщает `ExpandedView`).
+    private func musicStripContains(_ p: NSPoint) -> Bool {
+        musicStripScreenRect?.insetBy(dx: -4, dy: -3).contains(p) ?? false
+    }
+
+    /// Полоса музыки раскрытого notch в координатах экрана (nil — её нет).
+    var musicStripScreenRect: CGRect? {
+        guard let r = ui.musicStripRect, ui.music != nil, expandedHost.window != nil else { return nil }
+        return panel.convertToScreen(expandedHost.convert(r, to: nil))
+    }
+
+    /// Кнопки музыки peek в координатах экрана.
+    var peekMusicScreenRects: [String: CGRect] {
+        guard state == .peek, !ui.peekMusicRects.isEmpty, peekLine.window != nil else { return [:] }
+        return ui.peekMusicRects.mapValues { panel.convertToScreen(peekLine.convert($0, to: nil)) }
+    }
+
+    private func peekMusicButton(at p: NSPoint) -> String? {
+        peekMusicScreenRects.first { $0.value.insetBy(dx: -2, dy: -2).contains(p) }?.key
     }
 
     private func installMonitors() {
@@ -638,6 +685,11 @@ final class NotchController: NSObject {
             }
             // В раскрытой панели и помощнике клик идёт в кнопки и поле ввода; в свёрнутой/peek — раскрывает
             // (по глазам Capri слева от выреза — помощник).
+            if self.state == .peek, let id = self.peekMusicButton(at: NSEvent.mouseLocation), let cmd = MusicCommand(button: id) {
+                // ⏮ ⏯ ⏭ в peek: клик по кнопке — музыка, не раскрытие.
+                self.onMusic?(cmd, "peek")
+                return nil
+            }
             if self.state == .collapsed || self.state == .peek {
                 if self.onCapriEyes(NSEvent.mouseLocation) { self.go(.assistant, reason: "eyes") } else { self.clickNotch() }
                 return nil

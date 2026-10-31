@@ -8,7 +8,9 @@ import CapriKit
 /// Аргументы: `--hosts timoserver,quiz` — ssh-хосты (по умолчанию из настроек `capri.hosts`);
 /// `--no-local`; `--only-sessions PREFIX` — только tmux-сессии с префиксом (проверки);
 /// `--debug-control` — команды из `~/.capri/tmp/control` (сквозные проверки без мыши);
-/// `--background` — запуск без окна (скрипты установки, перезапуск из настроек).
+/// `--background` — запуск без окна (скрипты установки, перезапуск из настроек);
+/// `--real-music` — вместе с `--debug-control` всё же управлять настоящим плеером (без него — фейковый бэкенд).
+/// Команды из файла `control` настоящий плеер и тогда не трогают — только клики и просьбы человека.
 ///
 /// Окно открывается только явным действием человека: «подробнее» в notch, клик по уведомлению, Dock,
 /// Launchpad/Spotlight, пункт меню. События сессий, перезапуск и автозапуск окно не показывают.
@@ -24,6 +26,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settings = Settings()
     private var cancellables: Set<AnyCancellable> = []
     private var hotKey: HotKey?
+    private let spotify = SpotifySearch()
+    private var music: MusicController!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMainMenu()
@@ -55,13 +59,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         attention.onPauseChange = { [weak self] in self?.updateStatusIcon() }
         settings.onFullscreenChange = { [weak self] in self?.attention.checkFullscreen() }
         settings.onHostsChange = { [weak self] hosts in self?.store.setRemoteHosts(hosts) }
-        character = CharacterCenter(store: store, notch: notch, settings: settings, attention: attention)
+        // Плеером управляем только по действию человека; в отладке (агенты, проверки) — фейк, если не попросили иначе.
+        let args = CommandLine.arguments
+        let fakeMusic = args.contains("--debug-control") && !args.contains("--real-music")
+        music = MusicController(backend: fakeMusic ? FakeMusicBackend() : AppleScriptBackend(), spotify: spotify)
+        character = CharacterCenter(store: store, codex: codex, notch: notch, settings: settings, attention: attention, music: music)
         settings.onCharacterChange = { [weak self] in self?.character.settingsChanged() }
         settings.onMusicChange = { [weak self] in self?.character.musicSettingChanged() }
         notch.dumpExtra = { [weak self] in self?.character.dump ?? [:] }
         notch.start()
         attention.start()
         character.debugLog = CommandLine.arguments.contains("--debug-control")
+        if character.debugLog { codex.log = { NotchController.debugWrite("codex \($0)") } }
         character.start()
         LoginItem.setUpOnFirstRun()
         store.start()
@@ -78,7 +87,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] sessions in
                 let waiting = sessions.filter { $0.status == .needsInput }.count
-                self?.statusItem.button?.title = waiting > 0 ? " \(waiting)" : ""
+                let title = waiting > 0 ? " \(waiting)" : ""
+                // Только при смене: даже то же значение перерисовывает значок и обновляет сцену строки меню.
+                if let button = self?.statusItem.button, button.title != title { button.title = title }
             }
             .store(in: &cancellables)
 
@@ -228,6 +239,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sub.addItem(toggle)
         characterItem.submenu = sub
         menu.addItem(characterItem)
+        if settings.music, let line = notch.ui.music {
+            // Музыка: Capri сама переключает (AppleScript — только по этому клику).
+            let musicItem = NSMenuItem(title: "♪ " + String(line.prefix(40)), action: nil, keyEquivalent: "")
+            let ms = NSMenu(title: "Музыка")
+            for (title, id) in [(notch.ui.musicPlaying ? "Пауза" : "Играть", "toggle"), ("Следующий трек", "next"), ("Предыдущий трек", "prev")] {
+                let it = NSMenuItem(title: title, action: #selector(musicMenu(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = id
+                ms.addItem(it)
+            }
+            musicItem.submenu = ms
+            menu.addItem(musicItem)
+        }
         if settings.characterHidden, let until = settings.characterHiddenUntil {
             item("Вернуть персонажа (спрятан до \(Self.clock.string(from: Date(timeIntervalSince1970: until))))", #selector(unhideCharacter))
         } else {
@@ -247,6 +271,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let raw = sender.representedObject as? String, let kind = SceneKind(rawValue: raw) else { return }
         // Меню закрывается — сцена после этого, чтобы глаза ушли из notch уже на чистый экран.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.character.demo(kind) }
+    }
+    @objc private func musicMenu(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, let cmd = MusicCommand(button: id) else { return }
+        character.musicButton(cmd, from: "menu")
     }
     @objc private func hideCharacter() { character.hide(hours: 1) }
     @objc private func unhideCharacter() { character.unhide() }
@@ -289,7 +317,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             w.isReleasedWhenClosed = false
             w.isRestorable = false
             w.collectionBehavior = [.managed, .participatesInCycle, .fullScreenNone]
-            let host = NSHostingView(rootView: SettingsView(settings: settings, hosts: store.hostList))
+            let host = NSHostingView(rootView: SettingsView(settings: settings, hosts: store.hostList, spotify: spotify))
             w.contentView = host
             w.setContentSize(NSSize(width: 480, height: 600))
             w.center()
@@ -372,7 +400,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window?.close()
         case "window-snapshot":
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.snapshotWindow() }
-        case "scene", "music", "director":
+        case "scene", "music", "director", "stage", "locate":
             character.debugCommand(cmd, arg)
         default:
             break

@@ -117,12 +117,16 @@ public struct NowPlayingState: Equatable {
     public static let longSilence = 10.0 * 60
     /// После паузы строка ♪ ещё видна столько секунд.
     public static let pauseGrace = 5.0
+    /// Строка трека в раскрытом notch видна столько секунд после старта или смены трека (потом — по наведению).
+    public static let revealSeconds = 4.0
 
     public private(set) var track: Track?
     public private(set) var playing = false
     /// С какого момента тишина (nil — играет).
     public private(set) var silentSince: Double?
     public private(set) var changedAt: Double?
+    /// До какого момента строку трека показывать без наведения (старт или смена трека); nil — не показывать.
+    public private(set) var revealUntil: Double?
 
     /// `now` — запуск Capri: до первого события считаем, что тишина с запуска.
     public init(now: Double) { silentSince = now }
@@ -135,9 +139,12 @@ public struct NowPlayingState: Equatable {
             if !wasPlaying {
                 let silence = silentSince.map { now - $0 } ?? .infinity
                 silentSince = nil
+                revealUntil = now + Self.revealSeconds
                 return .started(afterSilence: silence >= Self.longSilence)
             }
-            return old.map { $0.same(t) } == true ? .none : .changed
+            if old.map({ $0.same(t) }) == true { return .none }
+            revealUntil = now + Self.revealSeconds
+            return .changed
         case .paused(let t):
             track = t
             guard playing else { return .none }
@@ -146,9 +153,15 @@ public struct NowPlayingState: Equatable {
         case .stopped:
             let was = playing || track != nil
             if playing { silentSince = now }
-            playing = false; track = nil; changedAt = now
+            playing = false; track = nil; changedAt = now; revealUntil = nil
             return was ? .stopped : .none
         }
+    }
+
+    /// Строку трека показывать сама по себе (без наведения): прошло меньше 4 с после старта или смены трека.
+    public func revealed(now: Double) -> Bool {
+        guard let revealUntil, track != nil else { return false }
+        return now < revealUntil
     }
 
     /// Трек для строки ♪: играет или на паузе меньше 5 с.

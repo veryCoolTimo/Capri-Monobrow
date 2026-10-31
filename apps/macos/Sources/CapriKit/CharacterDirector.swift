@@ -14,6 +14,27 @@ public struct CharacterDirector: Equatable {
         case trackChanged
     }
 
+    /// Действие человека, на которое Capri отвечает сценой на столе (мимо лимитов: человек сам это сделал).
+    public enum ActionEvent: String, CaseIterable, Codable {
+        /// Ответил сессии через Capri — телепорт к терминалу.
+        case replySent
+        /// Спросил помощника и свернул notch — окно «думает».
+        case askedAssistant
+        /// Ответ помощника пришёл, а notch свёрнут — окно ответа.
+        case answerReady
+        /// «Включи …» помощнику или ⏮ ⏯ ⏭ по глазам на столе — окно музыки.
+        case musicRequested
+
+        public var scene: SceneKind {
+            switch self {
+            case .replySent: .reply
+            case .askedAssistant: .thinking
+            case .answerReady: .answer
+            case .musicRequested: .music
+            }
+        }
+    }
+
     public enum Rate: String, CaseIterable, Codable {
         case rare, sometimes
 
@@ -67,15 +88,21 @@ public struct CharacterDirector: Equatable {
         public var idleSec: Double
         public var lowPower: Bool
         public var reduceMotion: Bool
+        /// «Capri отвечает на мои действия на столе» (`capri.characterOnAction`).
+        public var onAction: Bool
+        /// Кто-то ждёт ответа или работает — фоном окно сессий вместо окна статуса.
+        public var sessionsActive: Bool
 
         public init(now: Double, enabled: Bool = true, hiddenUntil: Double? = nil, sessionEvents: Bool = true,
                     takeover: Bool = false, music: Bool = true, rate: Rate = .sometimes, paused: Bool = false,
                     fullscreen: Bool = false, displaysAsleep: Bool = false, notchOpen: Bool = false,
-                    sceneRunning: Bool = false, idleSec: Double = 10, lowPower: Bool = false, reduceMotion: Bool = false) {
+                    sceneRunning: Bool = false, idleSec: Double = 10, lowPower: Bool = false, reduceMotion: Bool = false,
+                    onAction: Bool = true, sessionsActive: Bool = false) {
             self.now = now; self.enabled = enabled; self.hiddenUntil = hiddenUntil; self.sessionEvents = sessionEvents
             self.takeover = takeover; self.music = music; self.rate = rate; self.paused = paused
             self.fullscreen = fullscreen; self.displaysAsleep = displaysAsleep; self.notchOpen = notchOpen
             self.sceneRunning = sceneRunning; self.idleSec = idleSec; self.lowPower = lowPower; self.reduceMotion = reduceMotion
+            self.onAction = onAction; self.sessionsActive = sessionsActive
         }
     }
 
@@ -197,13 +224,30 @@ public struct CharacterDirector: Equatable {
         }
     }
 
-    /// Фон: захват (если включён и прошло ≥ 2 ч) с вероятностью 1/4, иначе телепорт 70% / окно 30%.
+    /// Фон: захват (если включён и прошло ≥ 2 ч) с вероятностью 1/4, иначе телепорт 70% / окно 30%; окно — сессий,
+    /// если кто-то ждёт или работает, иначе статус.
     func pickAmbient(_ i: Input) -> SceneKind {
         let n = starts.count + Int(i.now / 60)
         if i.takeover, lastTakeover.map({ i.now - $0 >= Self.takeoverGap }) ?? true, TickNoise.unit(n, 700 + seed) < 0.25 {
             return .takeover
         }
-        return TickNoise.unit(n, 701 + seed) < 0.7 ? .teleport : .window
+        if TickNoise.unit(n, 701 + seed) < 0.7 { return .teleport }
+        return i.sessionsActive ? .sessions : .window
+    }
+
+    /// Сцена по действию человека: те же «тихие» запреты (спрятан, пауза, полноэкранное, сон, Reduce Motion) и своя
+    /// настройка, но без лимитов, кулдаунов, «занят/отошёл» и выключенного фонового персонажа. Лимиты фона не тратит.
+    public mutating func decideAction(_ event: ActionEvent, _ i: Input) -> Decision {
+        let d: Decision
+        if !i.onAction { d = .skip("actionOff") }
+        else if let h = i.hiddenUntil, h > i.now { d = .skip("hidden") }
+        else if i.paused { d = .skip("paused") }
+        else if i.fullscreen { d = .skip("fullscreen") }
+        else if i.displaysAsleep { d = .skip("asleep") }
+        else if i.reduceMotion { d = .skip("reduceMotion") }
+        else { d = .play(event.scene) }
+        lastDecision = "\(event.rawValue): \(d.log)"
+        return d
     }
 
     /// Следующая фоновая сцена: через интервал частоты (или через 10 мин, если сейчас нельзя по долгой причине).

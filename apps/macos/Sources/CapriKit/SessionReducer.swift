@@ -65,8 +65,16 @@ public struct CapriState: Equatable {
     var pendingIdle: [SessionKey: Double] = [:]
     /// Когда экран последний раз показал диалог сессии, ждущей ответа по хукам.
     var dialogSeen: [SessionKey: Double] = [:]
+    /// Последний снимок панели и его разбор (ключ — «хост панель»): повтор того же экрана (`screenSame`)
+    /// не классифицируется заново.
+    var screenMemo: [String: ScreenMemo] = [:]
 
     public init() {}
+
+    /// Хост убрали из настроек — забыть его снимки.
+    public mutating func forget(host: String) {
+        screenMemo = screenMemo.filter { $0.value.host != host }
+    }
 
     /// Ключ сессии с учётом склейки: `pane:%N` (видели только по экрану) заменяется сессией из хуков
     /// в той же панели. nil — сессии нет или она закрыта.
@@ -83,9 +91,22 @@ public struct CapriState: Equatable {
     }
 }
 
+/// Разобранный снимок панели: строки, агент из сообщения, для какого агента классифицирован и итог.
+struct ScreenMemo: Equatable {
+    var host: String
+    var pane: String
+    var paneAgent: Agent?
+    var lines: [String]
+    var agent: Agent?
+    var screen: ScreenState
+}
+
 public enum CapriInput: Equatable {
     case event(host: String, CapriEvent, replay: Bool)
     case screen(host: String, pane: String, agent: Agent?, lines: [String], ts: Double)
+    /// Тот же экран, что прошлый снимок панели (байт в байт), с новым временем: разбирать не нужно, но время
+    /// снимка нужно — им подтверждается «ждёт ввода».
+    case screenSame(host: String, pane: String, ts: Double)
     case panes(host: String, [PaneInfo]?, ts: Double)
     case connection(host: String, connected: Bool, ts: Double)
     case tick(Double)
@@ -118,6 +139,8 @@ public enum SessionReducer {
             return apply(&state, host: host, event: event, replay: replay)
         case let .screen(host, pane, agent, lines, ts):
             return applyScreen(&state, host: host, pane: pane, agent: agent, lines: lines, ts: ts)
+        case let .screenSame(host, pane, ts):
+            return applyScreenSame(&state, host: host, pane: pane, ts: ts)
         case let .panes(host, panes, ts):
             applyPanes(&state, host: host, panes: panes, ts: ts)
             return []
@@ -275,13 +298,40 @@ public enum SessionReducer {
 
     // MARK: экран (фолбэк)
 
-    static func applyScreen(_ state: inout CapriState, host: String, pane: String, agent paneAgent: Agent?, lines: [String], ts: Double) -> [CapriEffect] {
-        let hooked = state.sessions.values
+    static func memoKey(_ host: String, _ pane: String) -> String { "\(host) \(pane)" }
+
+    /// Сессия из хуков в этой панели (самая свежая).
+    static func hookedSession(_ state: CapriState, host: String, pane: String) -> Session? {
+        state.sessions.values
             .filter { $0.key.host == host && $0.tmux?.pane == pane && $0.status != .ended && !$0.key.id.hasPrefix("pane:") }
             .max { $0.lastEventAt < $1.lastEventAt }
+    }
+
+    static func applyScreen(_ state: inout CapriState, host: String, pane: String, agent paneAgent: Agent?, lines: [String], ts: Double) -> [CapriEffect] {
+        let hooked = hookedSession(state, host: host, pane: pane)
         let agent = hooked?.key.agent ?? paneAgent
         let screen = ScreenClassifier.classify(lines: lines, agent: agent)
+        state.screenMemo[memoKey(host, pane)] = ScreenMemo(host: host, pane: pane, paneAgent: paneAgent, lines: lines, agent: agent, screen: screen)
+        return applyClassified(&state, host: host, pane: pane, hooked: hooked, agent: agent, screen: screen, ts: ts)
+    }
 
+    /// Повтор прошлого снимка: та же логика, что у `applyScreen`, с сохранённым разбором (агент сессии сменился —
+    /// разбираем сохранённые строки заново). Снимка не было — ничего не делаем.
+    static func applyScreenSame(_ state: inout CapriState, host: String, pane: String, ts: Double) -> [CapriEffect] {
+        let k = memoKey(host, pane)
+        guard var memo = state.screenMemo[k] else { return [] }
+        let hooked = hookedSession(state, host: host, pane: pane)
+        let agent = hooked?.key.agent ?? memo.paneAgent
+        if agent != memo.agent {
+            memo.agent = agent
+            memo.screen = ScreenClassifier.classify(lines: memo.lines, agent: agent)
+            state.screenMemo[k] = memo
+        }
+        return applyClassified(&state, host: host, pane: pane, hooked: hooked, agent: agent, screen: memo.screen, ts: ts)
+    }
+
+    static func applyClassified(_ state: inout CapriState, host: String, pane: String, hooked: Session?, agent: Agent?,
+                                screen: ScreenState, ts: Double) -> [CapriEffect] {
         if var s = hooked {
             let key = s.key
             let before = s.status
@@ -338,6 +388,7 @@ public enum SessionReducer {
                                                confidence: .inferred, statusSince: ts, lastEventAt: ts,
                                                request: nil, lastMessage: nil, typedInput: nil)
         let before = s.status
+        let old = state.sessions[key]
         switch screen {
         case .running: set(&s, .running, ts); s.request = nil; s.typedInput = nil
         case .dialog(let d):
@@ -346,11 +397,15 @@ public enum SessionReducer {
         case .idle(let typed): set(&s, .idle, ts); s.request = nil; s.typedInput = typed
         case .unknown: break
         }
-        s.lastEventAt = ts
         if let p = state.hosts[host]?.panes?.first(where: { $0.pane == pane }) {
             s.tmux = TmuxRef(pane: pane, session: p.session, window: p.window, pid: p.pid.isEmpty ? nil : p.pid)
             if !p.path.isEmpty { s.cwd = p.path }
         }
+        // Активность — когда по экрану что-то поменялось, а не каждый снимок: повтор неизменного экрана раз в
+        // 10 с не должен переиздавать список сессий (и двигать ждущую в порядке «по свежести»).
+        // Исключение — сессия без панели в списке (`tmux == nil`): её держит в живых только свежий снимок, иначе
+        // она истечёт по `untrackedTTL`, хотя экран приходит.
+        if s != old || s.tmux == nil { s.lastEventAt = ts }
         state.sessions[key] = s
         return transitionEffects(key: key, before: before, after: s.status, replay: false)
     }
@@ -396,6 +451,7 @@ public enum SessionReducer {
         // panes == nil — tmux не ответил; ничего не закрываем.
         guard let panes else { return }
         let alive = Set(panes.map(\.pane))
+        state.screenMemo = state.screenMemo.filter { $0.value.host != host || alive.contains($0.value.pane) }
         for (key, s) in state.sessions where key.host == host && s.status != .ended {
             guard let pane = s.tmux?.pane, !alive.contains(pane) else { continue }
             if key.id.hasPrefix("pane:") {

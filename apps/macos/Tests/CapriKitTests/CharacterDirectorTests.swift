@@ -139,4 +139,40 @@ final class CharacterDirectorTests: XCTestCase {
         XCTAssertFalse(SceneTriggers.needsInputAppeared(prev: [a: .needsInput], next: [a: .needsInput]))
         XCTAssertTrue(SceneTriggers.needsInputAppeared(prev: [:], next: [c: .needsInput]))
     }
+
+    func testActionScenesBypassLimitsButNotQuietReasons() {
+        var d = CharacterDirector(now: 0)
+        XCTAssertEqual(d.decide(.sessionFinished, input(1000)), .play(.teleport))
+        // Только что была сцена, человек печатает, notch открыт, фоновый персонаж выключен — всё равно отвечаем.
+        let busy = input(1001) { $0.idleSec = 0; $0.enabled = false; $0.notchOpen = true; $0.sceneRunning = true; $0.lowPower = true }
+        XCTAssertEqual(d.decideAction(.replySent, busy), .play(.reply))
+        XCTAssertEqual(d.decideAction(.askedAssistant, busy), .play(.thinking))
+        XCTAssertEqual(d.decideAction(.answerReady, busy), .play(.answer))
+        XCTAssertEqual(d.decideAction(.replySent, input(1002)), .play(.reply), "без кулдауна")
+        // Лимиты фона не тратит.
+        XCTAssertEqual(d.starts.count, 1)
+        let quiet: [(String, (inout CharacterDirector.Input) -> Void)] = [
+            ("actionOff", { $0.onAction = false }),
+            ("hidden", { $0.hiddenUntil = 5000 }),
+            ("paused", { $0.paused = true }),
+            ("fullscreen", { $0.fullscreen = true }),
+            ("asleep", { $0.displaysAsleep = true }),
+            ("reduceMotion", { $0.reduceMotion = true }),
+        ]
+        for (why, edit) in quiet {
+            XCTAssertEqual(d.decideAction(.replySent, input(1003, edit)), .skip(why), why)
+        }
+        XCTAssertEqual(d.lastDecision, "replySent: skip reduceMotion")
+    }
+
+    func testAmbientPicksSessionsWhenSomeoneWaits() {
+        var kinds: [SceneKind: Int] = [:]
+        for seed in 0..<200 {
+            var d = CharacterDirector(now: 0, seed: seed)
+            if case .play(let k) = d.decide(.ambient, input(d.nextAmbient) { $0.sessionsActive = true }) { kinds[k, default: 0] += 1 }
+        }
+        XCTAssertGreaterThan(kinds[.sessions, default: 0], 0)
+        XCTAssertNil(kinds[.window], "кто-то ждёт или работает — окно сессий вместо статуса")
+        XCTAssertGreaterThan(kinds[.teleport, default: 0], kinds[.sessions, default: 0])
+    }
 }

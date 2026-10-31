@@ -54,6 +54,9 @@ public final class HostCollector {
     private var disconnectedAt: Double?
     private var everConnected = false
     private let staleAfter: TimeInterval = 45
+    /// Последний снимок экрана по панели — байты после `ts` (`StreamMessage.screenFingerprint`). Неизменный
+    /// экран хук присылает повторно раз в 10 с — его не разбираем, а отдаём `.screenSame`.
+    private var screenCache: [String: Data] = [:]
 
     public init(source: HostSource) { self.source = source }
 
@@ -114,6 +117,7 @@ public final class HostCollector {
             DispatchQueue.main.async { self?.exited(proc, generation: gen) }
         }
         buffer = Data()
+        screenCache = [:]
         lastStderr = ""
         startedAt = Date()
         lastData = Date()
@@ -177,7 +181,13 @@ public final class HostCollector {
         while let nl = buffer.firstIndex(of: 0x0A) {
             let lineData = buffer[buffer.startIndex..<nl]
             buffer.removeSubrange(buffer.startIndex...nl)
+            let screen = StreamMessage.screenFingerprint(lineData)
+            if let screen, screenCache[screen.pane] == screen.payload {
+                onInput?(.screenSame(host: source.name, pane: screen.pane, ts: screen.ts + clockOffset))
+                continue
+            }
             guard let line = String(data: lineData, encoding: .utf8), let msg = StreamMessage.decode(line: line) else { continue }
+            if let screen, case .screen(let pane, _, _, _) = msg, pane == screen.pane { screenCache[pane] = screen.payload }
             handle(msg)
             if gen != generation { return }   // handle мог оборвать соединение
         }
@@ -214,6 +224,10 @@ public final class HostCollector {
             let missedWhileAway = replay && everConnected && e.ts > (disconnectedAt ?? .infinity)
             onInput?(.event(host: source.name, e, replay: replay && !missedWhileAway))
         case let .panes(panes):
+            if let panes {
+                let alive = Set(panes.map(\.pane))
+                screenCache = screenCache.filter { alive.contains($0.key) }
+            }
             onInput?(.panes(host: source.name, panes, ts: now))
         case let .screen(pane, agent, lines, ts):
             onInput?(.screen(host: source.name, pane: pane, agent: agent, lines: lines, ts: ts + clockOffset))

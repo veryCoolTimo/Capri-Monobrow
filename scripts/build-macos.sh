@@ -44,6 +44,7 @@ cat > "$CAPRI_APP/Contents/Info.plist" <<'PLIST'
 <key>LSMultipleInstancesProhibited</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>NSAppleEventsUsageDescription</key><string>Capri включает, ставит на паузу и переключает треки в Spotify и Музыке, когда вы её об этом просите.</string>
 </dict></plist>
 PLIST
 codesign --force --deep --sign - "$CAPRI_APP"

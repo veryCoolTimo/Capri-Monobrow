@@ -22,7 +22,9 @@ public enum SceneClip {
     public static let all = [look, close, many, slits, appear, talk, shut, burst, crazy, teleOut, teleIn, melt, texMosh, texGraffiti]
 }
 
-/// Сцены персонажа на рабочем столе: короткие представления (≤ 8 с), после которых глаза снова только в notch.
+/// Сцены персонажа на рабочем столе: короткие представления, после которых глаза снова только в notch. Фоновые —
+/// ≤ 8 с; окна по действию человека (`thinking`, `answer`) — дольше, а наведение, перетаскивание и «📌» держат
+/// сцену на месте (`SceneClock`).
 /// Всё здесь — чистые функции времени: живой показ и снимки (`scene sheet`) дают одинаковые кадры.
 /// Координаты — глобальные AppKit (начало внизу слева).
 public enum SceneKind: String, CaseIterable, Codable {
@@ -34,6 +36,16 @@ public enum SceneKind: String, CaseIterable, Codable {
     case takeover
     /// «Видит, что играет трек»: телепорт в угол, кивает под музыку, ноты.
     case vibe
+    /// Окно `CAPRI//SESSIONS`: до 4 строк сессий, клик по строке — сессия в основном окне.
+    case sessions
+    /// Окно `CAPRI//THINK`: помощник думает над вопросом, notch свёрнут. Клик — помощник в notch.
+    case thinking
+    /// Окно `CAPRI//ANSWER`: ответ помощника, кнопки предложения.
+    case answer
+    /// Человек ответил сессии через Capri: телепорт к окну терминала, «→ имя ✓».
+    case reply
+    /// Окно `CAPRI//MUSIC`: «включи …» или кнопки музыки — ищет, включает, ⏮ ⏯ ⏭.
+    case music
 
     public var title: String {
         switch self {
@@ -41,7 +53,57 @@ public enum SceneKind: String, CaseIterable, Codable {
         case .window: "Окно"
         case .takeover: "Захват"
         case .vibe: "Вайб"
+        case .sessions: "Сессии"
+        case .thinking: "Думает"
+        case .answer: "Ответ"
+        case .reply: "К терминалу"
+        case .music: "Музыка"
         }
+    }
+
+    /// Сцены-окна с рамкой `CAPRI//…`, «×» и «📌».
+    public var boxed: Bool { [.window, .sessions, .thinking, .answer, .music].contains(self) }
+
+    /// Сцена держится на месте при наведении/перетаскивании (`SceneClock`); захват — нет (он весь подвижный).
+    public var holdable: Bool { self != .takeover }
+}
+
+/// Параметры сцены из живых данных (длины строк, число строк окна, моменты событий) — всё, что влияет на кадр.
+public struct SceneOptions: Equatable {
+    /// Длина строки статуса окна (`window`).
+    public var text = 0
+    /// Длины строк «захвата».
+    public var lines: [Int] = []
+    /// Строк в окне сессий (показывается до 4).
+    public var rows = 0
+    /// Сколько сессий ждут: ≥ 3 — `crazy` в окне сессий.
+    public var waiting = 0
+    /// Ответ помощника: строк после переноса (до 6) и букв всего.
+    public var answerLines = 0
+    public var answerChars = 0
+    /// В ответе есть неподтверждённое действие (кнопки «отправить»/«отмена») — читать дольше.
+    public var proposal = false
+    /// Ответ продолжает окно «думает» (то же окно, глитч-переход вместо прилёта).
+    public var continued = false
+    /// Время таймлайна, когда предложение отправили (`burst` один раз).
+    public var burstAt: Double?
+    /// Длина подписи «→ имя ✓» сцены `reply`.
+    public var caption = 0
+    /// Время таймлайна, когда ответ сессии не дошёл (`reply`: `crazy` + глитч 3).
+    public var failedAt: Double?
+    /// Окно музыки: смены состояния (ищет → играет → пауза …) по времени таймлайна.
+    public var musicMarks: [SceneMusicMark] = []
+    /// Музыка известна (есть что переключать) и кнопки ⏮ ⏯ ⏭ под глазами сейчас показаны (наведение на глаза).
+    public var musicKnown = false
+    public var controls = false
+    /// Насколько таймлайн отстал от стены (удержание): клипы окна музыки идут по стене, состояние — по таймлайну.
+    public var lag = 0.0
+
+    public init(text: Int = 0, lines: [Int] = [], rows: Int = 0, waiting: Int = 0, answerLines: Int = 0, answerChars: Int = 0,
+                proposal: Bool = false, continued: Bool = false, burstAt: Double? = nil, caption: Int = 0, failedAt: Double? = nil) {
+        self.text = text; self.lines = lines; self.rows = rows; self.waiting = waiting; self.answerLines = answerLines
+        self.answerChars = answerChars; self.proposal = proposal; self.continued = continued; self.burstAt = burstAt
+        self.caption = caption; self.failedAt = failedAt
     }
 }
 
@@ -68,6 +130,17 @@ public struct SceneGeometry: Equatable {
         if let area { r = r.union(area) }
         return r.insetBy(dx: -90, dy: -90)
     }
+
+    /// Перетаскивание: цель и окно сдвигаются вместе, не выходя за `visible`; `home` (notch) на месте.
+    public func moved(by d: CGVector) -> SceneGeometry {
+        let zone = area ?? target
+        let to = SceneLayout.clamp(zone.offsetBy(dx: d.dx, dy: d.dy), to: visible)
+        let dx = to.minX - zone.minX, dy = to.minY - zone.minY
+        var g = self
+        g.target = target.offsetBy(dx: dx, dy: dy)
+        g.area = area?.offsetBy(dx: dx, dy: dy)
+        return g
+    }
 }
 
 /// Молния между двумя точками (глобальные координаты).
@@ -90,10 +163,26 @@ public struct SceneWindow: Equatable {
     public var chrome: Bool
     /// 0…1: рассыпается в частицы.
     public var melt: CGFloat
-    /// Сколько букв строки статуса напечатано.
+    /// Сколько букв строки статуса (ответа) напечатано; в окне сессий — сколько строк показано; в «думает» — точек.
     public var typed: Int
     /// Курсор печати мигает.
     public var caret: Bool
+    /// «Думает»: сканлайн-вайп сверху вниз, 0…1 (nil — нет).
+    public var scan: CGFloat?
+
+    public init(rect: CGRect, open: CGFloat, chrome: Bool, melt: CGFloat, typed: Int, caret: Bool, scan: CGFloat? = nil) {
+        self.rect = rect; self.open = open; self.chrome = chrome; self.melt = melt; self.typed = typed; self.caret = caret
+        self.scan = scan
+    }
+}
+
+/// Подпись сцены `reply` рядом с глазами («→ votek2 ✓»): правый край — `anchor`.
+public struct SceneCaption: Equatable {
+    public var anchor: CGPoint
+    /// Сколько букв напечатано.
+    public var typed: Int
+    /// Не дошло — красным.
+    public var failed: Bool
 }
 
 /// «Захват» области.
@@ -148,6 +237,9 @@ public struct SceneFrame: Equatable {
     public var window: SceneWindow?
     public var takeover: SceneTakeover?
     public var notes: [SceneNote] = []
+    /// Кольца-импульсы от глаз (`reply`: «отправила»).
+    public var rings: [SceneRing] = []
+    public var caption: SceneCaption?
     /// Сцена кончилась — глаза снова в notch.
     public var done = false
 
@@ -166,29 +258,51 @@ public enum SceneTimeline {
     /// Строки «захвата».
     public static let takeoverLines = 2
 
-    public static func duration(_ kind: SceneKind) -> Double {
+    /// «Думает» ждёт ответа помощника не дольше минуты (дальше ответ всё равно покажет notch).
+    public static let thinkingDuration = 60.0
+    /// Уход окна (свёртывание в линию, молния домой).
+    static let foldDuration = 0.9
+
+    public static func duration(_ kind: SceneKind, _ o: SceneOptions = SceneOptions()) -> Double {
         switch kind {
         case .teleport: 5.0
         case .window: 8.0
         case .takeover: 4.6
         case .vibe: 7.0
+        case .sessions: 8.0
+        case .thinking: thinkingDuration
+        case .answer:
+            // Прилёт + печать (18 букв/с) + чтение + уход; с кнопками — дольше; потолок 25 с (дальше — «📌»).
+            min(25, arrival(kind, o) + Double(o.answerChars) / 18 + (o.proposal ? 10 : max(4, Double(o.answerLines))) + foldDuration)
+        case .reply: 4.0
+        case .music:
+            // Не меньше 8 с и ≥ 5 с после последней смены состояния (ждём плеер не дольше 6 с — потом «не нашла»).
+            min(musicCap, max(8, (o.musicMarks.map(\.t).max() ?? 0) + 5))
         }
     }
 
+    /// Потолок окна музыки без «📌».
+    public static let musicCap = 40.0
+
+    /// Конец прилёта окна (рамка раскрыта).
+    static func arrival(_ kind: SceneKind, _ o: SceneOptions) -> Double { kind == .answer && o.continued ? 0.3 : 1.0 }
+
     /// Спокойная часть сцены (глаза на месте, молнии нет): показ идёт на 12 fps вместо 24 — панель большая,
-    /// каждый кадр перерисовывает её целиком. Захват — весь подвижный.
-    public static func calm(_ kind: SceneKind) -> Range<Double>? {
+    /// каждый кадр перерисовывает её целиком. Захват — весь подвижный. Только здесь есть горячие точки и удержание.
+    public static func calm(_ kind: SceneKind, _ o: SceneOptions = SceneOptions()) -> Range<Double>? {
         switch kind {
         case .teleport: 1.0..<4.4
         case .window: 1.0..<7.0
         case .vibe: 0.75..<6.5
         case .takeover: nil
+        case .sessions, .thinking, .answer, .music: arrival(kind, o)..<(duration(kind, o) - foldDuration)
+        case .reply: 1.5..<3.4
         }
     }
 
     /// Шаг кадра в момент `t` (после обрыва — всегда 24 fps).
-    public static func frameInterval(_ kind: SceneKind, t: Double, aborted: Bool = false) -> Double {
-        if !aborted, let c = calm(kind), c.contains(t) { return 1.0 / 12 }
+    public static func frameInterval(_ kind: SceneKind, t: Double, aborted: Bool = false, options o: SceneOptions = SceneOptions()) -> Double {
+        if !aborted, let c = calm(kind, o), c.contains(t) { return 1.0 / 12 }
         return 1.0 / 24
     }
 
@@ -196,15 +310,22 @@ public enum SceneTimeline {
     /// `text` — длина строки статуса окна; `lines` — длины строк захвата; `abortedAt` — когда сцену оборвали.
     public static func frame(_ kind: SceneKind, t: Double, geometry g: SceneGeometry, clips: Set<String> = [],
                              text: Int = 0, lines: [Int] = [], abortedAt: Double? = nil) -> SceneFrame {
+        frame(kind, t: t, geometry: g, clips: clips, options: SceneOptions(text: text, lines: lines), abortedAt: abortedAt)
+    }
+
+    public static func frame(_ kind: SceneKind, t: Double, geometry g: SceneGeometry, clips: Set<String> = [],
+                             options o: SceneOptions, abortedAt: Double? = nil) -> SceneFrame {
         if let a = abortedAt, t >= a {
-            return recall(kind, t: t, at: a, geometry: g, clips: clips, text: text, lines: lines)
+            return recall(kind, t: t, at: a, geometry: g, clips: clips, options: o)
         }
-        guard t >= 0, t < duration(kind) else { return .home() }
+        guard t >= 0, t < duration(kind, o) else { return .home() }
         switch kind {
         case .teleport: return teleport(t, g, clips)
-        case .window: return windowForm(t, g, clips, text)
-        case .takeover: return takeover(t, g, clips, lines)
+        case .window: return windowForm(t, g, clips, o.text)
+        case .takeover: return takeover(t, g, clips, o.lines)
         case .vibe: return vibe(t, g, clips)
+        case .sessions, .thinking, .answer, .music: return boxed(kind, t, g, clips, o)
+        case .reply: return reply(t, g, clips, o)
         }
     }
 
@@ -272,8 +393,14 @@ public enum SceneTimeline {
         case ..<0.5: return jump("jump", from: g.home, to: g.target, t - 0.3, len: 0.2)
         case ..<1.0: return into("in", at: g.target, t - 0.5, len: 0.5, c)
         case ..<4.4:
+            // Смотрит вокруг и моргает (`close`) раз в 2,5 с; без клипа — редкий глитч, как раньше.
             var f = SceneFrame(phase: "look", eyes: lean(g.target, g), clip: SceneClip.look, clipT: t - 1.0)
-            f.glitch = idleGlitch(t)
+            let cyc = (t - 1.0).truncatingRemainder(dividingBy: 2.5)
+            if c.contains(SceneClip.close) {
+                if cyc >= 2.15 { f.clip = SceneClip.close; f.clipT = cyc - 2.15; f.loop = false }
+            } else {
+                f.glitch = idleGlitch(t)
+            }
             return f
         case ..<4.7: return out("leave", at: g.target, t - 4.4, len: 0.3, c)
         case ..<4.85: return jump("back", from: g.target, to: g.home, t - 4.7, len: 0.15)
@@ -474,15 +601,15 @@ public enum SceneTimeline {
     // MARK: обрыв
 
     /// Где были глаза в момент обрыва (или центр цели, если их не было на столе).
-    static func eyesAt(_ kind: SceneKind, _ t: Double, _ g: SceneGeometry, _ c: Set<String>, _ text: Int, _ lines: [Int]) -> CGRect {
-        frame(kind, t: t, geometry: g, clips: c, text: text, lines: lines).eyes ?? g.target
+    static func eyesAt(_ kind: SceneKind, _ t: Double, _ g: SceneGeometry, _ c: Set<String>, _ o: SceneOptions) -> CGRect {
+        frame(kind, t: t, geometry: g, clips: c, options: o).eyes ?? g.target
     }
 
     static func recall(_ kind: SceneKind, t: Double, at a: Double, geometry g: SceneGeometry, clips: Set<String>,
-                       text: Int, lines: [Int]) -> SceneFrame {
+                       options o: SceneOptions) -> SceneFrame {
         let k = t - a
         guard k < recallDuration else { return .home("recalled") }
-        let from = eyesAt(kind, a, g, clips, text, lines)
+        let from = eyesAt(kind, a, g, clips, o)
         if k < 0.1 {
             var f = SceneFrame(phase: "recall", eyes: from, glitch: 4)
             f.squash = CGFloat(max(0.05, 1 - k / 0.1))

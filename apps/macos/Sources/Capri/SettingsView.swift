@@ -41,6 +41,8 @@ final class Settings: ObservableObject {
     }
     @Published var characterSessionEvents: Bool { didSet { d.set(characterSessionEvents, forKey: "capri.characterSessionEvents") } }
     @Published var characterTakeover: Bool { didSet { d.set(characterTakeover, forKey: "capri.characterTakeover") } }
+    /// Сцены по моим действиям (ответ сессии → к терминалу, вопрос помощнику → «думает»/ответ) — вкл. по умолчанию.
+    @Published var characterOnAction: Bool { didSet { d.set(characterOnAction, forKey: "capri.characterOnAction") } }
     /// «Спрятать персонажа на час»: до этого времени (unix) сцен и кивания нет.
     @Published var characterHiddenUntil: Double? {
         didSet { d.set(characterHiddenUntil, forKey: "capri.characterHiddenUntil"); onCharacterChange?() }
@@ -74,6 +76,7 @@ final class Settings: ObservableObject {
         characterRate = d.string(forKey: "capri.characterRate").flatMap(CharacterDirector.Rate.init(rawValue:)) ?? .sometimes
         characterSessionEvents = d.object(forKey: "capri.characterSessionEvents") as? Bool ?? true
         characterTakeover = d.object(forKey: "capri.characterTakeover") as? Bool ?? false
+        characterOnAction = d.object(forKey: "capri.characterOnAction") as? Bool ?? true
         characterHiddenUntil = d.object(forKey: "capri.characterHiddenUntil") as? Double
         music = d.object(forKey: "capri.music") as? Bool ?? true
     }
@@ -136,6 +139,10 @@ struct SettingsView: View {
     @ObservedObject var settings: Settings
     /// Только список хостов, а не весь стор: форма не перерисовывается на каждое событие сессий.
     @ObservedObject var hosts: HostList
+    /// Ключи Spotify Web API (Связка ключей) — поиск трека по названию.
+    @ObservedObject var spotify: SpotifySearch
+    @State private var spotifyID = ""
+    @State private var spotifySecret = ""
     @State private var newHost = ""
     @State private var hostError: String?
     @State private var advanced = false
@@ -172,12 +179,41 @@ struct SettingsView: View {
                 Toggle("Изображать захват экрана", isOn: $settings.characterTakeover)
                     .disabled(!settings.character)
                     .help("Только рисунок поверх: Capri ничего не нажимает и не печатает")
+                Toggle("Capri отвечает на мои действия на столе", isOn: $settings.characterOnAction)
+                    .help("Ответил сессии — телепорт к терминалу; спросил помощника и свернул notch — окно «думаю» и ответ")
                 Toggle("Реагировать на музыку (Spotify, Музыка)", isOn: $settings.music)
                     .help("Кивает в notch на смену трека; в раскрытом notch — что играет")
             } header: {
                 Text("Персонаж")
             } footer: {
-                Text("Короткие сцены до 8 секунд: телепорт, окно, «захват», вайб. Не в полноэкранных приложениях, не когда вы печатаете или отошли, не чаще раза в 20 минут. Клики проходят насквозь. Посмотреть все сцены — меню ✦ → Персонаж.")
+                Text("Фоновые сцены до 8 секунд: телепорт, окно, сессии, «захват», вайб — не в полноэкранных приложениях, не когда вы печатаете или отошли, не чаще раза в 20 минут. Сцены на ваши действия — сразу. Capri можно перетащить за глаза или заголовок; наведение держит окно, «📌» — до «×». Клики мимо её окон проходят насквозь. Посмотреть все сцены — меню ✦ → Персонаж.")
+                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Section {
+                if spotify.hasKeys {
+                    HStack {
+                        Text("Ключи Spotify сохранены")
+                        Spacer()
+                        Button("Проверить") { spotify.check() }
+                        Button("Стереть", role: .destructive) { spotify.erase() }
+                    }
+                } else {
+                    TextField("Client ID", text: $spotifyID).font(.system(.body, design: .monospaced))
+                    SecureField("Client secret", text: $spotifySecret).font(.system(.body, design: .monospaced))
+                    HStack {
+                        Spacer()
+                        Button("Сохранить") {
+                            spotify.save(id: spotifyID, secret: spotifySecret)
+                            if spotify.hasKeys { spotifyID = ""; spotifySecret = ""; spotify.check() }
+                        }
+                        .disabled(spotifyID.trimmingCharacters(in: .whitespaces).isEmpty || spotifySecret.isEmpty)
+                    }
+                }
+                if let st = spotify.status { Text(st).font(.caption).foregroundColor(.secondary) }
+            } header: {
+                Text("Музыка")
+            } footer: {
+                Text("«Включи …» помощнику и кнопки ⏮ ⏯ ⏭: Capri управляет Spotify и Музыкой через AppleScript — только когда вы её просите; macOS спросит разрешение (Автоматизация; после переустановки Capri может спросить снова). Чтобы Spotify-трек находился по названию, нужны ключи бесплатного приложения developer.spotify.com (Create app → Client ID и Client secret) — они хранятся в Связке ключей. Без ключей Capri откроет поиск в Spotify, а ссылки и spotify:-адреса включит сама. Музыка ищет по вашей медиатеке.")
                     .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Section {

@@ -126,6 +126,43 @@ public enum StreamMessage: Equatable {
         var now: Double?
     }
 
+    /// Отпечаток снимка экрана без разбора JSON: `pane`, `ts` и всё после `ts` (сессия, команда, агент, pid,
+    /// строки) — для точного сравнения байт с прошлым снимком той же панели. capri-hook пишет поля в постоянном
+    /// порядке: `{"kind":"screen","ts":<число>,"pane":"<%N>",…`. Другой порядок, экранирование в `pane`,
+    /// не снимок — nil (тогда обычный разбор).
+    public static func screenFingerprint(_ line: Data) -> (pane: String, ts: Double, payload: Data)? {
+        let prefix = Array(#"{"kind":"screen","ts":"#.utf8)
+        let paneKey = Array(#""pane":""#.utf8)
+        return line.withUnsafeBytes { (buf: UnsafeRawBufferPointer) -> (pane: String, ts: Double, payload: Data)? in
+            let b = buf.bindMemory(to: UInt8.self)
+            guard b.count > prefix.count + paneKey.count + 4,
+                  prefix.indices.allSatisfy({ b[$0] == prefix[$0] }) else { return nil }
+            // ts — число до запятой.
+            var i = prefix.count
+            let tsStart = i
+            while i < b.count, b[i] != UInt8(ascii: ",") {
+                let c = b[i]
+                guard (c >= 0x30 && c <= 0x39) || c == UInt8(ascii: ".") || c == UInt8(ascii: "-")
+                        || c == UInt8(ascii: "e") || c == UInt8(ascii: "E") || c == UInt8(ascii: "+") else { return nil }
+                i += 1
+            }
+            guard i < b.count, i > tsStart,
+                  let ts = Double(String(decoding: UnsafeBufferPointer(rebasing: b[tsStart..<i]), as: UTF8.self)) else { return nil }
+            i += 1
+            let payloadStart = i
+            guard b.count - i > paneKey.count, paneKey.indices.allSatisfy({ b[i + $0] == paneKey[$0] }) else { return nil }
+            i += paneKey.count
+            let paneStart = i
+            while i < b.count, b[i] != UInt8(ascii: "\"") {
+                if b[i] == UInt8(ascii: "\\") { return nil }
+                i += 1
+            }
+            guard i < b.count, i > paneStart else { return nil }
+            let pane = String(decoding: UnsafeBufferPointer(rebasing: b[paneStart..<i]), as: UTF8.self)
+            return (pane, ts, Data(UnsafeBufferPointer(rebasing: b[payloadStart...])))
+        }
+    }
+
     public static func decode(line: String) -> StreamMessage? {
         guard let d = line.data(using: .utf8), let raw = try? JSONDecoder().decode(Raw.self, from: d) else { return nil }
         switch raw.kind {

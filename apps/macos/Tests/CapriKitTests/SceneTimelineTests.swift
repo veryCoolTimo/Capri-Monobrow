@@ -11,6 +11,9 @@ final class SceneTimelineTests: XCTestCase {
         switch kind {
         case .window: return SceneGeometry(home: home, target: target, area: SceneLayout.windowForm(visible), visible: visible)
         case .takeover: return SceneGeometry(home: home, target: target, area: SceneLayout.takeoverArea(window: nil, visible: visible), visible: visible)
+        case .sessions, .thinking, .answer:
+            let w = SceneLayout.windowForm(visible, kind: kind)
+            return SceneGeometry(home: home, target: SceneTimeline.eyesIn(kind, window: w), area: w, visible: visible)
         default: return SceneGeometry(home: home, target: target, visible: visible)
         }
     }
@@ -25,7 +28,12 @@ final class SceneTimelineTests: XCTestCase {
                 XCTAssertNil(f.eyes)
                 XCTAssertNil(f.bolt)
             }
-            XCTAssertLessThanOrEqual(SceneTimeline.duration(k), 8)
+            // Фоновые сцены и ответ терминалу — короткие; окна по действию — дольше, но с потолком.
+            switch k {
+            case .thinking: XCTAssertEqual(SceneTimeline.duration(k), SceneTimeline.thinkingDuration)
+            case .answer: XCTAssertLessThanOrEqual(SceneTimeline.duration(k, SceneOptions(answerLines: 6, answerChars: 5000, proposal: true)), 25)
+            default: XCTAssertLessThanOrEqual(SceneTimeline.duration(k), 8)
+            }
         }
     }
 
