@@ -103,6 +103,8 @@ final class SessionStore: ObservableObject {
 
     var onNeedsInput: ((Session) -> Void)?
     var onDelivered: ((SessionKey) -> Void)?
+    /// Человек сам ответил сессии (новый промпт в ней или ответ через Capri).
+    var onUserResponded: ((SessionKey) -> Void)?
 
     private var state = CapriState()
     private var supervisor: CollectorSupervisor!
@@ -177,8 +179,11 @@ final class SessionStore: ObservableObject {
             }
         case let .screen(host, pane, _, lines, ts):
             details.setScreen(host: host, pane: pane, lines: lines, ts: ts)
-        case let .event(host, event, _):
+        case let .event(host, event, replay):
             details.record(host: host, event: event)
+            if !replay, event.event == "UserPromptSubmit", let id = event.sessionId {
+                onUserResponded?(SessionKey(host: host, agent: event.agent, id: id))
+            }
         case let .panes(_, panes, _) where panes != nil:
             details.prune(sessions: state.sessions, panes: state.hosts.compactMapValues(\.panes))
         default:
@@ -277,6 +282,7 @@ final class SessionStore: ObservableObject {
     private func confirmDeliveries() {
         for key in deliveries.update(state.sessions, resolve: state.resolve) {
             onDelivered?(key)
+            onUserResponded?(key)
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in self?.deliveries.dropDelivered(key) }
         }
     }

@@ -116,4 +116,21 @@ final class AttentionTests: XCTestCase {
         p.system = .off
         XCTAssertFalse(p.decide(now: 4000, notchHidden: true).systemNotification)
     }
+
+    func testThrottleTwicePerSessionPerWindow() {
+        var t = AttentionThrottle(limit: 2, window: 600)
+        let a = SessionKey(host: "h", agent: .claude, id: "a"), b = SessionKey(host: "h", agent: .claude, id: "b")
+        func call(_ k: SessionKey, _ now: Double) -> Bool {
+            guard t.allows(k, now: now) else { return false }
+            t.record(k, now: now); return true
+        }
+        XCTAssertEqual([0, 10, 20, 300].map { call(a, $0) }, [true, true, false, false])
+        XCTAssertTrue(call(b, 30))
+        XCTAssertTrue(call(a, 601))
+        XCTAssertFalse(call(a, 605))
+        // Ответил сам — снова зовёт; проверка без вызова места не занимает.
+        t.reset(a)
+        XCTAssertTrue(t.allows(a, now: 606))
+        XCTAssertTrue(call(a, 607) && call(a, 608))
+    }
 }

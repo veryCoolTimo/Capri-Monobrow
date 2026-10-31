@@ -13,6 +13,7 @@ final class AttentionCenter: NSObject {
     private var cancellables: Set<AnyCancellable> = []
     private var pauseTimer: Timer?
     private var displaysAsleep = false
+    private var throttle = AttentionThrottle()
     /// Пауза включилась/кончилась — обновить значок в строке меню.
     var onPauseChange: (() -> Void)?
 
@@ -26,6 +27,7 @@ final class AttentionCenter: NSObject {
 
     func start() {
         store.onNeedsInput = { [weak self] s in self?.needsInput(s) }
+        store.onUserResponded = { [weak self] key in self?.throttle.reset(key) }
         notifier.start()
         // Ответили или сессия ушла — её уведомление из Центра уведомлений больше не нужно.
         store.$sessions
@@ -59,7 +61,10 @@ final class AttentionCenter: NSObject {
     }
 
     private func needsInput(_ s: Session) {
-        let d = policy.decide(now: Date().timeIntervalSince1970, notchHidden: !notchVisible)
+        let now = Date().timeIntervalSince1970
+        guard throttle.allows(s.key, now: now) else { return }
+        let d = policy.decide(now: now, notchHidden: !notchVisible)
+        if d.peek || d.systemNotification { throttle.record(s.key, now: now) }
         if d.peek { notch.alert(s, sound: d.sound) }
         if d.systemNotification {
             notifier.post(s, text: settings.notificationText && !settings.codexPrivateHosts.contains(s.key.host)

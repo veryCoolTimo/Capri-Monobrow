@@ -83,3 +83,34 @@ public struct AttentionPolicy: Equatable {
         return Decision(peek: true, sound: sound, systemNotification: system)
     }
 }
+
+/// Сколько раз звать про одну сессию: не больше `limit` раз за `window` секунд — дальше она только
+/// в шкале сессий. Иначе сессия, которая раз за разом спрашивает (или моргает статусом), гоняет notch туда-сюда.
+public struct AttentionThrottle: Equatable {
+    public var limit: Int
+    public var window: Double
+    private var calls: [SessionKey: [Double]] = [:]
+
+    public init(limit: Int = 2, window: Double = 600) {
+        self.limit = limit; self.window = window
+    }
+
+    /// Можно ли сейчас позвать про `key`.
+    public mutating func allows(_ key: SessionKey, now: Double) -> Bool {
+        calls = calls.compactMapValues { times in
+            let fresh = times.filter { now - $0 < window }
+            return fresh.isEmpty ? nil : fresh
+        }
+        return (calls[key]?.count ?? 0) < limit
+    }
+
+    /// Позвали про `key` (показали notch или уведомление).
+    public mutating func record(_ key: SessionKey, now: Double) {
+        calls[key, default: []].append(now)
+    }
+
+    /// Человек ответил сессии сам — следующий её запрос снова зовёт.
+    public mutating func reset(_ key: SessionKey) {
+        calls[key] = nil
+    }
+}

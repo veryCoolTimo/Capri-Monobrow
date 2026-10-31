@@ -367,6 +367,59 @@ final class SessionReducerTests: XCTestCase {
         XCTAssertEqual(state.sessions[key]!.status, .idle)
     }
 
+    func testParallelToolsDoNotEndDialogWait() {
+        var state = CapriState()
+        let claude = live.filter { $0.agent == .claude }
+        _ = run(Array(claude.prefix(1)), into: &state)
+        let key = session(state, .claude).key
+        let pane = session(state, .claude).tmux?.pane ?? "%10"
+        func hook(_ event: String, _ ts: Double, _ data: String = "{}") -> CapriEvent {
+            CapriEvent.decode(line: #"{"v":1,"ts":\#(ts),"host":"server","agent":"claude","source":"hook","event":"\#(event)","session_id":"\#(key.id)","tmux":{"pane":"\#(pane)"},"data":\#(data)}"#)!
+        }
+        func screen(_ name: String, _ ts: Double) -> [CapriEffect] {
+            SessionReducer.reduce(&state, .screen(host: "server", pane: pane, agent: .claude, lines: Fixtures.screen(name), ts: ts))
+        }
+        let ask = #"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#
+        let remind = #"{"notification_type":"permission_prompt","message":"Claude needs your permission"}"#
+        let t0 = session(state, .claude).lastEventAt + 1
+        SessionReducer.reduce(&state, .connection(host: "server", connected: true, ts: t0))
+        _ = run([hook("UserPromptSubmit", t0)], into: &state)
+        var effects = run([hook("PermissionRequest", t0 + 1, ask)], into: &state)
+        // Диалог ещё не нарисован — на экране работа; это не ответ.
+        effects += screen("claude-running", t0 + 3)
+        // Субагенты работают дальше, потом напоминание о том же диалоге — не новое «ждёт меня».
+        effects += run([hook("PostToolUse", t0 + 4), hook("PreToolUse", t0 + 5), hook("Notification", t0 + 7, remind)], into: &state)
+        effects += screen("claude-permission", t0 + 8)
+        XCTAssertEqual(effects, [.notifyNeedsInput(key)])
+        XCTAssertEqual(state.sessions[key]!.status, .needsInput)
+        XCTAssertEqual(state.sessions[key]!.request?.summary, "ls")
+        // Ответили — на экране снова работа; запоздалое напоминание не зовёт заново.
+        effects = screen("claude-running", t0 + 12)
+        XCTAssertEqual(state.sessions[key]!.status, .running)
+        XCTAssertNil(state.sessions[key]!.request)
+        effects += run([hook("Notification", t0 + 9, remind)], into: &state)
+        XCTAssertEqual(state.sessions[key]!.status, .running)
+        XCTAssertTrue(effects.isEmpty)
+
+        // Ответили отказом, субагенты ещё шлют события, на экране строка ввода — ждёт задачу.
+        _ = run([hook("PermissionRequest", t0 + 20, ask)], into: &state)
+        _ = screen("claude-permission", t0 + 22)
+        _ = run([hook("PostToolUse", t0 + 24)], into: &state)
+        _ = screen("claude-idle-suggestion", t0 + 25)
+        SessionReducer.reduce(&state, .tick(t0 + 29))
+        XCTAssertEqual(state.sessions[key]!.status, .idle)
+
+        // Вне диалога и после вопроса текстом инструмент — снова работа.
+        _ = run([hook("PreToolUse", t0 + 30)], into: &state)
+        XCTAssertEqual(state.sessions[key]!.status, .running)
+        _ = run([hook("Stop", t0 + 31, #"{"last_assistant_message":"Продолжить?"}"#), hook("PreToolUse", t0 + 32)], into: &state)
+        XCTAssertEqual(state.sessions[key]!.status, .running)
+        // Без связи с хостом экрана нет — инструмент снимает ожидание, как раньше.
+        SessionReducer.reduce(&state, .connection(host: "server", connected: false, ts: t0 + 33))
+        _ = run([hook("PermissionRequest", t0 + 34, ask), hook("PostToolUse", t0 + 35)], into: &state)
+        XCTAssertEqual(state.sessions[key]!.status, .running)
+    }
+
     func testStopFailureIsError() {
         var state = CapriState()
         _ = run(Fixtures.events("stage0-claude-mac-stopfailure.jsonl"), into: &state)

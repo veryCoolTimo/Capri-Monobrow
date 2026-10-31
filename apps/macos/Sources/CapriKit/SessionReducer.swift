@@ -63,6 +63,8 @@ public struct CapriState: Equatable {
     var seenOrder: [String] = []
     /// Экран показал «ждёт ввода», пока по хукам сессия работает/ждёт: подтверждаем через паузу.
     var pendingIdle: [SessionKey: Double] = [:]
+    /// Когда экран последний раз показал диалог сессии, ждущей ответа по хукам.
+    var dialogSeen: [SessionKey: Double] = [:]
 
     public init() {}
 
@@ -144,6 +146,12 @@ public enum SessionReducer {
                                                statusSince: e.ts, lastEventAt: e.ts, request: nil, lastMessage: nil, typedInput: nil)
         // Устаревшее событие (пришло после более нового) не откатывает статус.
         if e.ts < s.lastEventAt { return [] }
+        // Пока висит диалог, параллельные агенты той же сессии продолжают звать инструменты — это не ответ.
+        // Ожидание снимет экран (диалог пропал), новый запрос или конец ответа. Без экрана — по-старому.
+        if e.event == "PreToolUse" || e.event == "PostToolUse", s.status == .needsInput, s.request?.kind != .reply,
+           s.tmux != nil, state.hosts[host]?.connected == true {
+            return []
+        }
         s.lastEventAt = e.ts
         if let t = e.tmux { s.tmux = t }
         if let c = e.cwd { s.cwd = c }
@@ -159,7 +167,8 @@ public enum SessionReducer {
         case "Notification":
             let type = e.data["notification_type"]?.string ?? ""
             if type == "permission_prompt" || type.contains("elicitation") {
-                if s.status != .needsInput {
+                // Напоминание, пришедшее после того, как экран уже показал ответ, — не новый запрос.
+                if s.status != .needsInput, e.ts >= s.statusSince {
                     set(&s, .needsInput, e.ts)
                     s.request = PendingRequest(kind: .notification, summary: e.data["message"]?.string ?? "Нужен ответ")
                 }
@@ -187,13 +196,14 @@ public enum SessionReducer {
         s.confidence = .hook
         // Ожидание подтверждения по экрану отменяет только событие, сменившее статус: например,
         // Notification после уже записанного запроса не должна залипить needs_input после отказа.
-        if s.status != before { state.pendingIdle[key] = nil }
+        if s.status != before { state.pendingIdle[key] = nil; state.dialogSeen[key] = nil }
         state.sessions[key] = s
         if let pane = s.tmux?.pane {
             // Хуки пришли из панели, где раньше видели сессию только по экрану, — она та же.
             let inferred = SessionKey(host: host, agent: e.agent, id: "pane:\(pane)")
             state.sessions[inferred] = nil
             state.pendingIdle[inferred] = nil
+            state.dialogSeen[inferred] = nil
             // В панели новая сессия — прежняя (убитая без SessionEnd) закончилась.
             for (other, o) in state.sessions where other != key && other.host == host && o.tmux?.pane == pane
                 && o.status != .ended && o.lastEventAt < e.ts && !other.id.hasPrefix("pane:") {
@@ -202,6 +212,7 @@ public enum SessionReducer {
                 ended.request = nil
                 state.sessions[other] = ended
                 state.pendingIdle[other] = nil
+                state.dialogSeen[other] = nil
             }
         }
         return transitionEffects(key: key, before: before, after: s.status, replay: replay)
@@ -284,6 +295,7 @@ public enum SessionReducer {
                 }
             case .dialog(let d):
                 state.pendingIdle[key] = nil
+                state.dialogSeen[key] = ts
                 if s.status == .running || s.status == .idle {
                     set(&s, .needsInput, ts); s.confidence = .inferred
                     s.request = screenRequest(d)
@@ -303,6 +315,13 @@ public enum SessionReducer {
             case .running:
                 state.pendingIdle[key] = nil
                 s.typedInput = nil
+                // Диалог ответили — на экране снова работа. Только если диалог на экране уже видели:
+                // хук PermissionRequest приходит раньше, чем диалог нарисован.
+                if s.status == .needsInput, s.request?.kind != .reply, let seen = state.dialogSeen[key], seen >= s.statusSince,
+                   ts > seen {
+                    set(&s, .running, ts); s.request = nil; s.confidence = .inferred
+                    state.dialogSeen[key] = nil
+                }
             case .unknown:
                 break
             }
@@ -343,6 +362,7 @@ public enum SessionReducer {
         for (key, s) in state.sessions {
             if s.status == .ended, now - s.statusSince > endedTTL {
                 state.sessions[key] = nil
+                state.dialogSeen[key] = nil
             } else if s.tmux == nil, s.status != .ended, now - s.lastEventAt > untrackedTTL {
                 var e = s
                 set(&e, .ended, now)
@@ -380,6 +400,7 @@ public enum SessionReducer {
                 state.sessions[key] = e
             }
             state.pendingIdle[key] = nil
+            state.dialogSeen[key] = nil
         }
         // Имя tmux-сессии и окно — из списка панелей: хук мог их не прислать, а сессию могли переименовать.
         let byPane = Dictionary(panes.map { ($0.pane, $0) }, uniquingKeysWith: { a, _ in a })
