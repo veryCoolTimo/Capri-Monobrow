@@ -31,6 +31,27 @@ public struct FrameClip: Equatable {
         return frames.last
     }
 
+    /// Как играть: один раз (стоп на последнем), по кругу, туда-обратно (без повтора крайних рисунков).
+    public enum Mode: Equatable { case once, loop, bounce }
+
+    public func frame(at tick: Int, mode: Mode) -> Int? {
+        switch mode {
+        case .once: return frame(at: tick, loop: false)
+        case .loop: return frame(at: tick, loop: true)
+        case .bounce:
+            guard frames.count > 2 else { return frame(at: tick, loop: true) }
+            let back = holds[1..<(holds.count - 1)].reduce(0, +)
+            var k = max(0, tick) % (total + back)
+            if k < total { return frame(at: k, loop: false) }
+            k -= total
+            for i in stride(from: frames.count - 2, through: 1, by: -1) {
+                if k < holds[i] { return frames[i] }
+                k -= holds[i]
+            }
+            return frames[1]
+        }
+    }
+
     /// Тот же клип, но ни один рисунок не держится дольше `cap` тиков.
     public func capped(_ cap: Int) -> FrameClip {
         FrameClip(frames: frames, holds: holds.map { min($0, cap) })

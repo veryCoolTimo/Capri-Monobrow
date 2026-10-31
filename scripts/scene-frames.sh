@@ -4,7 +4,8 @@
 # Capri должен быть запущен с --debug-control:
 #   open -a /Applications/Capri.app --args --background --debug-control
 # Использование: scripts/scene-frames.sh teleport teleport:window window takeover:terminal vibe \
-#   sessions thinking answer answer:sent reply reply:fail reply:corner music music:fail music:search teleport:controls
+#   sessions sessions:hover sessions:busy thinking answer answer:sent reply reply:fail reply:corner music music:fail music:search \
+#   teleport:controls
 set -euo pipefail
 MAC=${CAPRI_MAC:-timomac}
 cd "$(dirname "$0")/.."

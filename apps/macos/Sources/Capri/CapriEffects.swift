@@ -238,36 +238,118 @@ enum CapriFX {
     }
 }
 
-/// Кадр глаз с эффектами: рисунок вписан 2:1, поверх — глитч и молнии (обрезаны по кадру).
+/// Раскодированные рисунки: PNG разжимается один раз (а не на каждый кадр и каждую копию глитча), последние 64
+/// держатся в памяти (≈ 50 МБ на 576×360). Рисунки живут всё время работы (`ShowArt.shared`, `CapriArt`), так что
+/// ключ — сам объект.
+final class DecodedArt: @unchecked Sendable {
+    static let shared = DecodedArt()
+    static let capacity = 64
+
+    private let lock = NSLock()
+    private var cache: [ObjectIdentifier: CGImage] = [:]
+    private var order: [ObjectIdentifier] = []
+
+    func cgImage(_ image: NSImage) -> CGImage? {
+        let key = ObjectIdentifier(image)
+        lock.lock()
+        if let hit = cache[key] {
+            if let i = order.firstIndex(of: key) { order.remove(at: i) }
+            order.append(key)
+            lock.unlock()
+            return hit
+        }
+        lock.unlock()
+        guard let decoded = Self.decode(image) else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        cache[key] = decoded
+        order.append(key)
+        while order.count > Self.capacity { cache[order.removeFirst()] = nil }
+        return decoded
+    }
+
+    /// Рисует рисунок в растр его размера в пикселях — дальше кадр берёт готовые пиксели.
+    private static func decode(_ image: NSImage) -> CGImage? {
+        guard let src = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let w = src.width, h = src.height
+        guard w > 0, h > 0, let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return src }
+        ctx.draw(src, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage() ?? src
+    }
+}
+
+/// Кадр глаз с эффектами: рисунок вписан 2:1 (или, `fill`, заполняет кадр с обрезкой — крупная Capri в окнах,
+/// с движением `face`), поверх — глитч и молнии (обрезаны по кадру).
 struct CapriShotView: View {
     var image: NSImage?
     var glitch: CapriFX.Glitch?
     var bolt: CapriFX.Bolt?
+    var fill = false
+    var face: SceneFace?
 
     var body: some View {
         Canvas { ctx, size in
-            guard let image, image.size.height > 0 else { return }
+            guard let image, image.size.height > 0, size.height > 0 else { return }
             let aspect = image.size.width / image.size.height
-            let w = min(size.width, size.height * aspect), h = w / aspect
-            let r = CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
-            let art = ctx.resolve(Image(nsImage: image).resizable().interpolation(.high))
-            ctx.clip(to: Path(r))
+            let r: CGRect
+            // Где кадр виден: в fill рисунок больше кадра — глитч рисуем по видимой части, а не по всему рисунку.
+            var view = CGRect(origin: .zero, size: size)
+            if fill {
+                let s = face ?? SceneFace()
+                let th = CGFloat(s.tilt * .pi / 180)
+                // Запас, чтобы сдвиг и наклон не открывали края.
+                let over = 1 + 2 * abs(s.shift.dx) + 2 * abs(s.shift.dy) + abs(sin(th)) * (size.width / size.height + size.height / size.width)
+                let w = max(size.width, size.height * aspect) * max(1, s.zoom) * over, h = w / aspect
+                r = CGRect(x: (size.width - w) / 2 + s.shift.dx * size.width, y: (size.height - h) / 2 - s.shift.dy * size.height,
+                           width: w, height: h)
+                ctx.clip(to: Path(CGRect(origin: .zero, size: size)))
+                if th != 0 {
+                    ctx.translateBy(x: size.width / 2, y: size.height / 2)
+                    ctx.rotate(by: .radians(-Double(th)))
+                    ctx.translateBy(x: -size.width / 2, y: -size.height / 2)
+                }
+            } else {
+                let w = min(size.width, size.height * aspect), h = w / aspect
+                r = CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
+                ctx.clip(to: Path(r))
+                view = r
+            }
+            if face?.mirror == true {
+                ctx.translateBy(x: size.width, y: 0)
+                ctx.scaleBy(x: -1, y: 1)
+            }
+            // Готовые пиксели (`DecodedArt`); крупное лицо — интерполяция попроще: она всё равно увеличена.
+            let quality: Image.Interpolation = fill ? .medium : .high
+            let base = DecodedArt.shared.cgImage(image).map { Image(decorative: $0, scale: 1) } ?? Image(nsImage: image)
+            let art = ctx.resolve(base.resizable().interpolation(quality))
             ctx.draw(art, in: r)
-            if let glitch { draw(glitch, art: art, in: r, ctx: ctx) }
+            if let pulse = face?.pulse, pulse > 0 {
+                // Вспышка на сильную долю: светлее (+12 %) и розовый отблеск.
+                var c = ctx
+                c.blendMode = .screen
+                c.opacity = Double(pulse) * 0.12
+                c.draw(art, in: r)
+                c.opacity = Double(pulse) * 0.1
+                c.fill(Path(r), with: .color(CapriFX.hackPink))
+            }
+            if let glitch { draw(glitch, art: art, in: r, view: view, ctx: ctx) }
             if let bolt { draw(bolt, in: r, ctx: ctx) }
         }
     }
 
     /// Глитч: двойная экспозиция → кайма → мазки → сдвинутые полосы с цветным разносом → блоки → плашки → рваный край.
-    private func draw(_ g: CapriFX.Glitch, art: GraphicsContext.ResolvedImage, in r: CGRect, ctx: GraphicsContext) {
-        if g.level >= 4 { return hack(g, art: art, in: r, ctx: ctx) }
+    /// `r` — где рисунок, `v` — видимая часть кадра (полосы, блоки и край — по ней).
+    private func draw(_ g: CapriFX.Glitch, art: GraphicsContext.ResolvedImage, in r: CGRect, view v: CGRect, ctx: GraphicsContext) {
+        if g.level >= 4 { return hack(g, art: art, in: r, view: v, ctx: ctx) }
         func band(_ y: CGFloat, _ h: CGFloat) -> Path {
-            Path(CGRect(x: r.minX, y: r.minY + y * r.height, width: r.width, height: h * r.height))
+            Path(CGRect(x: v.minX, y: v.minY + y * v.height, width: v.width, height: h * v.height))
         }
         if g.ghost != 0 {
             var c = ctx
             c.opacity = 0.32
-            c.draw(art, in: r.offsetBy(dx: g.ghost * r.width, dy: 0))
+            c.draw(art, in: r.offsetBy(dx: g.ghost * v.width, dy: 0))
         }
         if g.level >= 2 {
             // Кайма: тонированные копии вразнос, «светлее» не выбеливает зелёный, но даёт цветной край у тёмного.
@@ -275,7 +357,7 @@ struct CapriShotView: View {
                 var c = ctx
                 c.blendMode = .lighten
                 c.addFilter(.colorMultiply(color))
-                c.draw(art, in: r.offsetBy(dx: dx * r.width * 0.6, dy: 0))
+                c.draw(art, in: r.offsetBy(dx: dx * v.width * 0.6, dy: 0))
             }
         }
         for m in g.smears {
@@ -283,7 +365,8 @@ struct CapriShotView: View {
             var c = ctx
             c.clip(to: band(m.y, m.h))
             let k = max(1, m.h / 0.006)
-            c.draw(art, in: CGRect(x: r.minX, y: r.minY + m.y * r.height - m.src * r.height * k,
+            // Строка рисунка `src` растянута от верха полосы.
+            c.draw(art, in: CGRect(x: r.minX, y: v.minY + m.y * v.height - m.src * r.height * k,
                                    width: r.width, height: r.height * k))
             c.blendMode = .screen
             c.fill(band(m.y, m.h), with: .color(CapriFX.tints[m.tint].opacity(0.45)))
@@ -291,38 +374,38 @@ struct CapriShotView: View {
         for s in g.slices {
             var c = ctx
             c.clip(to: band(s.y, s.h))
-            let shifted = r.offsetBy(dx: s.dx * r.width, dy: 0)
+            let shifted = r.offsetBy(dx: s.dx * v.width, dy: 0)
             c.draw(art, in: shifted)
             for (color, dx) in [(Palette.crimson, g.split), (Palette.violet, -g.split)] {
                 var t = c
                 t.blendMode = .screen
                 t.opacity = 0.8
                 t.addFilter(.colorMultiply(color))
-                t.draw(art, in: shifted.offsetBy(dx: dx * r.width, dy: 0))
+                t.draw(art, in: shifted.offsetBy(dx: dx * v.width, dy: 0))
             }
         }
         for b in g.blocks {
             var c = ctx
-            let rect = CGRect(x: r.minX + b.rect.minX * r.width, y: r.minY + b.rect.minY * r.height,
-                              width: b.rect.width * r.width, height: b.rect.height * r.height)
+            let rect = CGRect(x: v.minX + b.rect.minX * v.width, y: v.minY + b.rect.minY * v.height,
+                              width: b.rect.width * v.width, height: b.rect.height * v.height)
             c.clip(to: Path(rect))
-            c.draw(art, in: r.offsetBy(dx: b.dx * r.width, dy: b.dy * r.height))
+            c.draw(art, in: r.offsetBy(dx: b.dx * v.width, dy: b.dy * v.height))
         }
         for p in g.patches {
             var c = ctx
             c.blendMode = .screen
-            c.fill(Path(CGRect(x: r.minX + p.rect.minX * r.width, y: r.minY + p.rect.minY * r.height,
-                               width: p.rect.width * r.width, height: p.rect.height * r.height)),
+            c.fill(Path(CGRect(x: v.minX + p.rect.minX * v.width, y: v.minY + p.rect.minY * v.height,
+                               width: p.rect.width * v.width, height: p.rect.height * v.height)),
                    with: .color(CapriFX.tints[p.tint].opacity(0.6)))
         }
         if g.tear != 0 {
             // Рваный край: короткие белые и чёрные штрихи по левому и правому краю.
             var white = Path(), black = Path()
             for k in 0..<18 {
-                let y = r.minY + r.height * TickNoise.unit(g.tear, 600 + k)
-                let w = r.width * (0.01 + 0.06 * TickNoise.unit(g.tear, 620 + k))
-                let h = max(1, r.height * 0.008 * (1 + TickNoise.unit(g.tear, 640 + k)))
-                let x = k % 2 == 0 ? r.minX : r.maxX - w
+                let y = v.minY + v.height * TickNoise.unit(g.tear, 600 + k)
+                let w = v.width * (0.01 + 0.06 * TickNoise.unit(g.tear, 620 + k))
+                let h = max(1, v.height * 0.008 * (1 + TickNoise.unit(g.tear, 640 + k)))
+                let x = k % 2 == 0 ? v.minX : v.maxX - w
                 if TickNoise.unit(g.tear, 660 + k) < 0.5 { white.addRect(CGRect(x: x, y: y, width: w, height: h)) }
                 else { black.addRect(CGRect(x: x, y: y, width: w, height: h)) }
             }
@@ -343,8 +426,8 @@ struct CapriShotView: View {
 
     /// «Взлом»: чёрно-белый кадр, розовые клинья умножением (на белом — розовые, на чёрном — чёрные), рваные
     /// строки из растянутых строк и тонких штрихов, розовая молния-зигзаг, рваный край.
-    private func hack(_ g: CapriFX.Glitch, art: GraphicsContext.ResolvedImage, in r: CGRect, ctx: GraphicsContext) {
-        func at(_ p: CGPoint) -> CGPoint { CGPoint(x: r.minX + p.x * r.width, y: r.minY + p.y * r.height) }
+    private func hack(_ g: CapriFX.Glitch, art: GraphicsContext.ResolvedImage, in r: CGRect, view v: CGRect, ctx: GraphicsContext) {
+        func at(_ p: CGPoint) -> CGPoint { CGPoint(x: v.minX + p.x * v.width, y: v.minY + p.y * v.height) }
         var mono = ctx
         mono.addFilter(.colorMatrix(Self.mono))
         mono.draw(art, in: r)
@@ -356,28 +439,28 @@ struct CapriShotView: View {
         var streaks: [Path] = [Path(), Path(), Path(), Path()]
         let colors: [Color] = [.white, Color(white: 0.82), Color(white: 0.25), CapriFX.hackPink]
         for (n, m) in g.smears.enumerated() {
-            let y0 = r.minY + m.y * r.height, h = m.h * r.height
+            let y0 = v.minY + m.y * v.height, h = m.h * v.height
             var c = mono
-            c.clip(to: Path(CGRect(x: r.minX, y: y0, width: r.width, height: h)))
+            c.clip(to: Path(CGRect(x: v.minX, y: y0, width: v.width, height: h)))
             let k = max(1, m.h / 0.006)
             c.draw(art, in: CGRect(x: r.minX, y: y0 - m.src * r.height * k, width: r.width, height: r.height * k))
-            c.fill(Path(CGRect(x: r.minX, y: y0, width: r.width, height: h)), with: .color(.white.opacity(0.3)))
+            c.fill(Path(CGRect(x: v.minX, y: y0, width: v.width, height: h)), with: .color(.white.opacity(0.3)))
             for i in 0..<24 {
-                let x = r.minX + r.width * TickNoise.unit(n * 100 + i, 1000 + g.tear % 97)
+                let x = v.minX + v.width * TickNoise.unit(n * 100 + i, 1000 + g.tear % 97)
                 let yy = y0 + h * TickNoise.unit(n * 100 + i, 1100 + g.tear % 97)
-                let w = r.width * (0.01 + 0.08 * TickNoise.unit(n * 100 + i, 1200 + g.tear % 97))
-                streaks[i % 4].addRect(CGRect(x: x, y: yy, width: w, height: max(0.5, r.height * 0.005)))
+                let w = v.width * (0.01 + 0.08 * TickNoise.unit(n * 100 + i, 1200 + g.tear % 97))
+                streaks[i % 4].addRect(CGRect(x: x, y: yy, width: w, height: max(0.5, v.height * 0.005)))
             }
         }
         for (i, p) in streaks.enumerated() { ctx.fill(p, with: .color(colors[i])) }
         var zig = Path()
         zig.addLines(g.zigzag.map(at))
-        ctx.stroke(zig, with: .color(CapriFX.hackPink), lineWidth: max(1.2, r.height * 0.016))
+        ctx.stroke(zig, with: .color(CapriFX.hackPink), lineWidth: max(1.2, v.height * 0.016))
         var edge = Path()
         for k in 0..<16 {
-            let y = r.minY + r.height * TickNoise.unit(g.tear, 600 + k)
-            let w = r.width * (0.01 + 0.06 * TickNoise.unit(g.tear, 620 + k))
-            edge.addRect(CGRect(x: k % 2 == 0 ? r.minX : r.maxX - w, y: y, width: w, height: max(1, r.height * 0.01)))
+            let y = v.minY + v.height * TickNoise.unit(g.tear, 600 + k)
+            let w = v.width * (0.01 + 0.06 * TickNoise.unit(g.tear, 620 + k))
+            edge.addRect(CGRect(x: k % 2 == 0 ? v.minX : v.maxX - w, y: y, width: w, height: max(1, v.height * 0.01)))
         }
         ctx.fill(edge, with: .color(.white))
     }

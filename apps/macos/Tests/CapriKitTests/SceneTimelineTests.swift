@@ -13,7 +13,7 @@ final class SceneTimelineTests: XCTestCase {
         case .takeover: return SceneGeometry(home: home, target: target, area: SceneLayout.takeoverArea(window: nil, visible: visible), visible: visible)
         case .sessions, .thinking, .answer:
             let w = SceneLayout.windowForm(visible, kind: kind)
-            return SceneGeometry(home: home, target: SceneTimeline.eyesIn(kind, window: w), area: w, visible: visible)
+            return SceneGeometry(home: home, target: SceneTimeline.faceIn(kind, window: w), area: w, visible: visible)
         default: return SceneGeometry(home: home, target: target, visible: visible)
         }
     }
@@ -126,7 +126,7 @@ final class SceneTimelineTests: XCTestCase {
         let early = SceneTimeline.frame(.window, t: 1.3, geometry: g, clips: all, text: 12).window!
         XCTAssertLessThan(early.typed, 12)
         XCTAssertTrue(w.contains(SceneTimeline.closeRect(w)))
-        XCTAssertTrue(w.contains(SceneTimeline.eyesInWindow(w)))
+        XCTAssertTrue(w.contains(SceneTimeline.faceIn(.window, window: w)))
         XCTAssertEqual(SceneTimeline.frame(.window, t: 7.3, geometry: g, clips: all).clip, "melt")
     }
 

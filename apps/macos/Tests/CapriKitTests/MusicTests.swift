@@ -176,7 +176,7 @@ final class MusicTests: XCTestCase {
     let home = CGRect(x: 600, y: 950, width: 32, height: 16)
     var geometry: SceneGeometry {
         let w = SceneLayout.windowForm(visible, kind: .music)
-        return SceneGeometry(home: home, target: SceneTimeline.eyesIn(.music, window: w), area: w, visible: visible)
+        return SceneGeometry(home: home, target: SceneTimeline.faceIn(.music, window: w), area: w, visible: visible)
     }
 
     func frame(_ t: Double, _ marks: [SceneMusicMark], clips: Set<String> = Set(SceneClip.all), lag: Double = 0) -> SceneFrame {
@@ -189,24 +189,60 @@ final class MusicTests: XCTestCase {
     func testMusicWindowClipsPerState() {
         let marks = [SceneMusicMark(t: 1.0, state: .searching), SceneMusicMark(t: 2.5, state: .playing),
                      SceneMusicMark(t: 4.5, state: .paused), SceneMusicMark(t: 5.2, state: .playing)]
-        XCTAssertEqual(frame(0.8, marks).clip, "slits", "раскрывается щёлками")
-        XCTAssertEqual(frame(1.5, marks).clip, "slits")
+        XCTAssertEqual(frame(0.8, marks).clip, "hair_bob", "раскрывается в волосах (не как «думает»)")
+        XCTAssertEqual(frame(1.5, marks).clip, "side_look")
+        XCTAssertTrue(frame(1.5, marks).clipMode == .bounce)
         XCTAssertNotNil(frame(1.5, marks).window?.scan, "ищет — сканлайн")
-        XCTAssertEqual(frame(2.7, marks).clip, "burst", "трек пошёл — взрыв глаз")
-        let nod = (0..<20).map { frame(3.5 + Double($0) / 24, marks) }
-        XCTAssertEqual(Set(nod.map(\.clip)), ["look", "slits"], "кивает")
+        XCTAssertEqual(frame(2.7, marks).clip, "eye_zoom", "трек пошёл — наезд в глаз")
+        let nod = (0..<24).map { frame(3.5 + Double($0) / 24, marks) }
+        XCTAssertEqual(Set(nod.map(\.clip)), ["hair_bob"], "кивает в волосах")
+        XCTAssertGreaterThan(Set(nod.map { Int(($0.face!.shift.dy * 1000).rounded()) }).count, 3, "кивок")
+        XCTAssertGreaterThan(Set(nod.map { Int(($0.face!.tilt * 10).rounded()) }).count, 3, "покачивание")
+        XCTAssertTrue(nod.contains { $0.face!.zoom > 1.02 }, "удар на долю")
         XCTAssertFalse(nod.allSatisfy { $0.notes.isEmpty }, "ноты")
-        XCTAssertEqual(frame(4.8, marks).clip, "close", "пауза — закрытые глаза")
-        XCTAssertFalse(frame(4.8, marks).loop, "держит последний кадр")
-        XCTAssertEqual(frame(5.4, marks).clip, "appear", "снова играет — появление")
+        XCTAssertEqual(frame(4.8, marks).clip, "face_nod", "пауза — прикрыла глаза")
+        XCTAssertEqual(frame(5.1, marks).clipT, 1.9, accuracy: 1e-9, "держит закрытые глаза")
+        XCTAssertGreaterThanOrEqual(frame(4.5, marks).clipT, 1.3, "пауза — сразу к закрытым глазам")
+        XCTAssertEqual(frame(1.5, marks).face?.mirror, true, "ищет — зеркально, не как «думает»")
+        XCTAssertEqual(frame(5.4, marks).clip, "face_nod", "снова играет — открывает глаза")
+        XCTAssertGreaterThanOrEqual(frame(5.4, marks).clipT, 2.5)
+        XCTAssertEqual(frame(6.0, marks).clip, "hair_bob")
         let failed = [SceneMusicMark(t: 1.0, state: .searching), SceneMusicMark(t: 7.0, state: .failed)]
         XCTAssertEqual(frame(7.2, failed).clip, "crazy")
         XCTAssertEqual(frame(7.2, failed).glitch, 3)
+        // Старые клипы: как в проходе 2.
+        let old = Set(SceneClip.all).subtracting([SceneClip.faceNod, SceneClip.hairBob, SceneClip.sideLook, SceneClip.eyeZoom])
+        XCTAssertEqual(frame(1.5, marks, clips: old).clip, "slits")
+        XCTAssertEqual(frame(2.7, marks, clips: old).clip, "burst")
+        XCTAssertEqual(Set((0..<20).map { frame(3.5 + Double($0) / 24, marks, clips: old).clip }), ["look", "slits"])
+        XCTAssertEqual(frame(4.8, marks, clips: old).clip, "close")
+        XCTAssertEqual(frame(5.4, marks, clips: old).clip, "appear")
         // Без клипов сериала — look/close.
         for t in stride(from: 0.0, to: 10, by: 0.1) {
             let f = frame(t, marks, clips: [])
             XCTAssertTrue(["look", "close"].contains(f.clip) || f.eyes == nil, "\(t) \(f.clip)")
         }
+    }
+
+    /// Глитч сильной доли не теряется при 12 fps с любым сдвигом кадров.
+    func testStrongBeatSeenAt12fps() {
+        let beatLen = 60 / SceneTimeline.bpm
+        for phase in stride(from: 0.0, to: 1.0 / 12, by: 0.01) {
+            for bar in 0..<4 {
+                let start = Double(bar * 4) * beatLen
+                let hits = stride(from: start - 0.05 + phase, to: start + beatLen, by: 1.0 / 12).filter { $0 >= 0 && SceneTimeline.strongBeat($0) }
+                XCTAssertFalse(hits.isEmpty, "доля \(bar * 4), сдвиг \(phase)")
+            }
+        }
+    }
+
+    func testGrooveStrongBeat() {
+        let beat = 60 / SceneTimeline.bpm
+        XCTAssertGreaterThan(SceneTimeline.groove(0.01, height: 200).pulse, 0.8, "сильная доля — вспышка")
+        XCTAssertEqual(SceneTimeline.groove(beat + 0.01, height: 200).pulse, 0, "слабая — нет")
+        XCTAssertGreaterThan(SceneTimeline.groove(beat + 0.01, height: 200).zoom, 1.03, "удар на каждую долю")
+        XCTAssertEqual(SceneTimeline.groove(beat * 0.5, height: 200).zoom, 1)
+        XCTAssertEqual(abs(SceneTimeline.groove(beat * 0.5, height: 200).tilt), 1.5, accuracy: 1e-6)
     }
 
     func testMusicWindowDurationFollowsMarks() {
@@ -222,8 +258,8 @@ final class MusicTests: XCTestCase {
         // Держали мышью: таймлайн стоит на 3.0, стена — 9.0; клик «пауза» на стене 9.0, через 0.2 с — начало клипа.
         let marks = [SceneMusicMark(t: 1.0, state: .playing), SceneMusicMark(t: 3.0, wall: 9.0, state: .paused)]
         let f = frame(3.0, marks, lag: 6.2)
-        XCTAssertEqual(f.clip, "close")
-        XCTAssertEqual(f.clipT, 0.2, accuracy: 1e-9)
+        XCTAssertEqual(f.clip, "face_nod")
+        XCTAssertEqual(f.clipT, 1.5, accuracy: 1e-9, "кивок с 1,3 с клипа, 0,2 с от клика")
     }
 
     func testMusicHotspotsAndEyeControls() {
@@ -236,9 +272,10 @@ final class MusicTests: XCTestCase {
             XCTAssertTrue(w.contains(b.rect))
             XCTAssertEqual(SceneLayout.hit(spots, CGPoint(x: b.rect.midX, y: b.rect.midY))?.kind, .button(b.id))
         }
-        // Строка трека — между кнопками и глазами.
-        let eyes = SceneTimeline.eyesIn(.music, window: w)
-        XCTAssertLessThan(SceneTimeline.musicLine(w).y, eyes.minY)
+        // Строка трека — на полосе внизу лица, кнопки — под лицом.
+        let face = SceneTimeline.faceIn(.music, window: w)
+        XCTAssertGreaterThan(SceneTimeline.musicLine(w).y, face.minY)
+        XCTAssertLessThan(SceneTimeline.musicLine(w).y, face.minY + SceneTimeline.faceBand(.music))
         XCTAssertGreaterThan(SceneTimeline.musicLine(w).y, SceneTimeline.musicButtons(w)[0].rect.maxY)
         // Под глазами телепорта: только если музыка известна и навели на глаза.
         let tg = SceneGeometry(home: home, target: SceneLayout.corner(visible, size: SceneTimeline.eyesSize), visible: visible)

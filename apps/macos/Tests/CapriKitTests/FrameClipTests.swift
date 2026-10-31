@@ -12,6 +12,14 @@ final class FrameClipTests: XCTestCase {
         XCTAssertNil(FrameClip(frames: [], holds: []).frame(at: 0, loop: true))
     }
 
+    func testBounce() {
+        // Туда-обратно без повтора крайних: 10 10 10 11 12 12 | 11 | 10 …
+        XCTAssertEqual((0..<9).map { clip.frame(at: $0, mode: .bounce) }, [10, 10, 10, 11, 12, 12, 11, 10, 10])
+        XCTAssertEqual(clip.frame(at: 100, mode: .once), 12)
+        XCTAssertEqual(clip.frame(at: 7, mode: .loop), 10)
+        XCTAssertEqual(FrameClip(frames: [1, 2], holds: [1, 1]).frame(at: 3, mode: .bounce), 2, "2 рисунка — по кругу")
+    }
+
     func testCapHoldConcat() {
         XCTAssertEqual(clip.capped(1).holds, [1, 1, 1])
         XCTAssertEqual(clip.holdingLast(9).holds, [3, 1, 9])

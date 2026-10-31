@@ -100,6 +100,8 @@ struct SceneRun: Equatable {
     var marks: [SceneMusicMark] = []
     /// ⏮ ⏯ ⏭ под глазами показаны (курсор на глазах или на кнопках).
     var controls = false
+    /// Стена, когда сменилась горячая точка под курсором (окно сессий: наезд в глаз над строкой).
+    var hoverAt = 0.0
 
     var options: SceneOptions {
         var o = SceneOptions(text: content.status.count, lines: content.lines.map(\.count), rows: min(content.rows.count, rowsCap),
@@ -109,6 +111,8 @@ struct SceneRun: Equatable {
         o.musicMarks = marks
         o.musicKnown = content.track != nil
         o.controls = controls
+        if case .row(let i)? = hover { o.hoverRow = i }
+        o.hoverAt = hoverAt
         return o
     }
 
@@ -126,9 +130,9 @@ struct SceneRun: Equatable {
     func frame(wall w: Double) -> SceneFrame {
         let t = clock.time(w)
         var o = options
-        if kind == .music { o.lag = clock.lag(w) }
+        o.lag = clock.lag(w)
         var f = SceneTimeline.frame(kind, t: t, geometry: geometry, clips: clips, options: o, abortedAt: abortedAt)
-        if kind != .music, abortedAt == nil, SceneTimeline.calm(kind, o)?.contains(t) == true { f.clipT += clock.lag(w) }
+        if !f.wallClock, abortedAt == nil, SceneTimeline.calm(kind, o)?.contains(t) == true { f.clipT += clock.lag(w) }
         return f
     }
 
@@ -153,8 +157,9 @@ final class StageModel: ObservableObject {
 
 /// Расписание кадров сцены по стене: 24 fps, в спокойной части (`SceneTimeline.calm`) — 12 fps. Панель сцены
 /// большая (notch ∪ цель), каждый кадр перерисовывает её целиком — лишние кадры в покое стоят батареи.
-/// Пока сцену держат, конца нет, но и кадров меньше — 4 fps (глаза дышат медленно, окно стоит); отпустили —
-/// `SceneRun` меняется, и расписание пересоздаётся. Наведение и подсветка тоже меняют `SceneRun` — отклик сразу.
+/// Пока сцену держат, конца нет, но и кадров меньше — 4 fps (глаза дышат медленно, окно стоит); у крупного лица
+/// (окна, `reply`: клип и движение идут по стене) — те же 12 fps, иначе оно дёргается. Отпустили — `SceneRun`
+/// меняется, и расписание пересоздаётся. Наведение и подсветка тоже меняют `SceneRun` — отклик сразу.
 struct SceneSchedule: TimelineSchedule {
     var run: SceneRun
     static let frozenInterval = 1.0 / 4
@@ -162,13 +167,17 @@ struct SceneSchedule: TimelineSchedule {
     func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
         var w = max(0, startDate.timeIntervalSince(run.start))
         let o = run.options
+        // Крупное лицо живёт по стене — замедлять нечего.
         let frozen = run.clock.frozen
+        let slow = frozen && !SceneTimeline.usesFace(run.kind)
         let wallEnd = frozen ? Double.infinity : run.end + run.clock.held + 0.1
         return AnyIterator {
             guard w <= wallEnd else { return nil }
             let date = run.start.addingTimeInterval(w)
             let step = SceneTimeline.frameInterval(run.kind, t: run.clock.time(w), aborted: run.abortedAt != nil, options: o)
-            w += frozen ? max(step, Self.frozenInterval) : step
+            // Секунду после смены наведения (наезд в глаз над строкой) — 12 fps и при удержании.
+            let fresh = run.hoverAt > 0 && w - run.hoverAt < 1
+            w += slow && !fresh ? max(step, Self.frozenInterval) : step
             return date
         }
     }
@@ -212,7 +221,8 @@ struct SceneCanvas: View {
                 let r = local(e)
                 SceneEyes(frame: frame, t: t)
                     .frame(width: r.width, height: r.height)
-                    .scaleEffect(x: 1 + (1 - frame.squash) * 0.25, y: max(0.02, frame.squash))
+                    // Лицо в окне не шире рамки; глаза на столе при сплющивании чуть раздаются вширь.
+                    .scaleEffect(x: frame.face != nil ? 1 : 1 + (1 - frame.squash) * 0.25, y: max(0.02, frame.squash))
                     .position(x: r.midX, y: r.midY)
             }
             Canvas { ctx, _ in drawFront(ctx) }
@@ -288,28 +298,25 @@ struct SceneCanvas: View {
             cross.move(to: CGPoint(x: x.maxX - 5, y: x.minY + 5)); cross.addLine(to: CGPoint(x: x.minX + 5, y: x.maxY - 5))
             c.stroke(cross, with: .color(pink), lineWidth: 1.4)
             StageWindows.drawPin(local(SceneTimeline.pinRect(w.rect)), pinned: run.clock.pinned, hover: run.hover == .pin, c)
-            if run.kind == .window {
-                // Строка статуса, печатается побуквенно; кликабельна — основное окно.
-                let text = String(run.content.status.prefix(w.typed))
-                let caret = w.typed < run.content.status.count || w.caret ? "▮" : " "
-                if run.hover == .button("status") {
-                    let sr = local(SceneTimeline.statusRect(w.rect))
-                    c.fill(Path(sr), with: .color(pink.opacity(0.14)))
-                    c.fill(Path(CGRect(x: sr.minX, y: sr.minY, width: 2, height: sr.height)), with: .color(Palette.acid))
-                }
-                c.draw(Text("> " + text + caret).font(.mono(11, .semibold)).foregroundColor(Palette.text),
-                       at: CGPoint(x: r.minX + 12, y: r.maxY - 18), anchor: .leading)
-            } else {
-                StageWindows(run: run, window: w, local: { self.local($0) }, localPoint: { self.local($0) }, t: t).draw(c)
-            }
-            // Уголки-скобки HUD.
-            var ticks = Path()
-            for (px, py, sx, sy) in [(r.minX, r.maxY, 1.0, -1.0), (r.maxX, r.maxY, -1.0, -1.0)] {
-                ticks.move(to: CGPoint(x: px + 4 * sx, y: py + 10 * sy)); ticks.addLine(to: CGPoint(x: px + 4 * sx, y: py + 4 * sy))
-                ticks.addLine(to: CGPoint(x: px + 10 * sx, y: py + 4 * sy))
-            }
-            c.stroke(ticks, with: .color(pink.opacity(0.7)), lineWidth: 1)
         }
+    }
+
+    /// Поверх лица: подписи на полосе-градиенте, строки и кнопки, рамка и уголки HUD (лицо закрывает тело окна).
+    private func drawWindowFront(_ w: SceneWindow, _ ctx: GraphicsContext) {
+        guard w.open >= 1, w.chrome else { return }
+        let r = local(w.rect)
+        let pink = CapriFX.hackPink
+        var c = ctx
+        if w.melt > 0 { c.opacity = Double(max(0, 1 - w.melt * 1.4)) }
+        StageWindows(run: run, window: w, local: { self.local($0) }, localPoint: { self.local($0) }, t: t).draw(c)
+        c.stroke(Path(r.insetBy(dx: 0.5, dy: 0.5)), with: .color(pink), lineWidth: 1)
+        // Уголки-скобки HUD.
+        var ticks = Path()
+        for (px, py, sx, sy) in [(r.minX, r.maxY, 1.0, -1.0), (r.maxX, r.maxY, -1.0, -1.0)] {
+            ticks.move(to: CGPoint(x: px + 4 * sx, y: py + 10 * sy)); ticks.addLine(to: CGPoint(x: px + 4 * sx, y: py + 4 * sy))
+            ticks.addLine(to: CGPoint(x: px + 10 * sx, y: py + 4 * sy))
+        }
+        c.stroke(ticks, with: .color(pink.opacity(0.7)), lineWidth: 1)
     }
 
     private func drawTakeover(_ k: SceneTakeover, _ ctx: GraphicsContext) {
@@ -417,6 +424,7 @@ struct SceneCanvas: View {
     // MARK: передний план
 
     private func drawFront(_ ctx: GraphicsContext) {
+        if let w = frame.window { drawWindowFront(w, ctx) }
         if let b = frame.bolt { drawBolt(b, ctx, width: 3) }
         if frame.flash > 0, let at = frame.flashAt {
             // Вспышка 2 кадра: белое ядро-звезда и розовое кольцо, без мягкого «шара».
@@ -536,9 +544,9 @@ struct SceneEyes: View {
 
     var body: some View {
         let tick = Int(t * CapriFace.fps)
-        CapriShotView(image: SceneArt.image(frame.clip, t: frame.clipT, loop: frame.loop),
+        CapriShotView(image: SceneArt.image(frame.clip, t: frame.clipT, mode: frame.clipMode),
                       glitch: frame.glitch > 0 ? CapriFX.make(level: frame.glitch, tick: tick, strength: 1) : nil,
-                      bolt: nil)
+                      bolt: nil, fill: frame.face != nil, face: frame.face)
     }
 }
 
@@ -550,8 +558,8 @@ enum SceneArt {
         return []
     }
 
-    static func image(_ clip: String, t: Double, loop: Bool) -> NSImage? {
-        if let show = ShowArt.shared { return show.image(clip: clip, t: t, loop: loop) }
+    static func image(_ clip: String, t: Double, mode: FrameClip.Mode) -> NSImage? {
+        if let show = ShowArt.shared { return show.image(clip: clip, t: t, mode: mode) }
         return CapriArt.images[CapriArt.frame(clip: clip, t: t)]
     }
 
@@ -665,20 +673,22 @@ final class StageController {
             }
         case .window:
             area = SceneLayout.windowForm(visible)
-            target = SceneTimeline.eyesInWindow(area!)
+            target = SceneTimeline.faceIn(.window, window: area!)
         case .sessions, .thinking, .answer, .music:
             var o = SceneOptions(rows: rowsCap, answerLines: content.answer.count)
             o.proposal = content.proposal != nil
             let size = SceneTimeline.windowSize(kind, o)
             area = around.map { SceneLayout.resized($0, to: size, visible: visible) } ?? SceneLayout.windowForm(visible, kind: kind, options: o)
-            target = SceneTimeline.eyesIn(kind, window: area!)
+            target = SceneTimeline.faceIn(kind, window: area!)
         case .reply:
+            // Крупное лицо 200×125 вместо полосы глаз (у терминала без места сверху — полоса глаз, `atTerminal`).
+            target = SceneLayout.corner(visible, size: SceneTimeline.replySize)
             var w = variant == "corner" ? nil : terminal
             if w == nil, variant != "corner", backdrop {
                 w = CGRect(x: visible.maxX - 860, y: visible.minY + 80, width: 760, height: 460)
             }
             if let w {
-                target = SceneLayout.atTerminal(w, visible: visible); lastTarget = "terminal"; backdropWindow = w
+                target = SceneLayout.atTerminal(w, visible: visible, size: SceneTimeline.replySize); lastTarget = "terminal"; backdropWindow = w
             }
         case .takeover:
             var w: CGRect?
@@ -857,6 +867,11 @@ final class StageController {
         return SceneLayout.hit(run.hotspots(wall: run.wall()), p)
     }
 
+    static func isRow(_ k: SceneHotspot.Kind?) -> Bool {
+        if case .row? = k { return true }
+        return false
+    }
+
     static func isMusicButton(_ k: SceneHotspot.Kind) -> Bool {
         if case .button(let id) = k { return MusicCommand(button: id) != nil }
         return false
@@ -883,6 +898,8 @@ final class StageController {
         let holding = over != nil
         guard controlsChanged || holding != run.clock.holding || over?.kind != run.hover else { return }
         if holding != run.clock.holding { run.clock.hold(holding, wall: w, calm: run.calm(wall: w)) }
+        // Наезд в глаз и 12 fps на секунду — только когда курсор входит в строку сессий или уходит с неё.
+        if over?.kind != run.hover, Self.isRow(over?.kind) || Self.isRow(run.hover) { run.hoverAt = w }
         run.hover = over?.kind
         model.run = run
         reschedule()
@@ -1074,6 +1091,12 @@ final class StageController {
         if kind == .reply, run.content.delivered == nil { run.content.delivered = variant != "fail" }
         if kind == .reply, variant == "fail" { run.failedAt = 2.0 }
         if kind == .answer, variant == "sent" { run.burstAt = 4.0 }
+        if kind == .sessions, variant == "hover" {
+            // Курсор на строке 2-й с 3 с до 5 с (наезд в глаз); лист — по таймлайну, удержания нет.
+            run.hover = .row(min(1, max(0, run.rowsCap - 1)))
+            run.hoverAt = 3.0
+        }
+        if kind == .sessions, variant == "busy" { run.content.waiting = 3 }
         if kind == .music {
             // Лист: ищет → (играет, пауза, снова играет) / не нашла / нужен ключ.
             if run.content.track == nil { run.content.track = "Test Artist — Test Track" }
@@ -1138,11 +1161,11 @@ final class StageController {
         case .window: [0.3, 0.45, 0.7, 0.85, 0.95, 1.5, 2.5, 7.1, 7.3, 7.5, 7.7]
         case .takeover: [0.6, 0.9, 1.3, 1.9, 2.3, 2.8, 3.4, 3.9, 4.1, 4.4]
         case .vibe: [0.3, 0.5, 1.0, 1.3, 2.0, 3.0, 6.6]
-        case .sessions: [0.3, 0.7, 0.9, 1.2, 1.5, 3.0, 7.3, 7.5, 7.7]
-        case .thinking: [0.7, 0.9, 1.2, 1.5, 2.6, 3.4]
-        case .answer: [0.7, 0.9, 1.2, 2.0, 4.2, 4.6]
-        case .reply: [0.15, 0.4, 0.7, 1.0, 1.2, 1.7, 2.2, 3.0, 3.5, 3.8]
-        case .music: [0.7, 0.9, 1.2, 2.6, 2.8, 3.1, 4.6, 4.8, 5.4, 6.2]
+        case .sessions: [0.3, 0.7, 0.9, 1.2, 1.5, 2.2, 3.0, 3.1, 3.3, 3.6, 4.4, 7.3, 7.5, 7.7]
+        case .thinking: [0.7, 0.9, 1.2, 1.5, 2.6, 3.4, 4.3, 5.1]
+        case .answer: [0.7, 0.9, 1.2, 2.0, 4.2, 4.6, 5.0, 5.6, 6.0]
+        case .reply: [0.15, 0.4, 0.7, 1.0, 1.2, 1.7, 2.2, 2.6, 2.9, 3.2, 3.5, 3.8]
+        case .music: [0.7, 0.9, 1.2, 2.6, 2.8, 3.1, 3.55, 3.7, 4.6, 4.8, 5.4, 5.6, 6.2]
         }
     }
 

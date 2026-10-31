@@ -18,8 +18,24 @@ public enum SceneClip {
     public static let melt = "melt"
     public static let texMosh = "tex_mosh"
     public static let texGraffiti = "tex_graffiti"
+    // Проход 3: крупная Capri в окнах (16:10, рисуются aspect-fill по лицу окна).
+    /// Маска целиком: глаза + рот хлопает.
+    public static let faceTalk = "face_talk"
+    /// Кивок, глаза большие, довольные закрытые глаза ^^ (1,5–2,5 с), снова открыла.
+    public static let faceNod = "face_nod"
+    /// Крупно два глаза, камера ведёт вбок (играть туда-обратно).
+    public static let faceScan = "face_scan"
+    /// Оскал, глитч, зажмурилась, взрыв глаз (с 2,17 с).
+    public static let faceGrin = "face_grin"
+    /// По плечи в розовых волосах, петля.
+    public static let hairBob = "hair_bob"
+    /// Голова набок, взгляд в сторону, прищур.
+    public static let sideLook = "side_look"
+    /// Наезд в один глаз до огромного зрачка.
+    public static let eyeZoom = "eye_zoom"
     /// Все известные клипы (что `ShowArt` читает из `clips.json`).
-    public static let all = [look, close, many, slits, appear, talk, shut, burst, crazy, teleOut, teleIn, melt, texMosh, texGraffiti]
+    public static let all = [look, close, many, slits, appear, talk, shut, burst, crazy, teleOut, teleIn, melt, texMosh, texGraffiti,
+                             faceTalk, faceNod, faceScan, faceGrin, hairBob, sideLook, eyeZoom]
 }
 
 /// Сцены персонажа на рабочем столе: короткие представления, после которых глаза снова только в notch. Фоновые —
@@ -98,6 +114,9 @@ public struct SceneOptions: Equatable {
     public var controls = false
     /// Насколько таймлайн отстал от стены (удержание): клипы окна музыки идут по стене, состояние — по таймлайну.
     public var lag = 0.0
+    /// Окно сессий: строка под курсором и стена, когда наведение сменилось (наезд в глаз / глитч возврата).
+    public var hoverRow: Int?
+    public var hoverAt = 0.0
 
     public init(text: Int = 0, lines: [Int] = [], rows: Int = 0, waiting: Int = 0, answerLines: Int = 0, answerChars: Int = 0,
                 proposal: Bool = false, continued: Bool = false, burstAt: Double? = nil, caption: Int = 0, failedAt: Double? = nil) {
@@ -216,6 +235,22 @@ public struct SceneNote: Equatable {
     public var glyph: Int
 }
 
+/// Крупная Capri в окне: клип рисуется aspect-fill с обрезкой по прямоугольнику глаз, поверх — процедурное
+/// движение (детерминировано по времени): сдвиг (доли размера; `dy` > 0 — вверх), масштаб, наклон (градусы),
+/// вспышка яркости 0…1.
+public struct SceneFace: Equatable {
+    public var shift: CGVector
+    public var zoom: CGFloat
+    public var tilt: Double
+    public var pulse: CGFloat
+    /// Отразить по горизонтали (тот же клип в другом окне выглядит иначе).
+    public var mirror: Bool
+
+    public init(shift: CGVector = .zero, zoom: CGFloat = 1, tilt: Double = 0, pulse: CGFloat = 0, mirror: Bool = false) {
+        self.shift = shift; self.zoom = zoom; self.tilt = tilt; self.pulse = pulse; self.mirror = mirror
+    }
+}
+
 /// Кадр сцены в момент `t`.
 public struct SceneFrame: Equatable {
     /// Фаза — для тестов и `dump`.
@@ -225,7 +260,8 @@ public struct SceneFrame: Equatable {
     /// Клип сериала, секунды от его начала, по кругу или с остановкой на последнем.
     public var clip: String = SceneClip.look
     public var clipT: Double = 0
-    public var loop = true
+    /// Как играть клип: один раз (стоп на последнем), по кругу, туда-обратно.
+    public var clipMode: FrameClip.Mode = .loop
     /// 1 — обычные глаза, → 0 — сплющены в линию.
     public var squash: CGFloat = 1
     /// Уровень глитча глаз (0 — нет).
@@ -242,6 +278,26 @@ public struct SceneFrame: Equatable {
     public var caption: SceneCaption?
     /// Сцена кончилась — глаза снова в notch.
     public var done = false
+    /// Лицо: клип заполняет `eyes` (aspect-fill) с движением; nil — глаза вписаны как раньше. В окнах `eyes` —
+    /// прямоугольник лица (`faceRect`), а не полоса глаз 2:1.
+    public var face: SceneFace?
+    /// `clipT` уже считан по стене (`SceneOptions.lag`) — показ не добавляет отставание удержания.
+    public var wallClock = false
+
+    public init(phase: String, eyes: CGRect?, clip: String = SceneClip.look, clipT: Double = 0, loop: Bool = true,
+                glitch: Int = 0, done: Bool = false) {
+        self.phase = phase; self.eyes = eyes; self.clip = clip; self.clipT = clipT
+        self.clipMode = loop ? .loop : .once; self.glitch = glitch; self.done = done
+    }
+
+    /// Клип идёт по кругу (или туда-обратно); false — стоп на последнем рисунке.
+    public var loop: Bool {
+        get { clipMode != .once }
+        set { clipMode = newValue ? .loop : .once }
+    }
+
+    /// Прямоугольник крупного лица (окна, `reply`); nil — на столе обычные глаза.
+    public var faceRect: CGRect? { face != nil ? eyes : nil }
 
     public static func home(_ phase: String = "home") -> SceneFrame { SceneFrame(phase: phase, eyes: nil, done: true) }
 }
@@ -249,7 +305,9 @@ public struct SceneFrame: Equatable {
 public enum SceneTimeline {
     /// Глаза на столе — полоса 2:1.
     public static let eyesSize = CGSize(width: 120, height: 60)
-    public static let windowSize = CGSize(width: 280, height: 170)
+    public static let windowSize = CGSize(width: 300, height: 210)
+    /// Лицо у терминала (`reply`), 16:10.
+    public static let replySize = CGSize(width: 200, height: 125)
     public static let takeoverSize = CGSize(width: 480, height: 300)
     /// Обрыв (`needsInput`): молния домой.
     public static let recallDuration = 0.35
@@ -321,7 +379,7 @@ public enum SceneTimeline {
         guard t >= 0, t < duration(kind, o) else { return .home() }
         switch kind {
         case .teleport: return teleport(t, g, clips)
-        case .window: return windowForm(t, g, clips, o.text)
+        case .window: return windowForm(t, g, clips, o)
         case .takeover: return takeover(t, g, clips, o.lines)
         case .vibe: return vibe(t, g, clips)
         case .sessions, .thinking, .answer, .music: return boxed(kind, t, g, clips, o)
@@ -413,55 +471,57 @@ public enum SceneTimeline {
 
     // MARK: B. Окно
 
-    /// Глаза внутри окна: под заголовком, по центру.
-    public static func eyesInWindow(_ w: CGRect) -> CGRect {
-        let h: CGFloat = 70, wd = h * 2
-        return CGRect(x: w.midX - wd / 2, y: w.maxY - 22 - 8 - h, width: wd, height: h)
-    }
-
     /// «×» окна (глобальные координаты) — единственная кликабельная точка сцены.
     public static func closeRect(_ w: CGRect) -> CGRect {
         CGRect(x: w.maxX - 22, y: w.maxY - 20, width: 18, height: 18)
     }
 
-    static func windowForm(_ t: Double, _ g: SceneGeometry, _ c: Set<String>, _ text: Int) -> SceneFrame {
+    /// Окно статуса. Покой (1,0–7,0) — по стене (`o.lag`): с удержанием таймлайн стоит, Capri и печать — нет.
+    static func windowForm(_ t: Double, _ g: SceneGeometry, _ c: Set<String>, _ o: SceneOptions) -> SceneFrame {
+        let text = o.text
         let w = g.area ?? g.target
-        let eyes = eyesInWindow(w)
+        let face = faceIn(.window, window: w)
+        let eyes = strip(face)
         let line = CGRect(x: eyes.minX, y: eyes.midY - 1, width: eyes.width, height: 2)
         switch t {
         case ..<0.25: return out("out", at: g.home, t, len: 0.25, c)
         case ..<0.4: return jump("jump", from: g.home, to: eyes, t - 0.25, len: 0.15)
         case ..<0.6: return into("in", at: eyes, t - 0.4, len: 0.2, c)
         case ..<1.0:
-            // Из линии глаз: рамка растёт по горизонтали, потом по вертикали.
+            // Из линии глаз: рамка растёт по горизонтали, потом по вертикали; лицо раскрывается вместе с ней.
             let p = CGFloat((t - 0.6) / 0.4)
-            var f = SceneFrame(phase: "unfold", eyes: eyes, clip: SceneClip.look, clipT: t - 0.6)
-            f.squash = p < 0.5 ? 0.06 : 0.06 + 0.94 * (p - 0.5) * 2
-            f.glitch = 1
-            let rect: CGRect
-            if p < 0.5 {
-                let k = p * 2, wd = line.width + (w.width - line.width) * k
-                rect = CGRect(x: w.midX - wd / 2, y: line.midY - 1, width: wd, height: 2)
-            } else {
-                let k = (p - 0.5) * 2, h = 2 + (w.height - 2) * k
-                rect = CGRect(x: w.minX, y: line.midY - (line.midY - w.minY) * k - 1, width: w.width, height: h)
-                    .intersection(w)
-            }
-            f.window = SceneWindow(rect: rect, open: p, chrome: false, melt: 0, typed: 0, caret: false)
-            return f
+            return unfoldFrame(p, w, face, line, clip: pick([SceneClip.faceTalk, SceneClip.look], c), clipT: t - 0.6, loop: true)
         case ..<7.0:
-            let typing = max(0, t - 1.2)
-            let typed = min(text, Int(typing * 18))
+            // Говорит маской (`face_talk`) крупнее, чем в ответе, и без кивка — голова чуть плывёт вбок; напечатано —
+            // зеркальный крупный план глаз, камера плывёт вверх-вниз (у сессий — вбок, без зеркала).
+            let tw = t + o.lag
+            let typed = min(text, Int(max(0, tw - 1.2) * 18))
             let talking = typed < text
-            var f = SceneFrame(phase: "window", eyes: lean(eyes, g), clip: talking && c.contains(SceneClip.talk) ? SceneClip.talk : SceneClip.look,
-                               clipT: t - 1.0)
-            f.glitch = idleGlitch(t)
+            var f = SceneFrame(phase: "window", eyes: face)
+            f.face = SceneFace()
+            f.wallClock = true
+            if talking {
+                f.clip = pick([SceneClip.faceTalk, SceneClip.talk, SceneClip.look], c); f.clipT = tw - 1.0
+                if f.clip == SceneClip.faceTalk {
+                    f.face?.zoom = 1.12
+                    f.face?.shift = CGVector(dx: 0.02 * sin(tw * 1.3), dy: 0.03)
+                }
+            } else if c.contains(SceneClip.faceScan) {
+                f.clip = SceneClip.faceScan; f.clipT = (tw - 1.0) * 0.4; f.clipMode = .bounce
+                f.face?.mirror = true
+                f.face?.zoom = 1.1
+                f.face?.shift = CGVector(dx: 0, dy: 0.03 * sin(tw * 0.8))
+            } else {
+                f.clip = SceneClip.look; f.clipT = tw - 1.0
+            }
+            f.glitch = idleGlitch(tw)
             f.window = SceneWindow(rect: w, open: 1, chrome: true, melt: 0, typed: typed,
-                                   caret: Int(t * 2.5) % 2 == 0)
+                                   caret: Int(tw * 2.5) % 2 == 0)
             return f
         case ..<7.6:
             let p = CGFloat((t - 7.0) / 0.6)
-            var f = SceneFrame(phase: "melt", eyes: eyes, clip: c.contains(SceneClip.melt) ? SceneClip.melt : SceneClip.look, clipT: t - 7.0, loop: false)
+            var f = SceneFrame(phase: "melt", eyes: face, clip: c.contains(SceneClip.melt) ? SceneClip.melt : SceneClip.look, clipT: t - 7.0, loop: false)
+            f.face = SceneFace()
             f.glitch = c.contains(SceneClip.melt) ? 2 : 4
             f.squash = 1 - 0.8 * max(0, p - 0.5) * 2
             f.window = SceneWindow(rect: w, open: 1, chrome: p < 0.4, melt: p, typed: text, caret: false)
@@ -605,6 +665,9 @@ public enum SceneTimeline {
         frame(kind, t: t, geometry: g, clips: c, options: o).eyes ?? g.target
     }
 
+    /// Сцена с крупным лицом (aspect-fill): окна и `reply`. Показ держит у них 12 fps и при удержании.
+    public static func usesFace(_ kind: SceneKind) -> Bool { kind.boxed || kind == .reply }
+
     static func recall(_ kind: SceneKind, t: Double, at a: Double, geometry g: SceneGeometry, clips: Set<String>,
                        options o: SceneOptions) -> SceneFrame {
         let k = t - a
@@ -613,6 +676,7 @@ public enum SceneTimeline {
         if k < 0.1 {
             var f = SceneFrame(phase: "recall", eyes: from, glitch: 4)
             f.squash = CGFloat(max(0.05, 1 - k / 0.1))
+            if usesFace(kind) { f.face = SceneFace() }
             return f
         }
         return jump("recall", from: from, to: g.home, k - 0.1, len: recallDuration - 0.1)

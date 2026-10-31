@@ -92,7 +92,8 @@ enum CapriArt {
 /// [["000.png", 14], …], …}}` — держания в кадрах `fps`. Обязателен `look` (рассматривает); по желанию `close`,
 /// `many` (закрыла глаза → много глаз), `slits` (щёлки), `appear`, `talk`, `shut`, `burst` (маска появляется,
 /// говорит, закрывает глаза, взрыв глаз), `crazy` (безумный глитч); для сцен на столе — `tele_out`, `tele_in` (телепорт),
-/// `melt` (окно рассыпается), `tex_mosh`, `tex_graffiti` (текстуры «захвата»). Нет папки — Capri показывает кадры `CapriArt`.
+/// `melt` (окно рассыпается), `tex_mosh`, `tex_graffiti` (текстуры «захвата»); для окон (проход 3, 16:10) —
+/// `face_talk`, `face_nod`, `face_scan`, `face_grin`, `hair_bob`, `side_look`, `eye_zoom`. Нет папки — Capri показывает кадры `CapriArt`.
 struct ShowArt {
     let images: [NSImage]
     let fps: Double
@@ -103,6 +104,10 @@ struct ShowArt {
     static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".capri/art/eyes")
     static let shared: ShowArt? = load(dir)
     static let names = SceneClip.all
+
+    /// Потолок папки: рисунков и байт PNG (сейчас ≈ 290 рисунков, 43 МБ).
+    static let maxImages = 640
+    static let maxBytes = 160 << 20
 
     static func load(_ dir: URL) -> ShowArt? {
         func skip(_ why: String) -> ShowArt? {
@@ -115,21 +120,23 @@ struct ShowArt {
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let raw = root["clips"] as? [String: Any] else { return skip("clips.json не читается") }
         let fps = (root["fps"] as? Double).map { min(max($0, 6), 30) } ?? 12
-        var images: [NSImage] = [], index: [String: Int] = [:]
+        var images: [NSImage] = [], index: [String: Int] = [:], bytes = 0
         func clip(_ name: String) -> FrameClip? {
             guard let list = raw[name] as? [[Any]], !list.isEmpty else { return nil }
             var frames: [Int] = [], holds: [Int] = []
             for item in list {
-                // Только PNG прямо в папке, не больше 256 рисунков по 4 МБ.
+                // Только PNG прямо в папке, рисунок до 4 МБ, всего до `maxImages` рисунков и `maxBytes`.
                 guard item.count == 2, let file = item[0] as? String, let hold = item[1] as? Int,
                       file.hasSuffix(".png"), !file.hasPrefix("."), !file.contains("/") else { return nil }
                 if index[file] == nil {
                     let url = dir.appendingPathComponent(file)
-                    guard images.count < 256,
+                    guard images.count < maxImages,
                           let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 4 << 20,
+                          bytes + size <= maxBytes,
                           let im = NSImage(contentsOf: url) else { return nil }
                     index[file] = images.count
                     images.append(im)
+                    bytes += size
                 }
                 frames.append(index[file]!)
                 holds.append(hold)
@@ -137,8 +144,14 @@ struct ShowArt {
             return FrameClip(frames: frames, holds: holds)
         }
         var clips: [String: FrameClip] = [:]
-        for name in names where raw[name] != nil {
-            guard let c = clip(name) else { return skip("клип \(name): нужны PNG до 4 МБ прямо в папке") }
+        // `look` — первым: без него показа нет. Остальные клипы не прошли — пропускаем только их (сцена возьмёт
+        // фолбэк), а не весь показ.
+        for name in [SceneClip.look] + names.filter({ $0 != SceneClip.look }) where raw[name] != nil {
+            guard let c = clip(name) else {
+                if name == SceneClip.look { return skip("клип look: нужны PNG до 4 МБ прямо в папке") }
+                NSLog("[Capri] ~/.capri/art/eyes: клип %@ пропущен (PNG до 4 МБ прямо в папке, всего до %d рисунков)", name, maxImages)
+                continue
+            }
             clips[name] = c
         }
         guard let look = clips["look"] else { return skip("нет клипа look") }
@@ -164,7 +177,11 @@ struct ShowArt {
 
     /// Рисунок клипа `name` через `t` секунд от его начала (нет клипа — `look`).
     func image(clip name: String, t: Double, loop: Bool) -> NSImage? {
-        clip(name).frame(at: Int(max(0, t) * fps), loop: loop).map { images[$0] }
+        image(clip: name, t: t, mode: loop ? .loop : .once)
+    }
+
+    func image(clip name: String, t: Double, mode: FrameClip.Mode) -> NSImage? {
+        clip(name).frame(at: Int(max(0, t) * fps), mode: mode).map { images[$0] }
     }
 
     /// Рисунок настроения: `tick` — общий счётчик кадров `fps`, `since` — кадры с начала настроения.
