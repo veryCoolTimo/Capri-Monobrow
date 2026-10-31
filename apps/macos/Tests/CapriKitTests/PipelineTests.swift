@@ -362,6 +362,24 @@ final class SessionReducerTests: XCTestCase {
         _ = run([hook("UserPromptSubmit", t0 + 90)], into: &state)
         _ = run([hook("Stop", t0 + 100, #"{"last_assistant_message":"Готово, бэкап сделан."}"#)], into: &state)
         XCTAssertEqual(state.sessions[key]!.status, .idle)
+        // Новый вопрос, пока сессия уже ждала давно, — срок отсчитывается с него.
+        _ = run([hook("PermissionRequest", t0 + 101, #"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#)], into: &state)
+        _ = run([hook("Stop", t0 + 101 + SessionReducer.replyTTL, #"{"last_assistant_message":"Удалить старый мир?"}"#)], into: &state)
+        SessionReducer.reduce(&state, .tick(t0 + 102 + SessionReducer.replyTTL))
+        XCTAssertEqual(state.sessions[key]!.request?.summary, "Удалить старый мир?")
+        // Разрешение и вопрос с меню срок не снимает.
+        _ = run([hook("PermissionRequest", t0 + 103 + SessionReducer.replyTTL, #"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#)], into: &state)
+        SessionReducer.reduce(&state, .tick(t0 + 104 + 3 * SessionReducer.replyTTL))
+        XCTAssertEqual(state.sessions[key]!.request?.kind, .permission)
+        _ = run([hook("UserPromptSubmit", t0 + 104 + 3 * SessionReducer.replyTTL)], into: &state)
+        let t1 = t0 + 104 + 3 * SessionReducer.replyTTL
+        // Вопрос текстом без ответа полчаса — тихо «ждёт задачу».
+        _ = run([hook("Stop", t1 + 1, #"{"last_assistant_message":"Перезапустить сервер?"}"#)], into: &state)
+        SessionReducer.reduce(&state, .tick(t1 + SessionReducer.replyTTL))
+        XCTAssertEqual(state.sessions[key]!.status, .needsInput)
+        XCTAssertTrue(SessionReducer.reduce(&state, .tick(t1 + 2 + SessionReducer.replyTTL)).isEmpty)
+        XCTAssertEqual(state.sessions[key]!.status, .idle)
+        XCTAssertNil(state.sessions[key]!.request)
         // Stop, пока другой Stop-хук продолжает работу, — не вопрос.
         _ = run([hook("Stop", t0 + 110, #"{"stop_hook_active":true,"last_assistant_message":"Продолжить?"}"#)], into: &state)
         XCTAssertEqual(state.sessions[key]!.status, .idle)

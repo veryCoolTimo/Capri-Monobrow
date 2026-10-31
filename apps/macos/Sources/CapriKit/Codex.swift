@@ -175,7 +175,7 @@ public enum CodexPrompts {
 
     /// `label` — как назвать сессию (по умолчанию `name(s)`); без префикса «Сессия: » — для списков помощника.
     static func describe(_ s: Session, label: String? = nil, prefix: Bool = true) -> String {
-        var out = (prefix ? "Сессия: " : "") + "\(label ?? name(s)) · хост \(s.key.host) · агент \(s.key.agent.rawValue) · статус \(s.status.rawValue)"
+        var out = (prefix ? "Сессия: " : "") + "\(label ?? name(s)) · хост \(s.key.host) · агент \(s.key.agent.rawValue) · статус \(statusText(s.status))"
         if let r = s.request {
             out += "\nЗапрос (\(r.kind == .reply ? "вопрос текстом в конце ответа" : r.kind.rawValue)\(r.tool.map { ", \($0)" } ?? "")): \(Redactor.redact(r.summary))"
             if !r.options.isEmpty { out += "\nВарианты: " + r.choices.map { "\($0.index). \(Redactor.redact($0.label))" }.joined(separator: "; ") }
@@ -184,6 +184,21 @@ public enum CodexPrompts {
             out += "\nПоследнее сообщение агента: \(String(Redactor.redact(m).prefix(600)))"
         }
         return out
+    }
+
+    /// Статус с расшифровкой: модель не должна путать «закончила, ждёт задачу» с «ждёт ответа».
+    static func statusText(_ status: SessionStatus) -> String { "\(status.rawValue) (\(meaning(status)))" }
+
+    static func meaning(_ status: SessionStatus) -> String {
+        switch status {
+        case .needsInput: "ждёт ответа человека"
+        case .running: "работает"
+        case .idle: "закончила, ждёт новую задачу — ответа не ждёт"
+        case .error: "ошибка"
+        case .rateLimited: "упёрлась в лимит"
+        case .ended: "закрыта"
+        case .unknown: "неизвестно"
+        }
     }
 
     /// Однострочная сводка «что спрашивает сессия» для notch.

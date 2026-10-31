@@ -108,6 +108,8 @@ public enum SessionReducer {
     public static let endedTTL: Double = 3600
     /// Сессия без tmux (её не закроет пропажа панели) без событий 6 часов считается закрытой.
     public static let untrackedTTL: Double = 6 * 3600
+    /// Вопрос текстом без ответа 30 минут — уже не «ждёт меня», а просто закончила.
+    public static let replyTTL: Double = 1800
 
     @discardableResult
     public static func reduce(_ state: inout CapriState, _ input: CapriInput) -> [CapriEffect] {
@@ -180,7 +182,7 @@ public enum SessionReducer {
             if let m = message { s.lastMessage = m }
             // `stop_hook_active` — другой Stop-хук продолжает работу: это ещё не конец ответа.
             if e.event == "Stop", e.data["stop_hook_active"]?.bool != true, let q = message.flatMap(textQuestion) {
-                set(&s, .needsInput, e.ts); s.request = PendingRequest(kind: .reply, summary: q)
+                set(&s, .needsInput, e.ts); s.statusSince = e.ts; s.request = PendingRequest(kind: .reply, summary: q)
             } else {
                 set(&s, .idle, e.ts); s.request = nil
             }
@@ -227,7 +229,7 @@ public enum SessionReducer {
             let message = e.data["last-assistant-message"]?.string
             s.lastMessage = message ?? s.lastMessage
             if let q = message.flatMap(textQuestion) {
-                set(&s, .needsInput, e.ts); s.request = PendingRequest(kind: .reply, summary: q)
+                set(&s, .needsInput, e.ts); s.statusSince = e.ts; s.request = PendingRequest(kind: .reply, summary: q)
             } else {
                 set(&s, .idle, e.ts)
             }
@@ -366,6 +368,11 @@ public enum SessionReducer {
             } else if s.tmux == nil, s.status != .ended, now - s.lastEventAt > untrackedTTL {
                 var e = s
                 set(&e, .ended, now)
+                e.request = nil
+                state.sessions[key] = e
+            } else if s.status == .needsInput, s.request?.kind == .reply, now - s.statusSince > replyTTL {
+                var e = s
+                set(&e, .idle, now)
                 e.request = nil
                 state.sessions[key] = e
             }

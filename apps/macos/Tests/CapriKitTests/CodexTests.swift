@@ -274,6 +274,9 @@ final class AssistantTests: XCTestCase {
         let p = Assistant.prompt(question: "что сделала votek?", sessions: [a, b],
                                  history: { $0.key.id == "a" ? [hist] : [] }, screens: { ["экран \($0.key.id)"] })
         XCTAssertEqual(p.refs, ["S1": a.key, "S2": b.key])
+        // Счёт «ждут» делает Capri: закончившая сессия — не ждущая.
+        XCTAssertTrue(p.text.contains("Итого: needs_input (ждёт ответа человека) 1: votek2 · idle (закончила, ждёт новую задачу — ответа не ждёт) 1"), p.text)
+        XCTAssertTrue(p.text.contains("idle (закончила, ждёт новую задачу — ответа не ждёт)"), p.text)
         XCTAssertTrue(p.text.contains("S1 · votek ·"), p.text)
         XCTAssertTrue(p.text.contains("запустила деплой"))
         XCTAssertFalse(p.text.contains(token), "история проходит через Redactor")
