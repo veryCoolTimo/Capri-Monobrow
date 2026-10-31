@@ -178,14 +178,6 @@ public enum MusicCommand: Equatable {
         return String(s.prefix(120))
     }
 
-    /// `spotify:search:<q>` — поиск в самом Spotify (без ключей Web API).
-    public static func spotifySearchURL(_ query: String) -> URL? {
-        var allowed = CharacterSet.alphanumerics
-        allowed.insert(charactersIn: "-_.~")
-        guard let q = query.addingPercentEncoding(withAllowedCharacters: allowed), !q.isEmpty else { return nil }
-        return URL(string: "spotify:search:" + q)
-    }
-
     /// Ответ Capri в чате на просьбу (до результата плеера).
     public var reply: String {
         switch self {

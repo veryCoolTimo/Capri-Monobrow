@@ -394,9 +394,10 @@ SwiftUI-слой поверх Canvas внутри того же `NSHostingView`,
 - `Capri/SpotifySearch.swift`: токен в памяти до `expiresIn − 60`; ключи — `Capri/Keychain.swift`
   (`kSecClassGenericPassword`, service `capri.spotify`, accounts `client-id`/`client-secret`). Настройки → «Музыка»:
   два поля (секрет — `SecureField`), «Проверить» (запрос токена), «Стереть»; в UserDefaults ничего.
-- **«включи X» без ключей:** URI/ссылка → `play track`; иначе Spotify — `NSWorkspace.open(spotify:search:<X>,
-  activates = false)` и честно: «Открыла поиск в Spotify — выбери трек. Чтобы включала сама, добавь ключи Spotify
-  в настройках»; Музыка — поиск по библиотеке через AppleScript.
+- **«включи X» без ключей:** URI/ссылка → `play track`; Spotify по названию — не ищем, честно: «Без ключа Spotify
+  искать по названию не умею — пришли ссылку или добавь ключи». Поиск `spotify:search:` убран (проверено на Маке
+  31.10: Spotify выходит на передний план вопреки `activates = false` и сам трек не включает); бесплатный
+  song.link для перевода названия в ссылку закрыт (401). Музыка — поиск по библиотеке через AppleScript.
 - **Поток «включи X»:** вопрос помощнику → `MusicCommand.parse` (без Codex) или блок от Codex → чат: «Включаю
   «X»» → сцена `music` (телепорт в окно, «ищу…») → команда → первое событие `NowPlayingMonitor` с новым треком —
   `burst` и строка трека; нет события за 6 с — «не нашла/не включилось».

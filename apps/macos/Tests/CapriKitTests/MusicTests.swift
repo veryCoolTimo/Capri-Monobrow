@@ -84,12 +84,6 @@ final class MusicTests: XCTestCase {
         XCTAssertFalse(MusicCommand.isMusicRequest("запусти тесты"))
     }
 
-    func testSearchURL() {
-        XCTAssertEqual(MusicCommand.spotifySearchURL("Daft Punk")?.absoluteString, "spotify:search:Daft%20Punk")
-        XCTAssertEqual(MusicCommand.spotifySearchURL("a&b/c")?.absoluteString, "spotify:search:a%26b%2Fc")
-        XCTAssertNil(MusicCommand.spotifySearchURL(""))
-    }
-
     // MARK: выбор плеера
 
     func testRoute() {

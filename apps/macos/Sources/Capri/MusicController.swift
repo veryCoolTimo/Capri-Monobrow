@@ -21,8 +21,9 @@ enum MusicIntent {
 enum MusicResult: Equatable {
     /// Скрипт плееру ушёл.
     case sent(MusicSource)
-    /// Без ключей Spotify: открыли поиск в самом Spotify (в фоне).
-    case openedSearch(String)
+    /// Spotify по названию без ключей (или ключи не сработали): найти трек нечем. Поиск в самом
+    /// Spotify не открываем — он выходит на передний план и сам ничего не включает.
+    case needsKeys(String?)
     case notFound
     /// Пауза/переключение, а плеер не запущен.
     case notRunning
@@ -175,7 +176,7 @@ final class FakeMusicBackend: MusicBackend {
 }
 
 /// Единственная точка, через которую Capri трогает плеер. Решает, какому плееру, запускает его без активации
-/// (только для «включи»), ищет по названию (Spotify Web API по ключам, иначе поиск в Spotify; Музыка — медиатека)
+/// (только для «включи»), ищет по названию (Spotify Web API по ключам, без них — просит ссылку; Музыка — медиатека)
 /// и отдаёт итог. Событие плеера (трек пошёл) ждёт `CharacterCenter`.
 final class MusicController {
     let backend: MusicBackend
@@ -217,14 +218,9 @@ final class MusicController {
         }
     }
 
-    /// Spotify по названию: ключи есть — Web API → `play track`; нет — поиск в самом Spotify, в фоне.
+    /// Spotify по названию: ключи есть — Web API → `play track` в фоне; нет — честно просим ключи или ссылку.
     private func playSpotify(_ q: String, launch: Bool, completion: @escaping (MusicResult) -> Void) {
-        guard spotify.hasKeys else {
-            guard let url = MusicCommand.spotifySearchURL(q) else { completion(.notFound); return }
-            backend.open(url)
-            completion(.openedSearch(q))
-            return
-        }
+        guard spotify.hasKeys else { completion(.needsKeys(nil)); return }
         spotify.find(q) { [weak self] r in
             guard let self else { return }
             switch r {
@@ -235,10 +231,8 @@ final class MusicController {
             case .success(nil):
                 completion(.notFound)
             case .failure(let e):
-                // Ключи не сработали — честно открываем поиск в Spotify.
                 self.log?("music spotify search failed: \(e.text)")
-                if let url = MusicCommand.spotifySearchURL(q) { self.backend.open(url); completion(.openedSearch(q)) }
-                else { completion(.failed(e.text)) }
+                completion(.needsKeys(e.text))
             }
         }
     }

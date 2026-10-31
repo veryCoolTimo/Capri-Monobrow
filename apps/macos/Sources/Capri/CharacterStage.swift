@@ -1075,7 +1075,7 @@ final class StageController {
         if kind == .reply, variant == "fail" { run.failedAt = 2.0 }
         if kind == .answer, variant == "sent" { run.burstAt = 4.0 }
         if kind == .music {
-            // Лист: ищет → (играет, пауза, снова играет) / не нашла / открыла поиск.
+            // Лист: ищет → (играет, пауза, снова играет) / не нашла / нужен ключ.
             if run.content.track == nil { run.content.track = "Test Artist — Test Track" }
             if run.content.query == nil { run.content.query = "test track" }
             run.content.trackPlaying = true
@@ -1083,7 +1083,7 @@ final class StageController {
             switch variant {
             case "fail": run.marks.append(SceneMusicMark(t: 2.5, state: .failed))
             case "search":
-                run.content.note = "открыла поиск в Spotify"
+                run.content.note = "нужен ключ Spotify"
                 run.marks.append(SceneMusicMark(t: 2.5, state: .info))
             default:
                 run.marks += [SceneMusicMark(t: 2.5, state: .playing), SceneMusicMark(t: 4.5, state: .paused),

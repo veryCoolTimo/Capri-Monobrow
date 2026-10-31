@@ -524,11 +524,12 @@ final class CharacterCenter {
             }
             musicWaitWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: work)
-        case .openedSearch:
-            log("music: открыла поиск в Spotify")
-            musicDone(.info, message, status: "↗ поиск \(q) открыт в Spotify",
-                      text: "Открыла поиск \(q) в Spotify — выбери трек. Чтобы включала сама, добавь ключи Spotify в настройках (Музыка).",
-                      note: "открыла поиск в Spotify")
+        case .needsKeys(let err):
+            log("music: искать по названию нечем (\(err == nil ? "нет ключей" : "ключи не сработали"))")
+            let why = err.map { "Ключи Spotify не сработали (\($0))." } ?? "Без ключа Spotify искать по названию не умею."
+            musicDone(.failed, message, status: "✗ нужен ключ Spotify",
+                      text: "\(why) Пришли ссылку на трек — включу сразу, или добавь ключи в настройках (Музыка).",
+                      note: "нужен ключ Spotify")
         case .notFound:
             musicDone(.failed, message, status: "✗ не нашла \(q)", text: "Не нашла \(q).", note: "не нашла \(q)")
         case .notRunning:

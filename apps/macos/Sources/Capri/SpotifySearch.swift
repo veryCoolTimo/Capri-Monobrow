@@ -2,7 +2,7 @@ import Foundation
 import CapriKit
 
 /// Поиск трека по названию через Spotify Web API (client credentials) — по желанию: ключи бесплатного
-/// приложения developer.spotify.com в Связке ключей. Без ключей «включи X» открывает поиск в самом Spotify.
+/// приложения developer.spotify.com в Связке ключей. Без ключей «включи X» по названию не ищется — Capri просит ссылку (поиск в Spotify крадёт фокус и не включает).
 /// Токен — только в памяти, до `expiresIn − 60`. Ключи читаются только по действию человека.
 final class SpotifySearch: ObservableObject {
     static let idAccount = "client-id"

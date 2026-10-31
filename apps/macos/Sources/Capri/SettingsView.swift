@@ -213,7 +213,7 @@ struct SettingsView: View {
             } header: {
                 Text("Музыка")
             } footer: {
-                Text("«Включи …» помощнику и кнопки ⏮ ⏯ ⏭: Capri управляет Spotify и Музыкой через AppleScript — только когда вы её просите; macOS спросит разрешение (Автоматизация; после переустановки Capri может спросить снова). Чтобы Spotify-трек находился по названию, нужны ключи бесплатного приложения developer.spotify.com (Create app → Client ID и Client secret) — они хранятся в Связке ключей. Без ключей Capri откроет поиск в Spotify, а ссылки и spotify:-адреса включит сама. Музыка ищет по вашей медиатеке.")
+                Text("«Включи …» помощнику и кнопки ⏮ ⏯ ⏭: Capri управляет Spotify и Музыкой через AppleScript — только когда вы её просите; macOS спросит разрешение (Автоматизация; после переустановки Capri может спросить снова). Чтобы Spotify-трек находился по названию, нужны ключи бесплатного приложения developer.spotify.com (Create app → Client ID и Client secret) — они хранятся в Связке ключей. Без ключей по названию Spotify не ищется — Capri попросит ссылку; ссылки и spotify:-адреса включает сама, в фоне. Музыка ищет по вашей медиатеке.")
                     .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Section {

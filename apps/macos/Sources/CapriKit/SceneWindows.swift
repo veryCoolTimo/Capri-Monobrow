@@ -486,7 +486,7 @@ public enum SceneMusicState: String, Equatable {
     case paused
     /// Не нашла / не включилось / нет доступа.
     case failed
-    /// Просто сообщение (открыла поиск в Spotify).
+    /// Просто сообщение (нужен ключ Spotify).
     case info
 }
 
