@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CapriKit
 
 /// Настроение Capri — какой кадр и какое движение показывать.
 enum CapriMood: Equatable {
@@ -15,6 +16,8 @@ enum CapriMood: Equatable {
     case alert
     /// Ошибка: глитч.
     case error
+    /// Играет музыка: кивает в такт (только в notch, никогда не выше «ждёт меня»).
+    case vibing
 }
 
 /// Вид Capri — её глаза крупным планом (клипы сериала `ShowArt`, если лежат локально, иначе `CapriArt`). `.bust` — с полной анимацией (помощник, чат),
@@ -42,6 +45,14 @@ struct CapriMaskSprite: View {
     private var still: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
     var body: some View {
+        if mood == .vibing && active && !still {
+            VibingMask()
+        } else {
+            blinking
+        }
+    }
+
+    private var blinking: some View {
         TimelineView(EyesSchedule(paused: !active || still || mood == .alert)) { ctx in
             let blink = !still && (EyesSchedule.blink(at: ctx.date) ?? 0) > 0.5
             if let show = ShowArt.shared {
@@ -51,6 +62,50 @@ struct CapriMaskSprite: View {
             }
         }
         .accessibilityLabel(Text("Capri"))
+    }
+}
+
+/// Мини-глаза под музыку: кивок ~112 bpm, на сильную долю — щёлки, на смену трека — короткий глитч 1.
+/// 12 fps и только пока идёт вайб (4 с после смены трека или пока раскрыт notch).
+struct VibingMask: View {
+    @State private var start = Date()
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1 / CapriFace.fps)) { ctx in
+            let t = max(0, ctx.date.timeIntervalSince(start))
+            let tick = Int(t * CapriFace.fps)
+            CapriShotView(image: Self.image(at: t), glitch: tick < 3 ? CapriFX.make(level: 1, tick: tick, strength: 0.6) : nil, bolt: nil)
+                .offset(y: SceneTimeline.nod(t, amplitude: 1.5))
+        }
+        .onAppear { start = Date() }
+        .accessibilityLabel(Text("Capri кивает под музыку"))
+    }
+
+    /// Кадр кивания через `t` секунд: клипы сериала, если есть, иначе встроенный арт.
+    static func image(at t: Double) -> NSImage? {
+        let beat = SceneTimeline.onBeat(t)
+        if let show = ShowArt.shared { return show.vibing(beat: beat) }
+        return CapriArt.images[CapriArt.vibing(beat: beat)]
+    }
+}
+
+/// Три полоски-эквалайзер рядом с глазами (12 fps, только пока идёт вайб).
+struct EqualizerBars: View {
+    var color: Color = Palette.crimson
+    var animating = true
+    var height: CGFloat = 10
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1 / CapriFace.fps, paused: !animating)) { ctx in
+            let tick = Int(ctx.date.timeIntervalSinceReferenceDate * CapriFace.fps)
+            HStack(alignment: .bottom, spacing: 1.5) {
+                ForEach(0..<3, id: \.self) { k in
+                    let u = animating ? 0.25 + 0.75 * TickNoise.unit(tick, 60 + k) : 0.35
+                    Rectangle().fill(color).frame(width: 2, height: max(2, height * u))
+                }
+            }
+            .frame(height: height, alignment: .bottom)
+        }
     }
 }
 

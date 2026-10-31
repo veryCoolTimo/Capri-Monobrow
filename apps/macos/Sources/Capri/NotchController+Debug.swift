@@ -62,11 +62,15 @@ extension NotchController {
             if let d = store.deliveries[s.key] { r["delivery"] = "\(d)" }
             return r
         }
-        let out: [String: Any] = ["state": state.rawValue, "selected": ui.selected?.description ?? "", "sessions": rows,
+        var out: [String: Any] = ["state": state.rawValue, "selected": ui.selected?.description ?? "", "sessions": rows,
                                   "hosts": store.hosts.map { "\($0.name)=\($0.connected)" },
                                   // Видимые обычные окна Capri и политика активации — проверка «окно само не вылезает».
                                   "windows": NSApp.windows.filter { $0.isVisible && $0.styleMask.contains(.titled) && !($0 is NSPanel) }.map(\.title),
-                                  "regular": NSApp.activationPolicy() == .regular]
+                                  "regular": NSApp.activationPolicy() == .regular,
+                                  "frontmostPid": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0,
+                                  "frontmostIsCapri": NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier,
+                                  "notchKey": container.window?.isKeyWindow ?? false]
+        for (k, v) in dumpExtra?() ?? [:] { out[k] = v }
         if let d = try? JSONSerialization.data(withJSONObject: out, options: [.prettyPrinted, .sortedKeys]) {
             try? d.write(to: CapriPaths.tmp.appendingPathComponent("state.json"))
         }

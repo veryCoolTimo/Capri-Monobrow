@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var notch: NotchController!
     private var codex: CodexService!
     private var attention: AttentionCenter!
+    private var character: CharacterCenter!
     private var window: NSWindow?
     private let windowUI = WindowUI()
     private let settings = Settings()
@@ -54,8 +55,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         attention.onPauseChange = { [weak self] in self?.updateStatusIcon() }
         settings.onFullscreenChange = { [weak self] in self?.attention.checkFullscreen() }
         settings.onHostsChange = { [weak self] hosts in self?.store.setRemoteHosts(hosts) }
+        character = CharacterCenter(store: store, notch: notch, settings: settings, attention: attention)
+        settings.onCharacterChange = { [weak self] in self?.character.settingsChanged() }
+        settings.onMusicChange = { [weak self] in self?.character.musicSettingChanged() }
+        notch.dumpExtra = { [weak self] in self?.character.dump ?? [:] }
         notch.start()
         attention.start()
+        character.debugLog = CommandLine.arguments.contains("--debug-control")
+        character.start()
         LoginItem.setUpOnFirstRun()
         store.start()
         if settings.codexEnabled { codex.start() }
@@ -202,6 +209,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item("Пауза уведомлений на 1 час", #selector(pauseAlerts))
         }
         item("Спросить Capri (\(HotKey.assistant.label))", #selector(showAssistant))
+        // Персонаж: посмотреть сцены (работает и при выключенной настройке) и спрятать на час.
+        let characterItem = NSMenuItem(title: "Персонаж", action: nil, keyEquivalent: "")
+        let sub = NSMenu(title: "Персонаж")
+        let fullscreen = attention?.fullscreen ?? false
+        for kind in SceneKind.allCases {
+            let it = NSMenuItem(title: "Показать: \(kind.title)" + (fullscreen ? " (не в полноэкранном режиме)" : ""),
+                                action: fullscreen ? nil : #selector(showScene(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = kind.rawValue
+            it.isEnabled = !fullscreen
+            sub.addItem(it)
+        }
+        sub.addItem(.separator())
+        let toggle = NSMenuItem(title: "Персонаж на рабочем столе", action: #selector(toggleCharacter), keyEquivalent: "")
+        toggle.target = self
+        toggle.state = settings.character ? .on : .off
+        sub.addItem(toggle)
+        characterItem.submenu = sub
+        menu.addItem(characterItem)
+        if settings.characterHidden, let until = settings.characterHiddenUntil {
+            item("Вернуть персонажа (спрятан до \(Self.clock.string(from: Date(timeIntervalSince1970: until))))", #selector(unhideCharacter))
+        } else {
+            item("Спрятать персонажа на час", #selector(hideCharacter))
+        }
         item("Открыть Capri", #selector(openDashboard), key: "o")
         item("Показать notch-панель", #selector(showNotch))
         menu.addItem(.separator())
@@ -212,6 +243,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showNotch() { notch.go(.expanded, reason: "menu") }
+    @objc private func showScene(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let kind = SceneKind(rawValue: raw) else { return }
+        // Меню закрывается — сцена после этого, чтобы глаза ушли из notch уже на чистый экран.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.character.demo(kind) }
+    }
+    @objc private func hideCharacter() { character.hide(hours: 1) }
+    @objc private func unhideCharacter() { character.unhide() }
+    @objc private func toggleCharacter() { settings.character.toggle() }
     @objc private func showAssistant() { notch.go(.assistant, reason: "menu") }
 
     private func updateHotKey() {
@@ -333,6 +372,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window?.close()
         case "window-snapshot":
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.snapshotWindow() }
+        case "scene", "music", "director":
+            character.debugCommand(cmd, arg)
         default:
             break
         }

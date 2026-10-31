@@ -60,6 +60,9 @@ enum CapriFX {
         case .speaking: level = on(36, 3, 7) ? 2 : on(9, 1, 3) ? 1 : 0
         case .alert: level = on(36, 6, 4, since) ? 4 : on(12, 1, 8) ? 1 : 0
         case .error: level = on(20, 3, 5) ? (TickNoise.unit(tick / 20, 14) < 0.5 ? 4 : 3) : on(7, 1, 10) ? 2 : 0
+        case .vibing:
+            // Смена трека — короткий глитч 1, без перехода уровня 2.
+            return since < 3 ? make(level: 1, tick: tick, strength: 0.6) : nil
         }
         let transition = since > 0 && since < 3 ? 2 : 0
         let l = max(level, transition)
@@ -129,6 +132,7 @@ enum CapriFX {
         case .speaking: TickNoise.burst(tick, period: 24, length: 5, salt: 6)
         case .alert: TickNoise.burst(since, period: 36, length: 22, salt: 4)
         case .error: TickNoise.burst(tick, period: 20, length: 4, salt: 5)
+        case .vibing: nil
         }
         guard let beat else { return nil }
         let two = mood == .alert || TickNoise.unit(beat, 32) < 0.4
@@ -163,18 +167,54 @@ enum CapriFX {
 
     /// Контур молнии: каждое колено — тонкая игла от широкого основания к острию чуть дальше следующей вершины.
     static func boltPath(_ seed: Int, boil: Int, in r: CGRect) -> Path {
-        let pts = boltPoints(seed, boil: boil, in: r)
+        needles(boltPoints(seed, boil: boil, in: r), width: r.height * 0.045, taper: 0.5, tip: 0.12)
+    }
+
+    /// Иглы по вершинам: колено `k` — от основания ширины `width·(1 − taper·k/n)` к острию за следующей вершиной
+    /// (`tip` — доля колена).
+    static func needles(_ pts: [CGPoint], width: CGFloat, taper: CGFloat, tip: CGFloat) -> Path {
         var path = Path()
+        guard pts.count > 1 else { return path }
         for k in 0..<(pts.count - 1) {
             let p = pts[k], q = pts[k + 1]
             let dx = q.x - p.x, dy = q.y - p.y, len = max(1, (dx * dx + dy * dy).squareRoot())
-            let w = r.height * 0.045 * (1 - 0.5 * CGFloat(k) / CGFloat(pts.count))
-            let tip = CGPoint(x: q.x + dx * 0.12, y: q.y + dy * 0.12)
-            path.addLines([CGPoint(x: p.x - dy / len * w / 2, y: p.y + dx / len * w / 2), tip,
+            let w = width * (1 - taper * CGFloat(k) / CGFloat(pts.count))
+            let end = CGPoint(x: q.x + dx * tip, y: q.y + dy * tip)
+            path.addLines([CGPoint(x: p.x - dy / len * w / 2, y: p.y + dx / len * w / 2), end,
                            CGPoint(x: p.x + dy / len * w / 2, y: p.y - dx / len * w / 2)])
             path.closeSubpath()
         }
         return path
+    }
+
+    /// Вершины молнии между двумя произвольными точками (сцены на столе): зигзаг из `n` колен, амплитуда — доля
+    /// длины, но не больше `maxAmp` pt; `reach` — какая доля пути уже пройдена.
+    static func boltPoints(from a: CGPoint, to b: CGPoint, seed: Int, boil: Int, reach: CGFloat = 1, maxAmp: CGFloat = 26) -> [CGPoint] {
+        let dx = b.x - a.x, dy = b.y - a.y, len = max(1, (dx * dx + dy * dy).squareRoot())
+        let nx = -dy / len, ny = dx / len
+        let n = max(4, min(14, Int(len / 60) + 4))
+        let amp = min(maxAmp, len * 0.08)
+        let reach = max(0, min(1, reach))
+        var pts: [CGPoint] = []
+        for k in 0..<n {
+            let f = CGFloat(k) / CGFloat(n - 1)
+            guard f <= reach + 0.0001 || k == 0 else {
+                // Кончик — ровно на доле `reach`.
+                let prev = pts[pts.count - 1]
+                let tip = CGPoint(x: a.x + dx * reach, y: a.y + dy * reach)
+                if hypot(tip.x - prev.x, tip.y - prev.y) > 1 { pts.append(tip) }
+                break
+            }
+            let side: CGFloat = k == 0 || k == n - 1 ? 0 : (k % 2 == 0 ? 1 : -1) * (0.5 + 0.5 * CGFloat(TickNoise.unit(seed, 140 + k)))
+            let jitter = (CGFloat(TickNoise.unit(boil, 160 + k)) - 0.5) * amp * 0.3
+            pts.append(CGPoint(x: a.x + dx * f + nx * (amp * side + jitter), y: a.y + dy * f + ny * (amp * side + jitter)))
+        }
+        return pts
+    }
+
+    /// Контур тонкой молнии между точками: иглы от основания `width` к острию.
+    static func boltPath(from a: CGPoint, to b: CGPoint, seed: Int, boil: Int, reach: CGFloat = 1, width: CGFloat = 3) -> Path {
+        needles(boltPoints(from: a, to: b, seed: seed, boil: boil, reach: reach), width: width, taper: 0.4, tip: 0.1)
     }
 
     /// Звёздочки-контуры рядом с молнией, как на рефе.

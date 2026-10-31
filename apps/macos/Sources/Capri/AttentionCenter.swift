@@ -12,7 +12,11 @@ final class AttentionCenter: NSObject {
     private var observers: [NSObjectProtocol] = []
     private var cancellables: Set<AnyCancellable> = []
     private var pauseTimer: Timer?
-    private var displaysAsleep = false
+    private(set) var displaysAsleep = false
+    /// Полноэкранное приложение на экране notch (независимо от настройки «прятать notch»).
+    private(set) var fullscreen = false
+    /// Полноэкранный режим включился/выключился — персонаж гасит сцену.
+    var onFullscreen: ((Bool) -> Void)?
     private var throttle = AttentionThrottle()
     /// Пауза включилась/кончилась — обновить значок в строке меню.
     var onPauseChange: (() -> Void)?
@@ -134,8 +138,8 @@ final class AttentionCenter: NSObject {
     }
 
     func checkFullscreen() {
-        // При «всегда скрывать строку меню» развёрнутое окно не отличить от полноэкранного — не прячем notch вовсе.
-        guard settings.fullscreenQuiet, !Self.menuBarAutoHides, let screen = notch.notchScreen else {
+        guard let screen = notch.notchScreen else {
+            setFullscreen(false)
             notch.setSuppressed(false); return
         }
         let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
@@ -144,10 +148,25 @@ final class AttentionCenter: NSObject {
         let primaryHeight = NSScreen.screens.first?.frame.height ?? screen.frame.height
         let f = screen.frame
         let cgFrame = CGRect(x: f.minX, y: primaryHeight - f.maxY, width: f.width, height: f.height)
-        let active = Fullscreen.isActive(windows: windows, screen: cgFrame, safeAreaTop: screen.safeAreaInsets.top,
-                                         frontmost: NSWorkspace.shared.frontmostApplication?.processIdentifier,
-                                         ownPid: ProcessInfo.processInfo.processIdentifier)
-        notch.setSuppressed(active)
+        let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let own = ProcessInfo.processInfo.processIdentifier
+        let top = screen.safeAreaInsets.top
+        if Self.menuBarAutoHides {
+            // При «всегда скрывать строку меню» развёрнутое окно не отличить от полноэкранного — notch не прячем,
+            // а персонаж молчит при любом окне на весь экран.
+            setFullscreen(Fullscreen.frontCoversScreen(windows: windows, screen: cgFrame, safeAreaTop: top, frontmost: front, ownPid: own))
+            notch.setSuppressed(false)
+            return
+        }
+        let active = Fullscreen.isActive(windows: windows, screen: cgFrame, safeAreaTop: top, frontmost: front, ownPid: own)
+        setFullscreen(active)
+        notch.setSuppressed(active && settings.fullscreenQuiet)
+    }
+
+    private func setFullscreen(_ value: Bool) {
+        guard value != fullscreen else { return }
+        fullscreen = value
+        onFullscreen?(value)
     }
 }
 

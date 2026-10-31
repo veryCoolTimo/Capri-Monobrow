@@ -63,6 +63,26 @@ enum CapriArt {
             return .open
         case .error:
             return .slits
+        case .vibing:
+            guard !still else { return .open }
+            return vibing(beat: SceneTimeline.onBeat(since))
+        }
+    }
+
+    /// Кивает под музыку: на сильную долю — щёлки (одно правило с `ShowArt.vibing` и `VibingMask`).
+    static func vibing(beat: Bool) -> Frame { beat ? .slits : .open }
+
+    /// Кадр встроенного арта для клипа сцены (когда клипов сериала нет).
+    static func frame(clip: String, t: Double) -> Frame {
+        switch clip {
+        case SceneClip.close, SceneClip.teleOut, SceneClip.shut: return t < 0.1 ? .squint : .blink
+        case SceneClip.many, SceneClip.burst, SceneClip.melt: return .many
+        case SceneClip.slits: return .slits
+        case SceneClip.talk: return Int(t * 5) % 2 == 0 ? .speakA : .speakB
+        case SceneClip.appear, SceneClip.teleIn: return t < 0.12 ? .blink : .open
+        default:
+            let p = t.truncatingRemainder(dividingBy: 3.4)
+            return p < 1.2 ? .open : p < 2.0 ? .lookLeft : p < 2.8 ? .lookRight : .open
         }
     }
 }
@@ -71,7 +91,8 @@ enum CapriArt {
 /// в публичный репозиторий; кладёт `scripts/push-capri-art.sh`). `clips.json`: `{"fps": 24, "clips": {"look":
 /// [["000.png", 14], …], …}}` — держания в кадрах `fps`. Обязателен `look` (рассматривает); по желанию `close`,
 /// `many` (закрыла глаза → много глаз), `slits` (щёлки), `appear`, `talk`, `shut`, `burst` (маска появляется,
-/// говорит, закрывает глаза, взрыв глаз), `crazy` (безумный глитч). Нет папки — Capri показывает кадры `CapriArt`.
+/// говорит, закрывает глаза, взрыв глаз), `crazy` (безумный глитч); для сцен на столе — `tele_out`, `tele_in` (телепорт),
+/// `melt` (окно рассыпается), `tex_mosh`, `tex_graffiti` (текстуры «захвата»). Нет папки — Capri показывает кадры `CapriArt`.
 struct ShowArt {
     let images: [NSImage]
     let fps: Double
@@ -81,7 +102,7 @@ struct ShowArt {
 
     static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".capri/art/eyes")
     static let shared: ShowArt? = load(dir)
-    static let names = ["look", "close", "many", "slits", "appear", "talk", "shut", "burst", "crazy"]
+    static let names = SceneClip.all
 
     static func load(_ dir: URL) -> ShowArt? {
         func skip(_ why: String) -> ShowArt? {
@@ -138,9 +159,18 @@ struct ShowArt {
 
     private func clip(_ name: String) -> FrameClip { clips[name] ?? clips["look"]! }
 
+    /// Клип без подмены на `look`: сцене нужно знать, есть ли он.
+    func clip(named name: String) -> FrameClip? { clips[name] }
+
+    /// Рисунок клипа `name` через `t` секунд от его начала (нет клипа — `look`).
+    func image(clip name: String, t: Double, loop: Bool) -> NSImage? {
+        clip(name).frame(at: Int(max(0, t) * fps), loop: loop).map { images[$0] }
+    }
+
     /// Рисунок настроения: `tick` — общий счётчик кадров `fps`, `since` — кадры с начала настроения.
     func image(_ mood: CapriMood, tick: Int, since: Int) -> NSImage? {
         // Покой: рассматривает три круга, потом — сцена «тебя ждут» (маска, закрыла глаза, взрыв глаз), и снова.
+        if mood == .vibing { return vibing(beat: SceneTimeline.onBeat(Double(since) / fps)) }
         let calm = clip("look").total * 3, k = tick % (calm + alert.total)
         let i: Int? = switch mood {
         case .idle: k < calm ? clip("look").frame(at: k, loop: true) : alert.frame(at: k - calm, loop: false)
@@ -149,14 +179,21 @@ struct ShowArt {
         case .thinking: clip("slits").frame(at: since, loop: false)
         case .alert: alert.frame(at: since, loop: true)
         case .error: clip(clips["crazy"] != nil ? "crazy" : "slits").frame(at: since, loop: clips["crazy"] != nil)
+        case .vibing: nil
         }
         return i.map { images[$0] }
+    }
+
+    /// Кивает под музыку: на сильную долю — щёлки (нет клипа — закрытые глаза), иначе открытые.
+    func vibing(beat: Bool) -> NSImage? {
+        guard beat else { return open }
+        return clips[SceneClip.slits] != nil ? last(SceneClip.slits) : shut
     }
 
     /// Один рисунок без движения («Уменьшить движение», пауза).
     func still(_ mood: CapriMood) -> NSImage? {
         switch mood {
-        case .idle, .listening: open
+        case .idle, .listening, .vibing: open
         case .speaking: first("talk")
         case .thinking, .error: last("slits")
         case .alert: all

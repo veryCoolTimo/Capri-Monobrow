@@ -100,6 +100,15 @@ final class AttentionTests: XCTestCase {
         XCTAssertTrue(Fullscreen.isActive(windows: [menuBar, extFull], screen: ext, safeAreaTop: 0, frontmost: 7, ownPid: 1))
     }
 
+    func testFrontCoversScreenIgnoresMenuBar() {
+        let full = WindowInfo(pid: 7, layer: 0, bounds: CGRect(x: 0, y: 0, width: 1512, height: 982))
+        // При «всегда скрывать строку меню» окно на весь экран считается полноэкранным для персонажа.
+        XCTAssertTrue(Fullscreen.frontCoversScreen(windows: [menuBar, full], screen: screen, safeAreaTop: 37, frontmost: 7, ownPid: 1))
+        XCTAssertFalse(Fullscreen.frontCoversScreen(windows: [full], screen: screen, safeAreaTop: 37, frontmost: 8, ownPid: 1))
+        let small = WindowInfo(pid: 7, layer: 0, bounds: CGRect(x: 0, y: 37, width: 1512, height: 700))
+        XCTAssertFalse(Fullscreen.frontCoversScreen(windows: [small], screen: screen, safeAreaTop: 37, frontmost: 7, ownPid: 1))
+    }
+
     func testWindowInfoFromDictionary() {
         let d: [String: Any] = ["kCGWindowOwnerPID": 42, "kCGWindowLayer": 0,
                                 "kCGWindowBounds": ["X": 0, "Y": 37, "Width": 100, "Height": 50]]

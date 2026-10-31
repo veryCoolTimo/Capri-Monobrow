@@ -34,6 +34,21 @@ final class Settings: ObservableObject {
     var onHotKeyChange: (() -> Void)?
     /// Шорткат не зарегистрировался (занят другим приложением).
     @Published var hotKeyError: String?
+    /// Персонаж выходит на рабочий стол короткими сценами (по умолчанию выкл.; демо из меню — всегда).
+    @Published var character: Bool { didSet { d.set(character, forKey: "capri.character"); onCharacterChange?() } }
+    @Published var characterRate: CharacterDirector.Rate {
+        didSet { d.set(characterRate.rawValue, forKey: "capri.characterRate"); onCharacterChange?() }
+    }
+    @Published var characterSessionEvents: Bool { didSet { d.set(characterSessionEvents, forKey: "capri.characterSessionEvents") } }
+    @Published var characterTakeover: Bool { didSet { d.set(characterTakeover, forKey: "capri.characterTakeover") } }
+    /// «Спрятать персонажа на час»: до этого времени (unix) сцен и кивания нет.
+    @Published var characterHiddenUntil: Double? {
+        didSet { d.set(characterHiddenUntil, forKey: "capri.characterHiddenUntil"); onCharacterChange?() }
+    }
+    /// Кивать в notch под Spotify / Музыку.
+    @Published var music: Bool { didSet { d.set(music, forKey: "capri.music"); onMusicChange?() } }
+    var onCharacterChange: (() -> Void)?
+    var onMusicChange: (() -> Void)?
     var loginItem: Bool {
         get { LoginItem.enabled }
         set { loginItemError = LoginItem.set(newValue); objectWillChange.send() }
@@ -55,7 +70,15 @@ final class Settings: ObservableObject {
         codexPath = d.string(forKey: "capri.codexPath") ?? ""
         hosts = Self.hosts
         assistantHotKey = d.object(forKey: "capri.assistantHotKey") as? Bool ?? true
+        character = d.object(forKey: "capri.character") as? Bool ?? false
+        characterRate = d.string(forKey: "capri.characterRate").flatMap(CharacterDirector.Rate.init(rawValue:)) ?? .sometimes
+        characterSessionEvents = d.object(forKey: "capri.characterSessionEvents") as? Bool ?? true
+        characterTakeover = d.object(forKey: "capri.characterTakeover") as? Bool ?? false
+        characterHiddenUntil = d.object(forKey: "capri.characterHiddenUntil") as? Double
+        music = d.object(forKey: "capri.music") as? Bool ?? true
     }
+
+    var characterHidden: Bool { (characterHiddenUntil ?? 0) > Date().timeIntervalSince1970 }
 
     /// Настройки прототипа (`local.capri.prototype`) переезжают в `local.capri` один раз;
     /// трёхпозиционные уведомления (нет / когда не видно / всегда) стали переключателем.
@@ -136,6 +159,26 @@ struct SettingsView: View {
                     .help("Виден на экране блокировки. Выключено — только имя сессии.")
                 Toggle("Прятать notch в полноэкранных приложениях", isOn: $settings.fullscreenQuiet)
                     .help("Notch всплывёт только на новое «ждёт меня»")
+            }
+            Section {
+                Toggle("Персонаж на рабочем столе", isOn: $settings.character)
+                Picker("Как часто", selection: $settings.characterRate) {
+                    Text("редко").tag(CharacterDirector.Rate.rare)
+                    Text("иногда").tag(CharacterDirector.Rate.sometimes)
+                }
+                .disabled(!settings.character)
+                Toggle("Сцены, когда сессия доработала", isOn: $settings.characterSessionEvents)
+                    .disabled(!settings.character)
+                Toggle("Изображать захват экрана", isOn: $settings.characterTakeover)
+                    .disabled(!settings.character)
+                    .help("Только рисунок поверх: Capri ничего не нажимает и не печатает")
+                Toggle("Реагировать на музыку (Spotify, Музыка)", isOn: $settings.music)
+                    .help("Кивает в notch на смену трека; в раскрытом notch — что играет")
+            } header: {
+                Text("Персонаж")
+            } footer: {
+                Text("Короткие сцены до 8 секунд: телепорт, окно, «захват», вайб. Не в полноэкранных приложениях, не когда вы печатаете или отошли, не чаще раза в 20 минут. Клики проходят насквозь. Посмотреть все сцены — меню ✦ → Персонаж.")
+                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Section {
                 ForEach(hosts.rows) { h in

@@ -101,6 +101,12 @@ final class NotchController: NSObject {
     var onConversation: (() -> Void)?
     /// Отладочные команды, которые обрабатывает не notch (окно и т.п.).
     var onDebug: ((String, String) -> Void)?
+    /// Смена состояния (персонаж обрывает сцену, когда notch раскрыли).
+    var onStateChange: ((NotchState) -> Void)?
+    /// Дополнительные поля `dump` (персонаж, музыка).
+    var dumpExtra: (() -> [String: Any])?
+    /// Показать крылья свёрнутого notch, даже если сессий нет (кивание под музыку).
+    var forceWings = false { didSet { if forceWings != oldValue { storeChanged() } } }
 
     private var panel: NotchPanel!
     private(set) var container: NSView!
@@ -341,7 +347,7 @@ final class NotchController: NSObject {
             guard let self else { return }
             // Выбранная сессия закрылась — черновик ответа не должен достаться другой.
             if let k = self.ui.selected, self.store.resolve(k) == nil, !self.ui.reply.isEmpty { self.ui.reply = "" }
-            let q = !self.store.active
+            let q = !self.store.active && !self.forceWings
             guard q != self.quiet else { return }
             self.quiet = q
             if self.state == .collapsed {
@@ -358,6 +364,8 @@ final class NotchController: NSObject {
         if debugLog { Self.debugWrite("notch \(from.rawValue) → \(target.rawValue) (\(reason))") }
         let growing = NotchState.allCases.firstIndex(of: target)! > NotchState.allCases.firstIndex(of: from)!
         state = target
+        ui.expandedOpen = target == .expanded
+        onStateChange?(target)
         if suppressed {
             if target != .collapsed { setPanelVisible(true) }   // кликабельность — updateMouseThrough() в конце go()
             else {
@@ -483,6 +491,14 @@ final class NotchController: NSObject {
     func toggleAssistant() {
         if suppressed && state == .collapsed { setPanelVisible(true) }
         go(state == .assistant ? .collapsed : .assistant, reason: "assistant")
+    }
+
+    /// Глаза Capri в свёрнутом notch (глобально): откуда персонаж уходит на стол и куда возвращается.
+    var eyesRect: CGRect? {
+        guard screen != nil else { return nil }
+        let row = NotchGeometry.notchRect(notch)?.height ?? NotchGeometry.pillSize.height
+        let collapsed = NotchGeometry.shapeRect(.collapsed, notch)
+        return CGRect(x: collapsed.minX + 13, y: NotchGeometry.anchorTop(notch) - row + (row - 16) / 2, width: 32, height: 16)
     }
 
     /// Клик по левому крылу верхней строки (там глаза Capri), а не по строке peek под ней.

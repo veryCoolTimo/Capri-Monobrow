@@ -16,6 +16,17 @@ final class NotchUI: ObservableObject {
     @Published var assistantShown = false
     /// Увеличивается при каждом открытии помощника — поле ввода забирает фокус.
     @Published var assistantFocusTick = 0
+    /// Глаза ушли на рабочий стол (идёт сцена) — в notch их нет.
+    @Published var faceAway = false
+    /// Кивает под музыку (4 с после смены трека).
+    @Published var vibing = false
+    /// Что играет («Artist — Track») и играет ли сейчас; nil — ничего или неизвестно.
+    @Published var music: String?
+    @Published var musicPlaying = false
+    /// Notch раскрыт (кивает, пока раскрыт и играет музыка).
+    @Published var expandedOpen = false
+    /// «Спрятать персонажа на час» — в notch не кивает.
+    @Published var characterHidden = false
 }
 
 /// Действия notch → контроллер.
@@ -92,6 +103,23 @@ func hudButton(_ title: String, accent: Color = Palette.crimson, enabled: Bool =
     .opacity(enabled ? 1 : 0.4)
 }
 
+/// «♪ Artist — Track» в раскрытом notch (только пока играет или 5 с после паузы).
+struct MusicLine: View {
+    var line: String
+    var playing: Bool
+    /// Анимировать эквалайзер (только пока notch раскрыт — свёрнутый хост не удаляется, лишь прячется).
+    var animating: Bool
+    var body: some View {
+        HStack(spacing: 6) {
+            EqualizerBars(color: playing ? Palette.crimson : Palette.dim, animating: playing && animating, height: 8)
+            Text("♪ " + line).font(.mono(9.5, .semibold)).foregroundColor(playing ? Palette.text.opacity(0.85) : Palette.dim)
+                .lineLimit(1).truncationMode(.tail)
+            Spacer(minLength: 0)
+        }
+        .help("Что играет в Spotify или Музыке")
+    }
+}
+
 // MARK: - Свёрнутый вид
 
 /// Слева от выреза — глаза Capri (клик — помощник), справа — шкала сессий: столбик на сессию, зелёный — ждёт
@@ -107,10 +135,17 @@ struct TopRowView: View {
     var body: some View {
         let waiting = store.waiting.count
         let list = store.overview
+        // Музыка — никогда не выше «ждёт меня» и ответа Capri.
+        let vibing = waiting == 0 && !codex.chatBusy && !ui.characterHidden
+            && (ui.vibing || (ui.expandedOpen && ui.musicPlaying))
         HStack(spacing: 0) {
-            CapriFace(mood: waiting > 0 ? .alert : codex.chatBusy ? .thinking : .idle, style: .mask)
+            CapriFace(mood: waiting > 0 ? .alert : codex.chatBusy ? .thinking : vibing ? .vibing : .idle, style: .mask)
                 .frame(width: 32, height: 16)
+                .opacity(ui.faceAway ? 0 : 1)
                 .help("Capri — спросить (⌃⌥Space)")
+            if vibing {
+                EqualizerBars(color: Palette.crimson, animating: true, height: 9).padding(.leading, 4)
+            }
             Spacer(minLength: ui.hasNotch ? notchWidth : 8)
             HStack(spacing: 2.5) {
                 ForEach(list.prefix(Self.maxBars), id: \.key) { s in SessionBar(status: s.status) }
@@ -184,6 +219,9 @@ struct ExpandedView: View {
         let rows = Array(list.prefix(Self.maxRows))
         VStack(alignment: .leading, spacing: 6) {
             header(list)
+            if let line = ui.music {
+                MusicLine(line: line, playing: ui.musicPlaying, animating: ui.expandedOpen)
+            }
             if rows.isEmpty {
                 Text("Сессий нет").font(.system(size: 12, weight: .medium)).foregroundColor(Palette.dim)
                     .padding(.vertical, 4)

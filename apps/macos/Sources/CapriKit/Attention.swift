@@ -41,6 +41,14 @@ public enum Fullscreen {
                 && w.bounds.intersects(screen)
         }
         if menuBar { return false }
+        return frontCoversScreen(windows: windows, screen: screen, safeAreaTop: safeAreaTop, frontmost: front, ownPid: ownPid)
+    }
+
+    /// Обычное окно переднего приложения на весь экран (полноэкранное или развёрнутое). Без проверки строки меню —
+    /// при «всегда скрывать строку меню» их не отличить; персонажу этого хватает (лучше лишний раз промолчать).
+    public static func frontCoversScreen(windows: [WindowInfo], screen: CGRect, safeAreaTop: CGFloat,
+                                         frontmost: Int32?, ownPid: Int32) -> Bool {
+        guard let front = frontmost, front != ownPid else { return false }
         return windows.contains { w in
             w.pid == front && w.layer == 0
                 && abs(w.bounds.minX - screen.minX) < 1 && w.bounds.width >= screen.width - 1
