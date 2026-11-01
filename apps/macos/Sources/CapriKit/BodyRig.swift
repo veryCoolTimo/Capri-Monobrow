@@ -189,19 +189,17 @@ public struct BodyRig: Codable, Equatable {
             if backlit > 0.5, i == .hair { return .deep }
             return deep && i == .hair ? .deep : i
         }
+        // Кромка тела — одним слоем за всем телом (`rims`): фиолетовый сдвиг виден только по внешнему краю силуэта,
+        // а не вокруг каждой детали (иначе тонкие руки и ноги выглядят обведённой проволокой).
+        var rims: [RigShape] = []
         func add(_ name: String, _ i: RigInk, _ pts: [CGPoint], deep: Bool = false) {
             guard pts.count >= 3 else { return }
             let k = ink(i, deep: deep)
             if k == .hair || k == .deep {
-                // Разнос краёв: фиолетовый с одной стороны, чернила — с другой (части не сливаются с волосами).
-                if backlit < 0.5 {
-                    layers.append(RigShape(name + ".shade", .ink, pts.map { CGPoint(x: $0.x - pose.rim.dx * 0.8, y: $0.y - pose.rim.dy * 0.8) },
-                                           opacity: 0.9))
-                }
-                layers.append(RigShape(name + ".rim", backlit > 0.5 ? .light : .rim,
-                                       pts.map { CGPoint(x: $0.x + pose.rim.dx, y: $0.y + pose.rim.dy) }))
+                rims.append(RigShape(name + ".rim", backlit > 0.5 ? .light : .rim,
+                                     pts.map { CGPoint(x: $0.x + pose.rim.dx, y: $0.y + pose.rim.dy) }))
                 if backlit > 0.5 {
-                    layers.append(RigShape(name + ".rim2", .light, pts.map { CGPoint(x: $0.x - pose.rim.dx, y: $0.y + pose.rim.dy) }))
+                    rims.append(RigShape(name + ".rim2", .light, pts.map { CGPoint(x: $0.x - pose.rim.dx, y: $0.y + pose.rim.dy) }))
                 }
             }
             layers.append(RigShape(name, k, pts))
@@ -283,6 +281,7 @@ public struct BodyRig: Codable, Equatable {
             parts(.thigh, origin: sk.hips[i], angle: l.upper, side: i, deep: deep, sx: l.reach)
         }
         hairShards(front: false)
+        let bodyStart = layers.count
         outlined { arm(far, deep: true) }
         leg(far, deep: true)
         leg(nearI, deep: false)
@@ -318,6 +317,7 @@ public struct BodyRig: Codable, Equatable {
                                          CGPoint(x: c.x + w / 2, y: c.y + h * 0.4), CGPoint(x: c.x, y: c.y + h * 0.55)])
             }
         }
+        layers.insert(contentsOf: rims, at: bodyStart)
         if pose.melt > 0.001 { layers = melted(layers, pose, sk) }
         if pose.flip {
             let cx = sk.waist.x
