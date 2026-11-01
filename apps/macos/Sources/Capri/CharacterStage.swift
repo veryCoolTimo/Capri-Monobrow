@@ -45,6 +45,10 @@ struct SceneContent: Equatable {
     var trackPlaying = false
     var query: String?
     var note: String?
+    /// «На окне»: реплика в пузыре.
+    var bubble: String?
+    /// Терминал: все реплики сцены по порядку (пузырь `say` берёт свою).
+    var says: [String] = []
 
     /// Подпись `reply`: «→ votek2 ✓» / «→ votek2 …» / «→ votek2 · не дошло».
     var caption: String {
@@ -102,6 +106,24 @@ struct SceneRun: Equatable {
     var controls = false
     /// Стена, когда сменилась горячая точка под курсором (окно сессий: наезд в глаз над строкой).
     var hoverAt = 0.0
+    /// Переходы сцены (общая библиотека `Transitions`): вход у цели, уход от неё, зерно, Reduce Motion.
+    var enter: TransitionKind = .glitchBars
+    var exit: TransitionKind = .glitchBars
+    var seed = 0
+    var reduceMotion = false
+    /// Вайб: смены трека (время таймлайна) — глитч 1.
+    var glitchMarks: [Double] = []
+    /// «На окне»: экран окна (если не экран notch), мини-прыжок (откуда и когда), держится, пока окно тащат.
+    var screenFrame: CGRect?
+    var hopAt: Double?
+    var hopFrom: CGRect?
+    var perchHold = false
+    /// Снимок: окна поверх того, на котором сидит.
+    var backdropAbove: [CGRect] = []
+    /// «На окне» терминала: смотрит за сессией (реплики, конец, злорадство).
+    var watch: SceneWatch?
+    /// Оборвали, потому что ждут сразу несколько сессий: мини-маска — рой глаз перед молнией домой.
+    var overload = false
 
     var options: SceneOptions {
         var o = SceneOptions(text: content.status.count, lines: content.lines.map(\.count), rows: min(content.rows.count, rowsCap),
@@ -113,11 +135,22 @@ struct SceneRun: Equatable {
         o.controls = controls
         if case .row(let i)? = hover { o.hoverRow = i }
         o.hoverAt = hoverAt
+        o.enter = enter
+        o.exit = exit
+        o.seed = seed
+        o.reduceMotion = reduceMotion
+        o.glitchMarks = glitchMarks
+        o.perchChars = content.bubble?.count ?? 0
+        o.hopAt = hopAt
+        o.hopFrom = hopFrom
+        o.perchHold = perchHold
+        o.watch = watch
+        o.overload = overload
         return o
     }
 
     /// Конец таймлайна.
-    var end: Double { abortedAt.map { $0 + SceneTimeline.recallDuration } ?? SceneTimeline.duration(kind, options) }
+    var end: Double { abortedAt.map { $0 + SceneTimeline.recallLen(kind, options) } ?? SceneTimeline.duration(kind, options) }
 
     /// Секунды стены от начала сцены.
     func wall(_ date: Date = Date()) -> Double { date.timeIntervalSince(start) }
@@ -132,7 +165,7 @@ struct SceneRun: Equatable {
         var o = options
         o.lag = clock.lag(w)
         var f = SceneTimeline.frame(kind, t: t, geometry: geometry, clips: clips, options: o, abortedAt: abortedAt)
-        if !f.wallClock, abortedAt == nil, SceneTimeline.calm(kind, o)?.contains(t) == true { f.clipT += clock.lag(w) }
+        if !f.wallClock, kind != .perch, abortedAt == nil, SceneTimeline.calm(kind, o)?.contains(t) == true { f.clipT += clock.lag(w) }
         return f
     }
 
@@ -177,7 +210,8 @@ struct SceneSchedule: TimelineSchedule {
             let step = SceneTimeline.frameInterval(run.kind, t: run.clock.time(w), aborted: run.abortedAt != nil, options: o)
             // Секунду после смены наведения (наезд в глаз над строкой) — 12 fps и при удержании.
             let fresh = run.hoverAt > 0 && w - run.hoverAt < 1
-            w += slow && !fresh ? max(step, Self.frozenInterval) : step
+            // «На окне» стоит под курсором — картинка не меняется вовсе: кадр раз в секунду (подхватить отпускание).
+            w += slow && run.kind == .perch ? 1 : slow && !fresh ? max(step, Self.frozenInterval) : step
             return date
         }
     }
@@ -191,6 +225,7 @@ struct SceneView: View {
         if let run = model.run {
             TimelineView(SceneSchedule(run: run)) { ctx in
                 let w = run.wall(ctx.date)
+                let _ = StageController.countFrame()
                 SceneCanvas(run: run, t: w, frame: run.frame(wall: w))
             }
         } else {
@@ -216,8 +251,28 @@ struct SceneCanvas: View {
     var body: some View {
         ZStack(alignment: .topLeading) {
             if backdrop { Canvas { ctx, size in drawBackdrop(ctx, size) } }
-            Canvas { ctx, _ in drawBack(ctx) }
-            if let e = frame.eyes {
+            // Подложка есть только у окон и захвата — без неё не держим лишний слой во весь размер панели.
+            if frame.window != nil || frame.takeover != nil || frame.smear != nil { Canvas { ctx, _ in drawBack(ctx) } }
+            if let fx = frame.fx, !fx.plain {
+                // Переход: глаза полосами/столбцами (символ Canvas рисуется по кускам) или их нет вовсе.
+                if let at = fx.rect {
+                    let r = local(at)
+                    Canvas { ctx, _ in
+                        guard let eyes = ctx.resolveSymbol(id: 0) else { return }
+                        TransitionArt.drawContent(fx, symbol: eyes, in: r, squash: frame.squash, ctx)
+                    } symbols: {
+                        SceneEyes(frame: frame, t: t).frame(width: r.width, height: r.height).tag(0)
+                    }
+                }
+            } else if let e = frame.eyes, let pose = frame.rig {
+                // Мини-маска: руки, волосы и «z» выходят за полосу глаз — Canvas с запасом.
+                let r = local(e)
+                let pad = RigCanvas.margin(r.size)
+                RigCanvas(pose: pose, glitch: frame.glitch, pad: pad)
+                    .frame(width: r.width + 2 * pad.width, height: r.height + 2 * pad.height)
+                    .scaleEffect(x: 1 + (1 - frame.squash) * 0.25, y: max(0.02, frame.squash))
+                    .position(x: r.midX, y: r.midY)
+            } else if let e = frame.eyes {
                 let r = local(e)
                 SceneEyes(frame: frame, t: t)
                     .frame(width: r.width, height: r.height)
@@ -247,6 +302,15 @@ struct SceneCanvas: View {
                 let len = r.width * (0.2 + 0.6 * CGFloat(TickNoise.unit(k, 3)))
                 ctx.fill(Path(CGRect(x: r.minX + 14, y: y, width: len, height: 6)), with: .color(Color(white: 0.3)))
             }
+            // Кнопки окна — их Capri не закрывает.
+            for (k, c) in [Color.red, .yellow, .green].enumerated() {
+                ctx.fill(Path(ellipseIn: CGRect(x: r.minX + 9 + CGFloat(k) * 20, y: r.minY + 7, width: 12, height: 12)), with: .color(c.opacity(0.8)))
+            }
+        }
+        for a in run.backdropAbove {
+            let r = local(a)
+            ctx.fill(Path(roundedRect: r, cornerRadius: 10), with: .color(Color(white: 0.24)))
+            ctx.stroke(Path(roundedRect: r, cornerRadius: 10), with: .color(Color(white: 0.4)), lineWidth: 1)
         }
         // Вырез и строка меню.
         let home = local(run.geometry.home)
@@ -260,7 +324,37 @@ struct SceneCanvas: View {
     private func drawBack(_ ctx: GraphicsContext) {
         if let w = frame.window { drawWindow(w, ctx) }
         if let k = frame.takeover { drawTakeover(k, ctx) }
+        if let m = frame.smear { drawSmear(m, ctx) }
     }
+
+    /// Капли у верхнего края окна терминала: малиновые столбцы волос с фиолетовой тенью со сдвигом (как игла молнии),
+    /// скруглённым низом, полупрозрачные, в узкой полосе под местом посадки. Только рисунок поверх чужого окна.
+    private func drawSmear(_ m: WindowSmear, _ ctx: GraphicsContext) {
+        let r = local(m.rect)
+        var c = ctx
+        c.opacity = Double(m.alpha)
+        // Только по самому окну (капли за край не вылезают — иначе висят «таблетками» в воздухе).
+        c.clip(to: Path(roundedRect: local(m.clip), cornerRadius: 10))
+        if m.tint > 0 { c.fill(Path(r), with: .color(BiblePalette.hair.opacity(Double(m.tint)))) }
+        var shade = Path(), red = Path(), dark = Path()
+        for (i, col) in m.columns.enumerated() {
+            let x = r.minX + col.x * r.width
+            let w = max(1, col.w * r.width + 0.5)
+            let top = r.minY + col.top * r.height
+            let bottom = r.minY + col.bottom * r.height
+            // Верх — прямой срез, низ — капля (полуэллипс не выше 7 pt).
+            let cap = min(w * 0.45, 7, max(0, bottom - top) / 2)
+            var p = Path(CGRect(x: x, y: top, width: w, height: max(0, bottom - top - cap)))
+            if cap > 0.5 { p.addEllipse(in: CGRect(x: x, y: bottom - 2 * cap, width: w, height: 2 * cap)) }
+            // Соседние столбцы чуть разного тона — видно, что стекают столбцами, а не сплошной плашкой.
+            if TickNoise.unit(i, 1365) < 0.4 { dark.addPath(p) } else { red.addPath(p) }
+            shade.addPath(p.offsetBy(dx: 2, dy: 3))
+        }
+        c.fill(shade, with: .color(Palette.violet.opacity(0.75)))
+        c.fill(red, with: .color(BiblePalette.hair))
+        c.fill(dark, with: .color(Color(red: 0xC8 / 255, green: 0x08 / 255, blue: 0x3A / 255)))
+    }
+
 
     private func drawWindow(_ w: SceneWindow, _ ctx: GraphicsContext) {
         let r = local(w.rect)
@@ -425,23 +519,22 @@ struct SceneCanvas: View {
 
     private func drawFront(_ ctx: GraphicsContext) {
         if let w = frame.window { drawWindowFront(w, ctx) }
+        if let fx = frame.fx {
+            if let rb = fx.ribbon { TransitionArt.drawRibbon(rb, map: { self.local($0) }, ctx) }
+            if let f = fx.flash { TransitionArt.drawFlash(f, in: local(f.rect), ctx) }
+            if let b = fx.bolt { TransitionArt.drawBolt(b, map: { self.local($0) }, width: 3, ctx) }
+        }
         if let b = frame.bolt { drawBolt(b, ctx, width: 3) }
         if frame.flash > 0, let at = frame.flashAt {
-            // Вспышка 2 кадра: белое ядро-звезда и розовое кольцо, без мягкого «шара».
+            // Вспышка 2 кадра сплошным цветом (волосы или маска) с белым ядром — «вошла» в точку.
             let p = local(at), f = Double(frame.flash)
-            let r: CGFloat = 26 + 30 * (1 - frame.flash)
-            var star = Path()
-            for i in 0..<16 {
-                let a = CGFloat(i) * .pi / 8, rad = i % 2 == 0 ? r : r * 0.22
-                let q = CGPoint(x: p.x + cos(a) * rad, y: p.y + sin(a) * rad * 0.7)
-                if i == 0 { star.move(to: q) } else { star.addLine(to: q) }
-            }
-            star.closeSubpath()
+            let r: CGFloat = 18 + 22 * (1 - frame.flash)
             var c = ctx
             c.opacity = f
-            c.fill(star, with: .color(.white))
-            c.stroke(Path(ellipseIn: CGRect(x: p.x - r * 1.2, y: p.y - r * 0.84, width: r * 2.4, height: r * 1.68)),
-                     with: .color(CapriFX.hackPink), lineWidth: 2)
+            let box = CGRect(x: p.x - r * 1.2, y: p.y - r * 0.8, width: r * 2.4, height: r * 1.6)
+            c.fill(TransitionArt.burst(seed: run.seed &+ Int(t * 24), in: box), with: .color(BiblePalette.flash(frame.flashTint)))
+            c.fill(TransitionArt.burst(seed: run.seed &+ 5, in: box.insetBy(dx: r * 0.75, dy: r * 0.5)), with: .color(.white))
+            c.stroke(TransitionArt.burst(seed: run.seed &+ Int(t * 24), in: box), with: .color(BiblePalette.bolt), lineWidth: 1.5)
         }
         if let w = frame.window, w.melt > 0 { drawMelt(w, ctx) }
         if let k = frame.takeover { drawTakeoverFront(k, ctx) }
@@ -454,30 +547,96 @@ struct SceneCanvas: View {
             c.stroke(Path(ellipseIn: CGRect(x: p.x - rr, y: p.y - rr * 0.6, width: 2 * rr, height: 1.2 * rr)), with: .color(CapriFX.hackPink), lineWidth: 2.5)
             c.stroke(Path(ellipseIn: CGRect(x: p.x - rr * 0.7, y: p.y - rr * 0.42, width: 1.4 * rr, height: 0.84 * rr)), with: .color(Palette.acid), lineWidth: 1)
         }
-        if run.controls, run.content.track != nil, !run.kind.boxed, frame.eyes != nil,
+        if run.controls, run.content.track != nil, !run.kind.boxed, run.kind != .perch, frame.eyes != nil,
            run.abortedAt == nil, SceneTimeline.calm(run.kind, run.options)?.contains(run.clock.time(t)) == true {
             // ⏮ ⏯ ⏭ под глазами (наведение на глаза).
             let rects = SceneTimeline.eyeControls(run.geometry.target).map { ($0.id, local($0.rect)) }
             StageWindows.drawEyeControls(rects, playing: run.content.trackPlaying, hover: run.hover, ctx)
+        }
+        if let b = frame.bubble, let text = b.say < run.content.says.count ? run.content.says[b.say] : run.content.bubble {
+            drawBubble(b, text: text, ctx)
         }
         if let cap = frame.caption, cap.typed > 0 {
             StageWindows.drawCaption(String(run.content.caption.prefix(cap.typed)), full: run.content.caption.count == cap.typed,
                                      at: local(cap.anchor), failed: cap.failed, ctx)
         }
         for n in frame.notes {
-            let glyph = ["♪", "♫", "♬"][n.glyph % 3]
             var c = ctx
             c.opacity = Double(n.alpha)
-            c.draw(Text(glyph).font(.system(size: 22, weight: .heavy)).foregroundColor(Palette.violet), at: local(n.center).applying(.init(translationX: 1.5, y: 1.5)))
-            c.draw(Text(glyph).font(.system(size: 22, weight: .heavy)).foregroundColor(CapriFX.hackPink), at: local(n.center))
+            // Нота — контуром (не текстом: набор текста каждый кадр был самым дорогим в покое вайба).
+            let path = Self.notePath(n.glyph % 3, at: local(n.center))
+            c.fill(path.offsetBy(dx: 1.5, dy: 1.5), with: .color(Palette.violet))
+            c.fill(path, with: .color(CapriFX.hackPink))
         }
     }
 
+    /// Пузырь реплики: тёмная плашка, розовая рамка 1 px с уголком к глазам, моно 11 pt с кареткой. Проступает и
+    /// рассыпается полосами со сдвигом.
+    private func drawBubble(_ b: SceneBubble, text: String, _ ctx: GraphicsContext) {
+        let r = local(b.rect)
+        let pink = CapriFX.hackPink
+        let typed = String(text.prefix(b.typed)) + (b.caret ? "▮" : "")
+        func body(_ c: GraphicsContext, dx: CGFloat) {
+            let box = r.offsetBy(dx: dx, dy: 0)
+            c.fill(Path(box), with: .color(Color(red: 0.03, green: 0.02, blue: 0.05).opacity(0.94)))
+            c.stroke(Path(box.insetBy(dx: 0.5, dy: 0.5)), with: .color(pink), lineWidth: 1)
+            c.fill(Path(CGRect(x: box.minX + 1, y: box.minY + 1, width: 2, height: box.height - 2)), with: .color(Palette.acid))
+            c.draw(Text(typed).font(.mono(11, .semibold)).foregroundColor(Palette.text),
+                   at: CGPoint(x: box.minX + 10, y: box.midY), anchor: .leading)
+        }
+        if b.glitch {
+            // Полосы со сдвигом и RGB-разнос: три горизонтальных среза пузыря.
+            let tick = Int(t * 24)
+            for k in 0..<3 {
+                var c = ctx
+                let band = CGRect(x: r.minX - 20, y: r.minY + r.height * CGFloat(k) / 3, width: r.width + 40, height: r.height / 3 + 0.5)
+                c.clip(to: Path(band))
+                let dx = (CGFloat(TickNoise.unit(k, 77 + tick)) - 0.5) * 18
+                c.opacity = 0.55
+                c.fill(Path(r.offsetBy(dx: dx - 3, dy: 0)), with: .color(Palette.violet))
+                c.opacity = 1
+                body(c, dx: dx)
+            }
+        } else {
+            body(ctx, dx: 0)
+        }
+    }
+
+    /// Нота ♪ (0), ♫ (1), ♬ (2) контуром ≈ 22 pt вокруг `c` (координаты панели, сверху вниз).
+    static func notePath(_ glyph: Int, at c: CGPoint) -> Path {
+        var p = Path()
+        func head(_ x: CGFloat, _ y: CGFloat) {
+            p.addPath(Path(ellipseIn: CGRect(x: -4.5, y: -3.2, width: 9, height: 6.4))
+                .applying(CGAffineTransform(rotationAngle: -0.45).concatenating(CGAffineTransform(translationX: x, y: y))))
+        }
+        let base = c.y + 8
+        switch glyph {
+        case 0:
+            head(c.x - 3, base)
+            p.addRect(CGRect(x: c.x + 0.6, y: base - 17, width: 2, height: 17))
+            p.move(to: CGPoint(x: c.x + 2.6, y: base - 17))
+            p.addQuadCurve(to: CGPoint(x: c.x + 7, y: base - 6), control: CGPoint(x: c.x + 9, y: base - 12))
+            p.addLine(to: CGPoint(x: c.x + 2.6, y: base - 12))
+            p.closeSubpath()
+        default:
+            head(c.x - 7, base)
+            head(c.x + 5, base - 3)
+            p.addRect(CGRect(x: c.x - 3.4, y: base - 17, width: 2, height: 17))
+            p.addRect(CGRect(x: c.x + 8.6, y: base - 20, width: 2, height: 17))
+            var beam = Path()
+            beam.addLines([CGPoint(x: c.x - 3.4, y: base - 17), CGPoint(x: c.x + 10.6, y: base - 20),
+                           CGPoint(x: c.x + 10.6, y: base - 16), CGPoint(x: c.x - 3.4, y: base - 13)])
+            beam.closeSubpath()
+            p.addPath(beam)
+            if glyph == 2 { p.addPath(beam.offsetBy(dx: 0, dy: 6)) }
+        }
+        return p
+    }
+
+    /// Перелёт: розовая игольчатая молния (`TransitionArt.drawBolt`, концы — из общей библиотеки), кипит вместе с `seed`.
     private func drawBolt(_ b: SceneBolt, _ ctx: GraphicsContext, width: CGFloat) {
-        let a = local(b.from), z = local(b.to)
-        let path = CapriFX.boltPath(from: a, to: z, seed: b.seed / 2 + 7, boil: b.seed, reach: b.reach, width: width)
-        ctx.fill(path.offsetBy(dx: 1.2, dy: 1.5), with: .color(Palette.violet))
-        ctx.fill(path, with: .color(Palette.crimson))
+        guard let bolt = Transitions.bolt(from: b.from, to: b.to, seed: run.seed &+ b.seed &* 7, reach: b.reach) else { return }
+        TransitionArt.drawBolt(bolt, map: { self.local($0) }, width: width, ctx)
     }
 
     /// Окно рассыпается: квадратики рамки падают и гаснут.
@@ -527,12 +686,13 @@ struct SceneCanvas: View {
             ctx.stroke(at, with: .color(.white), lineWidth: 1)
         }
         if let seed = k.edgeBolt {
-            // Тонкая красная молния вдоль верхнего или правого края.
+            // Тонкая розовая молния вдоль верхнего или правого края (точки уже локальные).
             let top = seed % 2 == 0
             let from = top ? CGPoint(x: a.minX + a.width * 0.1, y: a.minY + 2) : CGPoint(x: a.maxX - 2, y: a.minY + a.height * 0.1)
             let to = top ? CGPoint(x: a.minX + a.width * 0.7, y: a.minY + 4) : CGPoint(x: a.maxX - 4, y: a.minY + a.height * 0.8)
-            let path = CapriFX.boltPath(from: from, to: to, seed: seed, boil: Int(t * 12), width: 1.6)
-            ctx.fill(path, with: .color(Palette.crimson))
+            if let bolt = Transitions.bolt(from: from, to: to, seed: seed &* 13 &+ Int(t * 12)) {
+                TransitionArt.drawBolt(bolt, map: { $0 }, width: 1.4, ctx)
+            }
         }
     }
 }
@@ -544,6 +704,14 @@ struct SceneEyes: View {
 
     var body: some View {
         let tick = Int(t * CapriFace.fps)
+        if let pose = frame.rig {
+            RigCanvas(pose: pose, glitch: frame.glitch)
+        } else {
+            shot(tick)
+        }
+    }
+
+    private func shot(_ tick: Int) -> some View {
         CapriShotView(image: SceneArt.image(frame.clip, t: frame.clipT, mode: frame.clipMode),
                       glitch: frame.glitch > 0 ? CapriFX.make(level: frame.glitch, tick: tick, strength: 1) : nil,
                       bolt: nil, fill: frame.face != nil, face: frame.face)
@@ -620,6 +788,8 @@ final class StageController {
     private var panel: StagePanel?
     private var hitView: StageHitView?
     private var endWork: DispatchWorkItem?
+    /// Сжать/разжать панель на границе спокойной фазы.
+    private var compactWork: DispatchWorkItem?
     /// Мониторы мыши — только пока идёт сцена с горячими точками.
     private var monitors: [Any] = []
     private var dragging = false
@@ -638,7 +808,18 @@ final class StageController {
     var makeMenu: (() -> NSMenu)?
     var log: ((String) -> Void)?
     private(set) var suppressed = false
+    /// `--debug-control`: живые сцены на столе не играют (агенты проверяют без Тимофея — живая сцена поверх его окон
+    /// выглядит как «появилась без причины»); листы `scene sheet` — офскрин, работают. `scene live on` — разрешить.
+    var offscreenOnly = false
     private(set) var lastTarget = ""
+    /// Сцена доиграла до конца (не обрыв, не «×») — вайб после этого кивает в notch.
+    var onFinished: ((SceneKind) -> Void)?
+    /// Сцена убрана с экрана (любым путём) — «на окне» снимает опрос окна и монитор мыши.
+    var onEnded: ((SceneKind) -> Void)?
+    /// Прошлые виды входа/выхода — два подряд одинаковыми не бывают.
+    private var lastEnter: TransitionKind?
+    private var lastExit: TransitionKind?
+    private var fxCount = 0
 
     var running: Bool { model.run != nil }
     var kind: SceneKind? { model.run?.kind }
@@ -700,18 +881,139 @@ final class StageController {
             lastTarget = w == nil ? "corner" : "terminal"
             backdropWindow = w
             target = SceneTimeline.eyesInArea(area!)
+        case .perch:
+            // Живой показ — `perch(_:)`; здесь — лист и отладка: муляж окна посреди экрана (варианты — разные края).
+            guard backdrop || variant?.hasPrefix("mock") == true else { lastTarget = "none"; return nil }
+            if variant?.hasPrefix("watch") == true { return watchMock(variant, home: home, visible: visible, screen: screen.frame, content: content) }
+            let line = content.bubble ?? PerchLines.compose(variant == "long"
+                ? PerchFacts(app: "Obsidian", category: .notes, waiting: 2) : PerchFacts(app: "Xcode", category: .ide), seed: 3)
+            let m = Self.perchMock(variant, visible: visible, chars: line.count)
+            guard let spot = m.spot else { lastTarget = "none"; return nil }
+            var c = content
+            c.bubble = line
+            let g = SceneGeometry(home: home, target: spot.eyes, visible: visible, bubble: spot.bubble)
+            guard let (origin, size) = Self.panelFrame(g, screen: screen.frame) else { return nil }
+            var run = SceneRun(kind: kind, start: Date(), geometry: g, origin: origin, size: size, clips: SceneArt.clips, content: c,
+                               abortedAt: nil, backdropWindow: backdrop ? m.window : nil, rowsCap: rowsCap)
+            run.backdropAbove = backdrop ? m.above : []
+            lastTarget = "perch(mock) \(spot.edge.rawValue)"
+            pickTransitions(&run)
+            return run
         case .vibe:
-            break
+            // На окне плеера (или переднем окне); места нет — сцены нет (кивание в notch), в угол не идём.
+            if let spot = Self.vibeSpot(on: screen) {
+                target = spot.eyes; backdropWindow = spot.window; lastTarget = spot.player ? "player" : "window"
+            } else if backdrop || variant == "mock" {
+                // Лист или отладка (`scene vibe mock`): муляж окна плеера посреди экрана.
+                let w = CGRect(x: visible.midX - 300, y: visible.midY - 220, width: 640, height: 400)
+                target = SceneLayout.onWindow(w, visible: visible) ?? corner; backdropWindow = w; lastTarget = "player(mock)"
+            } else {
+                lastTarget = "none"
+                return nil
+            }
         }
         let g = SceneGeometry(home: home, target: target, area: area, visible: visible, cursor: NSEvent.mouseLocation)
-        guard let (origin, size) = Self.panelFrame(g, screen: screen) else { return nil }
-        return SceneRun(kind: kind, start: Date(), geometry: g, origin: origin, size: size, clips: SceneArt.clips, content: content,
-                        abortedAt: nil, backdropWindow: backdrop ? backdropWindow : nil, rowsCap: rowsCap)
+        guard let (origin, size) = Self.panelFrame(g, screen: screen.frame) else { return nil }
+        var run = SceneRun(kind: kind, start: Date(), geometry: g, origin: origin, size: size, clips: SceneArt.clips, content: content,
+                           abortedAt: nil, backdropWindow: backdrop ? backdropWindow : nil, rowsCap: rowsCap)
+        pickTransitions(&run)
+        return run
     }
 
-    /// Панель — всё, что сцена может занять, в пределах экрана.
-    static func panelFrame(_ g: SceneGeometry, screen: NSScreen) -> (CGPoint, CGSize)? {
-        let bounds = g.bounds.intersection(screen.frame).integral
+    /// Виды входа и выхода по зерну, не повторяя прошлые; Reduce Motion — только полосы, без вспышек.
+    private func pickTransitions(_ run: inout SceneRun) {
+        fxCount += 1
+        let seed = (Int(Date().timeIntervalSince1970 * 1000) & 0xFFFFF) &+ fxCount &* 7919
+        let rm = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        run.seed = seed
+        run.reduceMotion = rm
+        run.enter = Transitions.pick(.enter, seed: seed, avoid: lastEnter, reduceMotion: rm)
+        run.exit = Transitions.pick(.exit, seed: seed, avoid: lastExit, reduceMotion: rm)
+        lastEnter = run.enter
+        lastExit = run.exit
+    }
+
+    /// Муляж «смотрит в терминал» для листа: окно терминала посреди экрана, реплики по ходу. Варианты: `watch` —
+    /// смотрит, на 6-й секунде новая реплика; `watchgloat` — сессия доработала на 5-й (злорадство и уход);
+    /// `watchend` — сессию закрыли на 4-й.
+    private func watchMock(_ variant: String?, home: CGRect, visible: CGRect, screen: CGRect, content: SceneContent) -> SceneRun? {
+        let w = CGRect(x: visible.midX - 330, y: visible.midY - 230, width: 660, height: 420)
+        let first = SessionRemark.opening(WatchedSession(name: "votek2", status: .running, since: 0,
+                                                         tail: ["Running tests…", "npm test"]), now: 240)
+        // Пузырь — под самую длинную реплику листа (живой показ подгоняет его под каждую, `watchSay`).
+        let longest = max(first.count, variant == "watchgloat" ? 29 : 10)
+        guard let spot = PerchLayout.spot(window: w, above: [], visible: visible, bubble: PerchLayout.bubbleSize(chars: longest))
+        else { return nil }
+        var c = content
+        c.bubble = first
+        c.says = [first]
+        let g = SceneGeometry(home: home, target: spot.eyes, area: w, visible: visible, bubble: spot.bubble)
+        guard let (origin, size) = Self.panelFrame(g, screen: screen) else { return nil }
+        var run = SceneRun(kind: .perch, start: Date(), geometry: g, origin: origin, size: size, clips: SceneArt.clips, content: c,
+                           abortedAt: nil, backdropWindow: w, rowsCap: 1)
+        var watch = SceneWatch(window: w, says: [SceneSay(at: WatchTimeline.firstSay, chars: first.count)])
+        switch variant {
+        case "watchgloat":
+            let line = "Готово. Без тебя справился ^^"
+            watch.says.append(SceneSay(at: 5.0, chars: line.count))
+            watch.gloatAt = 5.0
+            c.bubble = line
+            c.says.append(line)
+        case "watchend":
+            watch.end = 4.0
+        case "watchghost":
+            // Связь с хостом потеряна на 4-й секунде: пиксельный призрак.
+            watch.ghostAt = 4.0
+        case "watchsleep":
+            // Никто не трогает: на 41-й секунде засыпает, на 50-й реплика будит.
+            let line = "Ещё пыхтит."
+            watch.says.append(SceneSay(at: 50.0, chars: line.count))
+            c.bubble = line
+            c.says.append(line)
+        default:
+            let line = "Упало! Ха."
+            watch.says.append(SceneSay(at: 6.0, chars: line.count))
+            c.bubble = line
+            c.says.append(line)
+        }
+        run.content = c
+        run.watch = watch
+        pickTransitions(&run)
+        run.enter = .columnSmear
+        lastTarget = "watch(mock) \(spot.edge.rawValue)"
+        return run
+    }
+
+    /// Муляж для листа/отладки «на окне»: окно посреди экрана; `left` — правый верх закрыт другим окном, `side` — окно
+    /// упирается в строку меню (висит на боку), `bottom` — и справа места нет (нижний край).
+    static func perchMock(_ variant: String?, visible v: CGRect, chars: Int) -> (window: CGRect, above: [CGRect], spot: PerchSpot?) {
+        var w = CGRect(x: v.midX - 320, y: v.midY - 220, width: 640, height: 400)
+        var above: [CGRect] = []
+        switch variant?.replacingOccurrences(of: "mock", with: "") {
+        case "left": above = [CGRect(x: w.maxX - 220, y: w.maxY - 120, width: 420, height: 300)]
+        case "side": w = CGRect(x: v.midX - 420, y: v.midY - 140, width: 640, height: v.maxY - (v.midY - 140))
+        case "bottom": w = CGRect(x: v.maxX - 700, y: v.midY - 60, width: 700, height: v.maxY - (v.midY - 60))
+        default: break
+        }
+        return (w, above, PerchLayout.spot(window: w, above: above, visible: v, bubble: PerchLayout.bubbleSize(chars: chars)))
+    }
+
+    /// Где кивать под музыку на экране notch (окно плеера, иначе переднее окно); nil — места нет.
+    static func vibeSpot(on screen: NSScreen) -> (eyes: CGRect, window: CGRect, player: Bool)? {
+        let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let primary = NSScreen.screens.first?.frame.height ?? screen.frame.height
+        let players = Set(NSWorkspace.shared.runningApplications
+            .filter { SceneLayout.players.contains($0.bundleIdentifier ?? "") }.map(\.processIdentifier))
+        return SceneLayout.vibeSpot(windows: raw.compactMap(WindowInfo.from), players: players,
+                                    front: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+                                    own: ProcessInfo.processInfo.processIdentifier, screen: screen.frame,
+                                    visible: screen.visibleFrame, primaryHeight: primary)
+    }
+
+    /// Панель — всё, что сцена может занять, в пределах экрана; в спокойной фазе глаз на столе (`compact`) — только
+    /// вокруг них.
+    static func panelFrame(_ g: SceneGeometry, screen: CGRect, compact: CGRect? = nil) -> (CGPoint, CGSize)? {
+        let bounds = (compact ?? g.bounds).intersection(screen).integral
         guard !bounds.isNull, bounds.width > 0 else { return nil }
         return (bounds.origin, bounds.size)
     }
@@ -739,13 +1041,175 @@ final class StageController {
     @discardableResult
     func play(_ kind: SceneKind, variant: String? = nil, terminal: CGRect? = nil, content: SceneContent? = nil, around: CGRect? = nil) -> Bool {
         guard !suppressed else { log?("scene \(kind.rawValue): skip fullscreen"); return false }
+        guard !offscreenOnly else { log?("scene \(kind.rawValue): skip offscreen-only (scene live on)"); return false }
         stop()
         guard let run = makeRun(kind, variant: variant, terminal: terminal, content: content, around: around) else {
-            log?("scene \(kind.rawValue): no screen"); return false
+            log?("scene \(kind.rawValue): \(kind == .vibe && lastTarget == "none" ? "no place" : "no screen")"); return false
         }
         show(run)
-        log?("scene \(kind.rawValue) → \(lastTarget) frame=\(NSStringFromRect(panel?.frame ?? .zero))")
+        log?("scene \(kind.rawValue) → \(lastTarget) fx=\(run.enter.rawValue)/\(run.exit.rawValue) frame=\(NSStringFromRect(panel?.frame ?? .zero))")
         return true
+    }
+
+    /// «На окне»: куда сесть (место уже выбрано `PerchCenter`), экран окна, реплика.
+    struct PerchShow {
+        var spot: PerchSpot
+        var window: CGRect
+        var screen: CGRect
+        var visible: CGRect
+        var line: String
+    }
+
+    /// Сесть на окно. Экран не тот, где notch, — молния приходит с верхнего края того экрана (панель одного экрана).
+    @discardableResult
+    func perch(_ p: PerchShow) -> Bool {
+        guard !suppressed else { log?("scene perch: skip fullscreen"); return false }
+        guard !offscreenOnly else { log?("scene perch: skip offscreen-only (scene live on)"); return false }
+        stop()
+        let notchScreen = screen()?.frame
+        var home = self.home() ?? CGRect(x: p.screen.midX - 16, y: p.screen.maxY - 20, width: 32, height: 16)
+        if notchScreen != p.screen { home = CGRect(x: p.screen.midX - 16, y: p.screen.maxY - 18, width: 32, height: 16) }
+        var c = content()
+        c.bubble = p.line
+        let g = SceneGeometry(home: home, target: p.spot.eyes, visible: p.visible, cursor: NSEvent.mouseLocation, bubble: p.spot.bubble)
+        guard let (origin, size) = Self.panelFrame(g, screen: p.screen) else { return false }
+        var run = SceneRun(kind: .perch, start: Date(), geometry: g, origin: origin, size: size, clips: SceneArt.clips, content: c,
+                           abortedAt: nil, backdropWindow: nil, rowsCap: 1)
+        run.screenFrame = p.screen
+        pickTransitions(&run)
+        lastTarget = "perch \(p.spot.edge.rawValue)\(notchScreen == p.screen ? "" : " (другой экран)")"
+        show(run)
+        log?("scene perch → \(lastTarget) fx=\(run.enter.rawValue)/\(run.exit.rawValue) frame=\(NSStringFromRect(panel?.frame ?? .zero))")
+        return true
+    }
+
+    /// Окно сдвинули — мини-прыжок на новое место (0,2 с), панель на это время — оба места.
+    func perchHop(to spot: PerchSpot) {
+        guard var run = model.run, run.kind == .perch, run.abortedAt == nil, let t = elapsed,
+              let screen = run.screenFrame ?? screen()?.frame else { return }
+        let w = run.wall()
+        let before = SceneLayout.compactPanel(.perch, geometry: run.geometry)
+        run.hopFrom = run.geometry.target
+        run.hopAt = t
+        run.perchHold = false
+        if run.clock.pinned { run.clock.pin(false, wall: w, calm: true) }
+        run.geometry.target = spot.eyes
+        run.geometry.bubble = spot.bubble
+        let after = SceneLayout.compactPanel(.perch, geometry: run.geometry)
+        if let a = before, let b = after, let (origin, size) = Self.panelFrame(run.geometry, screen: screen, compact: a.union(b)) {
+            run.origin = origin
+            run.size = size
+            panel?.setFrame(CGRect(origin: origin, size: size), display: true)
+        }
+        model.run = run
+        log?("scene perch: hop → \(Int(spot.eyes.minX)),\(Int(spot.eyes.minY))")
+        reschedule()
+        DispatchQueue.main.asyncAfter(deadline: .now() + PerchTimeline.hopLen + 0.05) { [weak self] in
+            guard self?.model.run?.kind == .perch else { return }
+            self?.scheduleCompact()
+        }
+    }
+
+    /// Окно тащат — держится на месте (таймлайн стоит, глитч 1); отпустили — `perchHop` или `perchHold(false)`.
+    func perchHold(_ on: Bool) {
+        guard var run = model.run, run.kind == .perch, run.abortedAt == nil, run.perchHold != on else { return }
+        let w = run.wall()
+        run.perchHold = on
+        // Тот же механизм, что «📌» (наведение мышью его не снимает): уйти посреди перетаскивания она не должна.
+        run.clock.pin(on, wall: w, calm: run.calm(wall: w))
+        model.run = run
+        reschedule()
+    }
+
+    /// «Смотрит в терминал»: куда сесть (место выбрано `PerchCenter`), окно терминала, первая реплика.
+    struct WatchShow {
+        var spot: PerchSpot
+        var window: CGRect
+        var screen: CGRect
+        var visible: CGRect
+        var line: String
+    }
+
+    /// Вылезти из терминала: молния в окно → окно краснеет и стекает → натекает на край окна → смотрит (≤ 60 с).
+    @discardableResult
+    func watch(_ p: WatchShow) -> Bool {
+        guard !suppressed else { log?("scene watch: skip fullscreen"); return false }
+        guard !offscreenOnly else { log?("scene watch: skip offscreen-only (scene live on)"); return false }
+        stop()
+        let notchScreen = screen()?.frame
+        var home = self.home() ?? CGRect(x: p.screen.midX - 16, y: p.screen.maxY - 20, width: 32, height: 16)
+        if notchScreen != p.screen { home = CGRect(x: p.screen.midX - 16, y: p.screen.maxY - 18, width: 32, height: 16) }
+        var c = content()
+        c.bubble = p.line
+        c.says = [p.line]
+        // `area` — окно терминала: панель на входе накрывает его целиком (размаз), в покое — только глаза и пузырь.
+        let g = SceneGeometry(home: home, target: p.spot.eyes, area: p.window, visible: p.visible, cursor: NSEvent.mouseLocation,
+                              bubble: p.spot.bubble)
+        guard let (origin, size) = Self.panelFrame(g, screen: p.screen) else { return false }
+        var run = SceneRun(kind: .perch, start: Date(), geometry: g, origin: origin, size: size, clips: SceneArt.clips, content: c,
+                           abortedAt: nil, backdropWindow: nil, rowsCap: 1)
+        run.screenFrame = p.screen
+        run.watch = SceneWatch(window: p.window, says: [SceneSay(at: WatchTimeline.firstSay, chars: p.line.count)])
+        pickTransitions(&run)
+        // Вылезает из размаза — столбцами.
+        run.enter = run.reduceMotion ? .glitchBars : .columnSmear
+        lastTarget = "watch \(p.spot.edge.rawValue)\(notchScreen == p.screen ? "" : " (другой экран)")"
+        show(run)
+        log?("scene watch → \(lastTarget) frame=\(NSStringFromRect(panel?.frame ?? .zero))")
+        return true
+    }
+
+    /// Смотрит в терминал прямо сейчас (в покое, не уходит).
+    var watching: Bool {
+        guard let run = model.run, run.watch != nil, run.abortedAt == nil, let t = elapsed else { return false }
+        return t < WatchTimeline.leaveStart(run.watch!)
+    }
+
+    /// Новая реплика в терминале: печатается с ближайшего момента покоя; `bubble` — пузырь под её длину.
+    /// `gloat` — злорадствует с этого момента и уходит; `leave` — уходит, дочитав.
+    func watchSay(_ line: String, bubble: CGRect?, gloat: Bool = false, leave: Bool = false) {
+        guard var run = model.run, var w = run.watch, run.abortedAt == nil, let t = elapsed,
+              t < WatchTimeline.leaveStart(w) else { return }
+        let at = max(t, WatchTimeline.firstSay)
+        w.says.append(SceneSay(at: at, chars: line.count))
+        if gloat { w.gloatAt = at }
+        // Уходит, дочитав реплику.
+        if leave { w.end = min(w.end, at + Double(line.count) / PerchTimeline.cps + 1.6) }
+        run.watch = w
+        run.content.bubble = line
+        run.content.says.append(line)
+        if let bubble { run.geometry.bubble = bubble }
+        model.run = run
+        log?("scene watch: say\(gloat ? " (злорадство)" : "") at \(String(format: "%.1f", at))")
+        reschedule()
+        scheduleCompact()
+        refreshIgnores()
+    }
+
+    /// Связь с хостом сессии потеряна: рассыпается пиксельным призраком на краю окна и уходит.
+    func watchGhost() {
+        guard var run = model.run, var w = run.watch, run.abortedAt == nil, w.ghostAt == nil, let t = elapsed,
+              t < WatchTimeline.leaveStart(w) else { return }
+        w.ghostAt = max(WatchTimeline.arrive, t)
+        if let g = w.gloatAt, g > w.ghostAt! { w.gloatAt = nil }
+        run.watch = w
+        model.run = run
+        log?("scene watch: призрак (связь потеряна) at \(String(format: "%.1f", t))")
+        reschedule()
+        scheduleCompact()
+    }
+
+    /// Перестать смотреть сейчас (сессия пропала, досмотрела раньше): уход с края окна.
+    func watchEnd(_ why: String) {
+        guard var run = model.run, var w = run.watch, run.abortedAt == nil, let t = elapsed,
+              t < WatchTimeline.leaveStart(w) else { return }
+        w.end = max(WatchTimeline.arrive, t)
+        if let g = w.gloatAt, g > w.end { w.gloatAt = nil }
+        run.watch = w
+        model.run = run
+        log?("scene watch: end (\(why)) at \(String(format: "%.1f", t))")
+        reschedule()
+        scheduleCompact()
     }
 
     /// «Думает» → ответ в том же окне (где бы оно ни стояло): глитч-переход вместо прилёта.
@@ -767,11 +1231,14 @@ final class StageController {
         let panel = self.panel ?? makePanel()
         self.panel = panel
         panel.setFrame(CGRect(origin: run.origin, size: run.size), display: false)
+        compactWork?.cancel()
+        compactWork = nil
         setIgnores(true)
         model.run = run
         panel.orderFrontRegardless()
         onRunning?(true)
         reschedule()
+        scheduleCompact()
         if run.kind != .takeover { installMonitors() }
         // Курсор уже может стоять там, где появится кнопка: проверить в начале спокойной фазы.
         if let calm = SceneTimeline.calm(run.kind, run.options) {
@@ -812,6 +1279,36 @@ final class StageController {
         if let panel, panel.ignoresMouseEvents != value { panel.ignoresMouseEvents = value }
     }
 
+    /// Панель под текущую фазу: в спокойной фазе глаз на столе — сжатая вокруг них, иначе — от notch до цели.
+    private func fitPanel() {
+        guard var run = model.run, let screen = run.screenFrame ?? screen()?.frame else { return }
+        let w = run.wall()
+        let compact = run.abortedAt == nil && SceneTimeline.calm(run.kind, run.options)?.contains(run.clock.time(w)) == true
+            ? SceneLayout.compactPanel(run.kind, geometry: run.geometry) : nil
+        guard let (origin, size) = Self.panelFrame(run.geometry, screen: screen, compact: compact),
+              origin != run.origin || size != run.size else { return }
+        run.origin = origin
+        run.size = size
+        model.run = run
+        panel?.setFrame(CGRect(origin: origin, size: size), display: true)
+    }
+
+    /// Следующая граница спокойной фазы (по часам сцены) — там панель сжимается/разжимается. Удержание двигает её:
+    /// проверяем ещё раз, когда сработает.
+    private func scheduleCompact() {
+        compactWork?.cancel()
+        compactWork = nil
+        fitPanel()
+        guard let run = model.run, run.abortedAt == nil, SceneLayout.compactPanel(run.kind, geometry: run.geometry) != nil,
+              let calm = SceneTimeline.calm(run.kind, run.options) else { return }
+        let t = run.clock.time(run.wall())
+        let next = t < calm.lowerBound ? calm.lowerBound : t < calm.upperBound ? calm.upperBound - 1.0 / 24 : nil
+        guard let next else { return }
+        let work = DispatchWorkItem { [weak self] in self?.scheduleCompact() }
+        compactWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0.02, next - t), execute: work)
+    }
+
     /// Конец сцены по часам: идёт — таймер на остаток; стоит — проверка, когда кончится удержание.
     private func reschedule() {
         endWork?.cancel()
@@ -830,7 +1327,7 @@ final class StageController {
             return    // держат мышью — придёт событие мыши
         }
         let work = DispatchWorkItem { [weak self] in
-            if finish { self?.stop() } else { self?.reschedule() }
+            if finish { self?.finish() } else { self?.reschedule() }
         }
         endWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + max(0.05, delay) + 0.05, execute: work)
@@ -885,7 +1382,7 @@ final class StageController {
         let p = NSEvent.mouseLocation
         var over = SceneLayout.hit(run.hotspots(wall: w), p)
         var controlsChanged = false
-        if !run.kind.boxed, run.content.track != nil {
+        if !run.kind.boxed, run.kind != .perch, run.content.track != nil {
             let want = over.map { $0.kind == .drag || Self.isMusicButton($0.kind) } ?? false
             if want != run.controls {
                 run.controls = want
@@ -925,13 +1422,14 @@ final class StageController {
     /// Перетаскивание: цель и окно едут (не за экран), панель пересчитывается.
     func drag(by d: CGVector) {
         // После обрыва `StageHitView` ещё шлёт перетаскивание — сцена уже летит домой, не двигаем.
-        guard dragging, var run = model.run, run.abortedAt == nil, let screen = screen() else { return }
+        guard dragging, var run = model.run, run.abortedAt == nil, let screen = run.screenFrame ?? screen()?.frame else { return }
         let before = run.geometry.area ?? run.geometry.target
         run.geometry = run.geometry.moved(by: d)
         let after = run.geometry.area ?? run.geometry.target
         run.offset.dx += after.minX - before.minX
         run.offset.dy += after.minY - before.minY
-        guard let (origin, size) = Self.panelFrame(run.geometry, screen: screen) else { return }
+        let compact = run.calm(wall: run.wall()) ? SceneLayout.compactPanel(run.kind, geometry: run.geometry) : nil
+        guard let (origin, size) = Self.panelFrame(run.geometry, screen: screen, compact: compact) else { return }
         run.origin = origin
         run.size = size
         model.run = run
@@ -1010,32 +1508,51 @@ final class StageController {
     }
 
     /// Обрыв (кто-то ждёт ответа, notch раскрыли): молния домой за 0.35 с. Держание и «📌» снимаются.
-    func abort(_ why: String) {
+    func abort(_ why: String, overload: Bool = false) {
         guard var run = model.run, run.abortedAt == nil else { return }
         let w = run.wall()
         run.clock.release(w)
         let t = run.clock.time(w)
         guard t < SceneTimeline.duration(run.kind, run.options) - SceneTimeline.recallDuration else { return }
         run.abortedAt = t
+        run.overload = overload && run.kind == .perch
         run.hover = nil
         dragging = false
         model.run = run
         setIgnores(true)
         removeMonitors()
-        log?("scene abort (\(why)) at \(String(format: "%.2f", t))")
+        log?("scene abort (\(why)\(run.overload ? ", перегрузка" : "")) at \(String(format: "%.2f", t))")
         reschedule()
+        // Молния домой — нужна вся панель от глаз до notch.
+        scheduleCompact()
+    }
+
+    /// Конец по часам: доиграла сама (без обрыва) — `onFinished`.
+    private func finish() {
+        let done = model.run.flatMap { $0.abortedAt == nil ? $0.kind : nil }
+        stop()
+        if let done { onFinished?(done) }
+    }
+
+    /// Вайб: сменился трек — глитч 1 на месте, конец сцены не сдвигается.
+    func markTrackChange() {
+        guard var run = model.run, run.kind == .vibe, run.abortedAt == nil, let t = elapsed else { return }
+        run.glitchMarks.append(t)
+        model.run = run
+        log?("scene vibe: track changed at \(String(format: "%.1f", t))")
     }
 
     /// Сразу убрать панель.
     func stop() {
         endWork?.cancel(); endWork = nil
+        compactWork?.cancel(); compactWork = nil
         removeMonitors()
         dragging = false
-        let was = model.run != nil
+        let was = model.run?.kind
         model.run = nil
         setIgnores(true)
         panel?.orderOut(nil)
-        if was { onRunning?(false); log?("scene end") }
+        if let was { onRunning?(false); log?("scene end"); onEnded?(was) }
     }
 
     /// Полноэкранное приложение: сцены не играют, идущая гаснет сразу.
@@ -1044,8 +1561,12 @@ final class StageController {
         if value { stop() }
     }
 
+    /// Кадров сцены нарисовано (для `dump`: проверка «кадр по событию»).
+    private(set) static var frames = 0
+    static func countFrame() { frames += 1 }
+
     var status: [String: Any] {
-        var out: [String: Any] = ["running": running, "suppressed": suppressed, "tracking": !monitors.isEmpty]
+        var out: [String: Any] = ["running": running, "suppressed": suppressed, "offscreenOnly": offscreenOnly, "tracking": !monitors.isEmpty, "frames": Self.frames]
         if let run = model.run {
             let w = run.wall()
             let t = run.time(wall: w)
@@ -1065,6 +1586,7 @@ final class StageController {
             out["answerLines"] = run.content.answer.count
             out["caption"] = run.content.caption.count
             out["controls"] = run.controls
+            out["fx"] = "\(run.enter.rawValue)/\(run.exit.rawValue)\(run.reduceMotion ? " reduceMotion" : "")"
             if run.kind == .music {
                 out["music"] = run.marks.map { "\($0.state.rawValue)@\((($0.t * 10).rounded() / 10))" }
                 out["musicState"] = SceneTimeline.musicState(at: t, run.marks).state.rawValue
@@ -1113,6 +1635,23 @@ final class StageController {
                               SceneMusicMark(t: 5.2, state: .playing)]
             }
         }
+        // Переходы на листе: `bars|smear|burst` — виды входа/выхода; `reduce` — как с Reduce Motion; `track` — смена трека.
+        switch variant {
+        case "bars": run.enter = .glitchBars; run.exit = .glitchBars
+        case "smear": run.enter = .columnSmear; run.exit = .columnSmear
+        case "burst": run.enter = .burstIn; run.exit = .ribbonOut
+        case "reduce": run.enter = .glitchBars; run.exit = .glitchBars; run.reduceMotion = true
+        case "track": run.glitchMarks = [1.3]
+        default: break
+        }
+        if kind == .perch {
+            // `hop` — окно сдвинули на 4-й секунде; `hold` — окно тащат; `shoo` — прогнали кликом на 5-й секунде.
+            if variant == "hop" { run.hopAt = 4.0; run.hopFrom = run.geometry.target.offsetBy(dx: -170, dy: -60) }
+            if variant == "hold" { run.perchHold = true }
+            if variant == "shoo" { run.abortedAt = 5.0 }
+            // `overload` — прогнали тем, что ждут сразу несколько сессий: рой глаз, потом молния домой.
+            if variant == "overload" { run.abortedAt = 5.0; run.overload = true }
+        }
         if variant == "controls", !kind.boxed {
             // Наведение на глаза: ⏮ ⏯ ⏭ под ними.
             if run.content.track == nil { run.content.track = "Test Artist — Test Track" }
@@ -1125,7 +1664,7 @@ final class StageController {
         let span = min(d, 10)
         var times: [Double] = (0..<16).map { Double($0) * span / 16 }
         if d > span { times += [d - 0.85, d - 0.6, d - 0.35, d - 0.1] }
-        times += Self.keyTimes(kind)
+        times += run.watch != nil ? Self.watchTimes(run.watch!) : Self.keyTimes(kind)
         times = Array(Set(times.map { ($0 * 100).rounded() / 100 })).sorted()
         var frames: [(Double, CGImage)] = []
         for t in times {
@@ -1137,6 +1676,8 @@ final class StageController {
         guard !frames.isEmpty else { return [] }
         // Деталь: вокруг цели/области и notch не трогаем.
         var focus = (run.geometry.area ?? run.geometry.target).insetBy(dx: -70, dy: -70)
+        if let b = run.geometry.bubble { focus = focus.union(b.insetBy(dx: -20, dy: -20)) }
+        if let h = run.hopFrom { focus = focus.union(h.insetBy(dx: -40, dy: -40)) }
         // Подпись `reply` — слева от глаз.
         if kind == .reply { focus = focus.union(focus.offsetBy(dx: -220, dy: 0)) }
         let crop = CGRect(x: focus.minX - run.origin.x, y: run.size.height - (focus.maxY - run.origin.y),
@@ -1155,17 +1696,32 @@ final class StageController {
         return urls
     }
 
+    /// Кадры листа «смотрит в терминал»: молния, размаз, вылезает, печать реплик, злорадство, уход.
+    static func watchTimes(_ w: SceneWatch) -> [Double] {
+        let leave = WatchTimeline.leaveStart(w)
+        var out = [0.3, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.1, 1.25, 1.4, 1.7, 2.2, 2.8]
+        out += w.says.dropFirst().flatMap { [$0.at - 0.05, $0.at + 0.4, $0.at + 1.4] }
+        if let g = w.gloatAt { out += [g + 0.2, g + 0.9, g + 1.6] }
+        if let g = w.ghostAt { out += [g + 0.1, g + 0.4, g + 0.8, g + 1.2] }
+        for (a, _) in RigMoments.sleepWindows(w) { out += [a + 0.5, a + 1.5, a + 3.2, a + 5] }
+        out += [leave + 0.15, leave + 0.35, leave + 0.6]
+        return out
+    }
+
     static func keyTimes(_ kind: SceneKind) -> [Double] {
         switch kind {
-        case .teleport: [0.15, 0.35, 0.42, 0.55, 0.8, 4.5, 4.78, 4.9]
+        case .teleport: [0.05, 0.15, 0.25, 0.35, 0.42, 0.46, 0.55, 0.62, 0.7, 0.8, 0.9, 4.45, 4.52, 4.6, 4.66, 4.78, 4.9]
         case .window: [0.3, 0.45, 0.7, 0.85, 0.95, 1.5, 2.5, 7.1, 7.3, 7.5, 7.7]
         case .takeover: [0.6, 0.9, 1.3, 1.9, 2.3, 2.8, 3.4, 3.9, 4.1, 4.4]
-        case .vibe: [0.3, 0.5, 1.0, 1.3, 2.0, 3.0, 6.6]
+        case .vibe: [0.1, 0.3, 0.33, 0.45, 0.52, 0.6, 0.68, 1.0, 1.32, 1.4, 30.0, 57.9, 58.1, 58.25, 58.4, 58.6, 58.75, 58.9,
+                     59.05, 59.25, 59.35, 59.5, 59.7]
         case .sessions: [0.3, 0.7, 0.9, 1.2, 1.5, 2.2, 3.0, 3.1, 3.3, 3.6, 4.4, 7.3, 7.5, 7.7]
         case .thinking: [0.7, 0.9, 1.2, 1.5, 2.6, 3.4, 4.3, 5.1]
         case .answer: [0.7, 0.9, 1.2, 2.0, 4.2, 4.6, 5.0, 5.6, 6.0]
         case .reply: [0.15, 0.4, 0.7, 1.0, 1.2, 1.7, 2.2, 2.6, 2.9, 3.2, 3.5, 3.8]
         case .music: [0.7, 0.9, 1.2, 2.6, 2.8, 3.1, 3.55, 3.7, 4.6, 4.8, 5.4, 5.6, 6.2]
+        case .perch: [0.1, 0.2, 0.3, 0.35, 0.45, 0.6, 0.75, 0.92, 0.97, 1.1, 1.3, 1.5, 1.8, 2.4, 3.2, 4.06, 4.12, 4.16, 4.2, 5.0, 5.1,
+                      5.3, 5.5, 6.5, 7.5, 8.2]
         }
     }
 

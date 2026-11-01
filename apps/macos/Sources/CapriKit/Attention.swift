@@ -9,9 +9,11 @@ public struct WindowInfo: Equatable {
     public var bounds: CGRect
     /// Прозрачное окно (alpha 0) на экране не видно — так может «прятаться» строка меню.
     public var alpha: Double
+    /// `kCGWindowNumber` (0 — неизвестно): опрос одного окна, пока на нём сидит Capri.
+    public var number: UInt32
 
-    public init(pid: Int32, layer: Int, bounds: CGRect, alpha: Double = 1) {
-        self.pid = pid; self.layer = layer; self.bounds = bounds; self.alpha = alpha
+    public init(pid: Int32, layer: Int, bounds: CGRect, alpha: Double = 1, number: UInt32 = 0) {
+        self.pid = pid; self.layer = layer; self.bounds = bounds; self.alpha = alpha; self.number = number
     }
 
     public static func from(_ dict: [String: Any]) -> WindowInfo? {
@@ -20,7 +22,8 @@ public struct WindowInfo: Equatable {
               let b = dict["kCGWindowBounds"] as? [String: Any],
               let rect = CGRect(dictionaryRepresentation: b as CFDictionary) else { return nil }
         let alpha = (dict["kCGWindowAlpha"] as? Double) ?? (dict["kCGWindowAlpha"] as? NSNumber)?.doubleValue ?? 1
-        return WindowInfo(pid: pid, layer: layer, bounds: rect, alpha: alpha)
+        let number = (dict["kCGWindowNumber"] as? NSNumber)?.uint32Value ?? 0
+        return WindowInfo(pid: pid, layer: layer, bounds: rect, alpha: alpha, number: number)
     }
 }
 

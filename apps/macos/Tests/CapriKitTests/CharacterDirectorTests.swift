@@ -3,7 +3,8 @@ import XCTest
 
 final class CharacterDirectorTests: XCTestCase {
     func input(_ now: Double, _ edit: (inout CharacterDirector.Input) -> Void = { _ in }) -> CharacterDirector.Input {
-        var i = CharacterDirector.Input(now: now)
+        // Фоновые сцены по умолчанию выключены — здесь включены, их отдельный тест ниже.
+        var i = CharacterDirector.Input(now: now, ambient: true)
         edit(&i)
         return i
     }
@@ -37,22 +38,28 @@ final class CharacterDirectorTests: XCTestCase {
         // Через 5 мин — кулдаун события; через 15 — общий зазор 20 мин.
         XCTAssertEqual(d.decide(.sessionFinished, input(1300)), .skip("cooldown"))
         XCTAssertEqual(d.decide(.sessionFinished, input(1000 + 15 * 60)), .skip("gap"))
-        XCTAssertEqual(d.decide(.musicStarted, input(1000 + 15 * 60)), .skip("gap"))
-        XCTAssertEqual(d.decide(.sessionFinished, input(1000 + 20 * 60)), .play(.teleport))
-        XCTAssertEqual(d.decide(.musicStarted, input(1000 + 40 * 60)), .play(.vibe))
-        XCTAssertEqual(d.decide(.sessionFinished, input(1000 + 59 * 60)), .skip("gap"))
+        // Музыку включил человек — общий зазор ей не мешает, но она его тратит.
+        XCTAssertEqual(d.decide(.musicStarted, input(1000 + 15 * 60)), .play(.vibe))
+        XCTAssertEqual(d.decide(.sessionFinished, input(1000 + 20 * 60)), .skip("gap"))
+        XCTAssertEqual(d.decide(.sessionFinished, input(1000 + 35 * 60)), .play(.teleport))
+        XCTAssertEqual(d.decide(.sessionFinished, input(1000 + 54 * 60)), .skip("gap"))
     }
 
     func testNeverMoreThanLimitPerHour() {
         // Все события сразу, каждую минуту, сутки: в любом часе ≤ 4 сцен на столе, между сценами ≥ 20 мин.
         var d = CharacterDirector(now: 0, seed: 5)
         var plays: [Double] = []
+        var music: [Double] = []
         for m in 1..<(24 * 60) {
             let now = Double(m) * 60
             for e in [CharacterDirector.Event.sessionFinished, .musicStarted, .ambient] {
-                if case .play = d.decide(e, input(now) { $0.takeover = true }) { plays.append(now) }
+                if case .play = d.decide(e, input(now) { $0.takeover = true }) {
+                    if e == .musicStarted { music.append(now) } else { plays.append(now) }
+                }
             }
         }
+        // Музыка — мимо лимитов, но не чаще раза в 30 мин.
+        for (a, b) in zip(music, music.dropFirst()) { XCTAssertGreaterThanOrEqual(b - a, CharacterDirector.musicCooldown) }
         XCTAssertGreaterThan(plays.count, 10)
         for (a, b) in zip(plays, plays.dropFirst()) { XCTAssertGreaterThanOrEqual(b - a, CharacterDirector.minGap) }
         for p in plays { XCTAssertLessThanOrEqual(plays.filter { $0 >= p && $0 - p < 3600 }.count, CharacterDirector.perHour) }
@@ -109,7 +116,8 @@ final class CharacterDirectorTests: XCTestCase {
         // Персонаж выключен, человек печатает, сцена только что была — кивание в notch всё равно можно.
         XCTAssertEqual(d.decide(.trackChanged, input(1001) { $0.enabled = false; $0.idleSec = 0 }), .notchVibe)
         XCTAssertEqual(d.decide(.trackChanged, input(1100)), .skip("cooldown"))
-        XCTAssertEqual(d.decide(.trackChanged, input(1001 + 180)), .notchVibe)
+        XCTAssertEqual(d.decide(.trackChanged, input(1001 + 180)), .skip("cooldown"), "раньше 15 мин — нет")
+        XCTAssertEqual(d.decide(.trackChanged, input(1001 + CharacterDirector.notchVibeCooldown)), .notchVibe)
         XCTAssertEqual(d.decide(.trackChanged, input(2000) { $0.music = false }), .skip("musicOff"))
         XCTAssertEqual(d.decide(.trackChanged, input(2000) { $0.hiddenUntil = 3000 }), .skip("hidden"))
         // Пауза уведомлений, полноэкранное приложение и спящие экраны глушат и кивание.
@@ -174,5 +182,49 @@ final class CharacterDirectorTests: XCTestCase {
         XCTAssertGreaterThan(kinds[.sessions, default: 0], 0)
         XCTAssertNil(kinds[.window], "кто-то ждёт или работает — окно сессий вместо статуса")
         XCTAssertGreaterThan(kinds[.teleport, default: 0], kinds[.sessions, default: 0])
+    }
+
+    func testAmbientOffByDefault() {
+        XCTAssertFalse(CharacterDirector.Input(now: 0).ambient)
+        var d = CharacterDirector(now: 0, seed: 3)
+        let due = d.nextAmbient
+        XCTAssertEqual(d.decide(.ambient, CharacterDirector.Input(now: due)), .skip("ambientOff"))
+        XCTAssertEqual(d.lastDecision, "ambient: skip ambientOff")
+        // Не стучимся каждую минуту.
+        XCTAssertEqual(d.nextAmbient, due + 600)
+        XCTAssertTrue(d.starts.isEmpty)
+    }
+
+    func testMusicWithoutPlaceNodsInNotchNotCorner() {
+        var d = CharacterDirector(now: 0)
+        XCTAssertEqual(d.decide(.musicStarted, input(1000) { $0.musicPerch = false }), .notchVibe)
+        XCTAssertTrue(d.starts.isEmpty, "кивание в notch лимиты стола не тратит")
+        XCTAssertEqual(d.lastDecision, "musicStarted: play notch-vibe")
+        // Сразу следом — кулдаун музыки и кивания.
+        XCTAssertEqual(d.decide(.musicStarted, input(1100)), .skip("cooldown"))
+        XCTAssertEqual(d.decide(.trackChanged, input(1100)), .skip("cooldown"))
+    }
+
+    func testMusicIsAnswerToActionButKeepsQuietReasons() {
+        var d = CharacterDirector(now: 0)
+        XCTAssertEqual(d.decide(.sessionFinished, input(1000)), .play(.teleport))
+        // Персонаж на столе выключен, человек только что нажал «play», сцена была минуту назад — вайб всё равно.
+        XCTAssertEqual(d.decide(.musicStarted, input(1060) { $0.enabled = false; $0.idleSec = 0 }), .play(.vibe))
+        let quiet: [(String, (inout CharacterDirector.Input) -> Void)] = [
+            ("musicOff", { $0.music = false }),
+            ("hidden", { $0.hiddenUntil = 99_999 }),
+            ("paused", { $0.paused = true }),
+            ("fullscreen", { $0.fullscreen = true }),
+            ("asleep", { $0.displaysAsleep = true }),
+            ("notch", { $0.notchOpen = true }),
+            ("running", { $0.sceneRunning = true }),
+            ("lowPower", { $0.lowPower = true }),
+            ("reduceMotion", { $0.reduceMotion = true }),
+            ("away", { $0.idleSec = 600 }),
+        ]
+        for (why, edit) in quiet {
+            var e = CharacterDirector(now: 0)
+            XCTAssertEqual(e.decide(.musicStarted, input(5000, edit)), .skip(why), why)
+        }
     }
 }

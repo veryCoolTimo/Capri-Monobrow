@@ -53,8 +53,9 @@ struct CapriMaskSprite: View {
     }
 
     private var blinking: some View {
-        TimelineView(EyesSchedule(paused: !active || still || mood == .alert)) { ctx in
-            let blink = !still && (EyesSchedule.blink(at: ctx.date) ?? 0) > 0.5
+        // Слушает — глаза открыты и не моргают (смотрит на того, кто говорит).
+        TimelineView(EyesSchedule(paused: !active || still || mood == .alert || mood == .listening)) { ctx in
+            let blink = !still && mood != .listening && (EyesSchedule.blink(at: ctx.date) ?? 0) > 0.5
             if let show = ShowArt.shared {
                 CapriArtImage(image: mood == .alert ? show.all : blink ? show.shut : show.open)
             } else {

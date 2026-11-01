@@ -34,6 +34,9 @@ final class Settings: ObservableObject {
     var onHotKeyChange: (() -> Void)?
     /// Шорткат не зарегистрировался (занят другим приложением).
     @Published var hotKeyError: String?
+    /// Главный выключатель: Capri вообще выходит на рабочий стол (любая сцена — музыка, ответ, посадка, терминал).
+    /// Выкл. — всё только в notch. Вкл. по умолчанию; все пути делят один бюджет `ScreenBudget`.
+    @Published var desktop: Bool { didSet { d.set(desktop, forKey: "capri.desktop"); onCharacterChange?() } }
     /// Персонаж выходит на рабочий стол короткими сценами (по умолчанию выкл.; демо из меню — всегда).
     @Published var character: Bool { didSet { d.set(character, forKey: "capri.character"); onCharacterChange?() } }
     @Published var characterRate: CharacterDirector.Rate {
@@ -41,6 +44,8 @@ final class Settings: ObservableObject {
     }
     @Published var characterSessionEvents: Bool { didSet { d.set(characterSessionEvents, forKey: "capri.characterSessionEvents") } }
     @Published var characterTakeover: Bool { didSet { d.set(characterTakeover, forKey: "capri.characterTakeover") } }
+    /// Фоновые сцены по таймеру (телепорт в угол, окно, сессии, захват) — экспериментально, по умолчанию выкл.
+    @Published var characterAmbient: Bool { didSet { d.set(characterAmbient, forKey: "capri.characterAmbient"); onCharacterChange?() } }
     /// Сцены по моим действиям (ответ сессии → к терминалу, вопрос помощнику → «думает»/ответ) — вкл. по умолчанию.
     @Published var characterOnAction: Bool { didSet { d.set(characterOnAction, forKey: "capri.characterOnAction") } }
     /// «Спрятать персонажа на час»: до этого времени (unix) сцен и кивания нет.
@@ -49,6 +54,23 @@ final class Settings: ObservableObject {
     }
     /// Кивать в notch под Spotify / Музыку.
     @Published var music: Bool { didSet { d.set(music, forKey: "capri.music"); onMusicChange?() } }
+    /// «Садиться на окна, которые я открываю» (этап 2 присутствия) — вкл. по умолчанию.
+    @Published var perch: Bool { didSet { d.set(perch, forKey: "capri.perch") } }
+    /// Тихие часы посадок на окна (минуты от полуночи), по умолчанию 00:30–09:00.
+    @Published var perchQuietStart: Int { didSet { d.set(perchQuietStart, forKey: "capri.perchQuietStart") } }
+    @Published var perchQuietEnd: Int { didSet { d.set(perchQuietEnd, forKey: "capri.perchQuietEnd") } }
+    /// «Не садиться здесь» — bundle id.
+    @Published var perchBlocked: [String] { didSet { d.set(perchBlocked, forKey: "capri.perchBlocked") } }
+    /// «Прогнать с окон на час»: до этого времени (unix) посадок нет.
+    @Published var perchHiddenUntil: Double? { didSet { d.set(perchHiddenUntil, forKey: "capri.perchHiddenUntil") } }
+
+    /// Голос: удерживать ⌃⌥Space и говорить (короткое нажатие — как раньше, помощник).
+    @Published var voice: Bool { didSet { d.set(voice, forKey: "capri.voice") } }
+    /// Путь к модели речи (.gguf); пусто — кэш Hugging Face.
+    @Published var voiceModelPath: String { didSet { d.set(voiceModelPath, forKey: "capri.voiceModelPath") } }
+
+    var quietHours: QuietHours { QuietHours(start: perchQuietStart, end: perchQuietEnd) }
+    var perchHidden: Bool { (perchHiddenUntil ?? 0) > Date().timeIntervalSince1970 }
     var onCharacterChange: (() -> Void)?
     var onMusicChange: (() -> Void)?
     var loginItem: Bool {
@@ -72,13 +94,22 @@ final class Settings: ObservableObject {
         codexPath = d.string(forKey: "capri.codexPath") ?? ""
         hosts = Self.hosts
         assistantHotKey = d.object(forKey: "capri.assistantHotKey") as? Bool ?? true
+        desktop = d.object(forKey: "capri.desktop") as? Bool ?? true
         character = d.object(forKey: "capri.character") as? Bool ?? false
         characterRate = d.string(forKey: "capri.characterRate").flatMap(CharacterDirector.Rate.init(rawValue:)) ?? .sometimes
         characterSessionEvents = d.object(forKey: "capri.characterSessionEvents") as? Bool ?? true
         characterTakeover = d.object(forKey: "capri.characterTakeover") as? Bool ?? false
+        characterAmbient = d.object(forKey: "capri.characterAmbient") as? Bool ?? false
         characterOnAction = d.object(forKey: "capri.characterOnAction") as? Bool ?? true
         characterHiddenUntil = d.object(forKey: "capri.characterHiddenUntil") as? Double
         music = d.object(forKey: "capri.music") as? Bool ?? true
+        perch = d.object(forKey: "capri.perch") as? Bool ?? true
+        perchQuietStart = d.object(forKey: "capri.perchQuietStart") as? Int ?? QuietHours.standard.start
+        perchQuietEnd = d.object(forKey: "capri.perchQuietEnd") as? Int ?? QuietHours.standard.end
+        perchBlocked = d.stringArray(forKey: "capri.perchBlocked") ?? []
+        perchHiddenUntil = d.object(forKey: "capri.perchHiddenUntil") as? Double
+        voice = d.object(forKey: "capri.voice") as? Bool ?? true
+        voiceModelPath = d.string(forKey: "capri.voiceModelPath") ?? ""
     }
 
     var characterHidden: Bool { (characterHiddenUntil ?? 0) > Date().timeIntervalSince1970 }
@@ -141,6 +172,8 @@ struct SettingsView: View {
     @ObservedObject var hosts: HostList
     /// Ключи Spotify Web API (Связка ключей) — поиск трека по названию.
     @ObservedObject var spotify: SpotifySearch
+    /// Голос: где модель, скачивание.
+    @ObservedObject var voice: VoiceCenter
     @State private var spotifyID = ""
     @State private var spotifySecret = ""
     @State private var newHost = ""
@@ -157,6 +190,43 @@ struct SettingsView: View {
             } footer: {
                 Text("Ещё: клик по глазам слева от выреза или «✦ capri» в раскрытом notch.").font(.caption).foregroundColor(.secondary)
             }
+            Section {
+                Toggle("Говорить с Capri: держите \(HotKey.assistant.label)", isOn: $settings.voice)
+                    .disabled(!settings.assistantHotKey)
+                HStack {
+                    Text("Модель речи")
+                    Spacer()
+                    switch voice.model {
+                    case .found(let p):
+                        Text((p as NSString).lastPathComponent).font(.caption).foregroundColor(.secondary).lineLimit(1).truncationMode(.middle)
+                            .help(p)
+                    case .missing:
+                        Text("не найдена").font(.caption).foregroundColor(Palette.crimson)
+                        Button("Скачать (~750 МБ)") { voice.downloadModel() }
+                    case .downloading(let f):
+                        ProgressView(value: f).frame(width: 120)
+                        Text("\(Int(f * 100))%").font(.caption.monospacedDigit())
+                    case .failed(let e):
+                        Text("не скачалась: \(e)").font(.caption).foregroundColor(Palette.crimson).lineLimit(2)
+                        Button("Ещё раз") { voice.downloadModel() }
+                    }
+                }
+                .disabled(!settings.voice)
+                HStack {
+                    TextField("Свой путь к .gguf (пусто — кэш Hugging Face)", text: $settings.voiceModelPath)
+                        .onSubmit { voice.refreshModel() }
+                    Button("Проверить") { voice.refreshModel() }
+                }
+                .disabled(!settings.voice)
+                if AsrHelper.binary == nil {
+                    Text("В этой сборке нет распознавания речи (capri-asr).").font(.caption).foregroundColor(Palette.crimson)
+                }
+            } header: {
+                Text("Голос")
+            } footer: {
+                Text("Коротко нажать — помощник, держать — говорить; отпустите — Capri выполнит. «Включи …», «пауза», «запиши …» (Заметки), «напомни через 20 минут / в 18:00 / завтра в 9 …» (Напоминания), «найди в интернете …», «ответь votek2 …» (сначала покажет текст, отправит после ⌘⏎). Остальное — помощнику. Речь распознаётся на этом Маке (Nemotron), микрофон включён, только пока держите клавишу. Первый раз macOS спросит доступ к микрофону, к Заметкам и Напоминаниям.")
+                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
             Section("Уведомления") {
                 Toggle("Звук, когда сессия ждёт ответа", isOn: $settings.sound)
                 Toggle("Уведомления macOS, когда notch не видно", isOn: $settings.systemNotifications)
@@ -168,26 +238,74 @@ struct SettingsView: View {
                     .help("Notch всплывёт только на новое «ждёт меня»")
             }
             Section {
-                Toggle("Персонаж на рабочем столе", isOn: $settings.character)
+                Toggle("Capri выходит на рабочий стол", isOn: $settings.desktop)
+                    .help("Выключено — никаких сцен на столе: ни музыки, ни посадок на окна, ни терминала, ни ответов. Всё — в notch.")
+                HStack {
+                    Text("Тихие часы")
+                    Spacer()
+                    DatePicker("с", selection: minutes($settings.perchQuietStart), displayedComponents: .hourAndMinute)
+                        .labelsHidden()
+                    Text("до")
+                    DatePicker("до", selection: minutes($settings.perchQuietEnd), displayedComponents: .hourAndMinute)
+                        .labelsHidden()
+                }
+            } header: {
+                Text("Capri на рабочем столе")
+            } footer: {
+                Text("Один общий счёт на все появления на столе: не чаще раза в 10 минут, 2 раз в час и \(ScreenBudget.perDay) в день, не раньше 5 минут после прошлой сцены. Не в тихие часы (\(settings.quietHours.label)) и не во время звонка (камера или микрофон заняты). Ниже — какие поводы вообще бывают.")
+                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Section {
+                Toggle("Capri отвечает на мои действия на столе", isOn: $settings.characterOnAction)
+                    .disabled(!settings.desktop)
+                    .help("Ответил сессии — телепорт к терминалу; спросил помощника и свернул notch — окно «думаю» и ответ")
+                Toggle("Реагировать на музыку (Spotify, Музыка)", isOn: $settings.music)
+                    .help("Включили музыку сами после тишины — около минуты кивает на окне плеера и уходит в notch (включили через Capri — только кивок в notch); смена трека — кивок в notch не чаще раза в 15 минут")
+                Toggle("Сцены, когда сессия доработала", isOn: $settings.character)
+                    .disabled(!settings.desktop)
+                    .help("Короткий телепорт, когда сессия закончила работу (не чаще раза в 20 минут)")
+            } header: {
+                Text("Персонаж")
+            } footer: {
+                Text("Capri появляется только в ответ на ваши действия — не в полноэкранных приложениях и не когда notch раскрыт. Capri можно перетащить за глаза или заголовок; наведение держит окно, «📌» — до «×». Клики мимо её окон проходят насквозь. Посмотреть все сцены — меню ✦ → Персонаж.")
+                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Section {
+                Toggle("Садиться на окна запущенных приложений", isOn: $settings.perch)
+                    .disabled(!settings.desktop)
+                    .help("Запустили приложение (первый раз за день) — Capri садится на край окна, говорит про то, что происходит, и уходит. Клик по глазам — «кыш».")
+                ForEach(settings.perchBlocked, id: \.self) { id in
+                    HStack {
+                        Text("Не садиться: \(Self.appName(id))")
+                        Spacer()
+                        Button(role: .destructive) { settings.perchBlocked.removeAll { $0 == id } } label: { Image(systemName: "minus.circle") }
+                            .buttonStyle(.borderless)
+                            .help("Снова можно")
+                    }
+                }
+            } header: {
+                Text("На окнах")
+            } footer: {
+                Text("Только когда вы запускаете приложение, и только первый запуск этого приложения за день (переключение ⌘-Tab — не повод). Не больше \(PerchPolicy.perDay) посадок в день — и в общем счёте стола выше. Не садится в полноэкранных приложениях, играх, звонках (камера или микрофон заняты), менеджерах паролей. Прогнали два раза подряд — час не садится. «Не садиться на …» — правый клик по Capri на окне.")
+                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Section {
+                Toggle("Фоновые сцены по таймеру", isOn: $settings.characterAmbient)
+                    .disabled(!settings.character)
+                    .help("Телепорт, окно статуса, сессии — сами по себе, без вашего действия")
                 Picker("Как часто", selection: $settings.characterRate) {
                     Text("редко").tag(CharacterDirector.Rate.rare)
                     Text("иногда").tag(CharacterDirector.Rate.sometimes)
                 }
-                .disabled(!settings.character)
-                Toggle("Сцены, когда сессия доработала", isOn: $settings.characterSessionEvents)
-                    .disabled(!settings.character)
+                .disabled(!settings.character || !settings.characterAmbient)
                 Toggle("Изображать захват экрана", isOn: $settings.characterTakeover)
-                    .disabled(!settings.character)
+                    .disabled(!settings.character || !settings.characterAmbient)
                     .help("Только рисунок поверх: Capri ничего не нажимает и не печатает")
-                Toggle("Capri отвечает на мои действия на столе", isOn: $settings.characterOnAction)
-                    .help("Ответил сессии — телепорт к терминалу; спросил помощника и свернул notch — окно «думаю» и ответ")
-                Toggle("Реагировать на музыку (Spotify, Музыка)", isOn: $settings.music)
-                    .help("Кивает в notch на смену трека; в раскрытом notch — что играет")
             } header: {
-                Text("Персонаж")
+                Text("Экспериментальное")
             } footer: {
-                Text("Фоновые сцены до 8 секунд: телепорт, окно, сессии, «захват», вайб — не в полноэкранных приложениях, не когда вы печатаете или отошли, не чаще раза в 20 минут. Сцены на ваши действия — сразу. Capri можно перетащить за глаза или заголовок; наведение держит окно, «📌» — до «×». Клики мимо её окон проходят насквозь. Посмотреть все сцены — меню ✦ → Персонаж.")
-                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text("Выключено по умолчанию. Нужна «Сцены, когда сессия доработала».")
+                    .font(.caption).foregroundColor(.secondary)
             }
             Section {
                 if spotify.hasKeys {
@@ -283,6 +401,22 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 480)
         .frame(minHeight: 420)
+    }
+
+    /// Минуты от полуночи ↔ время для `DatePicker`.
+    private func minutes(_ b: Binding<Int>) -> Binding<Date> {
+        Binding(get: {
+            Calendar.current.date(bySettingHour: b.wrappedValue / 60, minute: b.wrappedValue % 60, second: 0, of: Date()) ?? Date()
+        }, set: { d in
+            let c = Calendar.current.dateComponents([.hour, .minute], from: d)
+            b.wrappedValue = (c.hour ?? 0) * 60 + (c.minute ?? 0)
+        })
+    }
+
+    /// Имя приложения по bundle id (для списка «не садиться»).
+    static func appName(_ id: String) -> String {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return id }
+        return FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
     }
 
     private func addHost() {

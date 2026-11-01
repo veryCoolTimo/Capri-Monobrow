@@ -373,7 +373,11 @@ final class SceneWindowsTests: XCTestCase {
                 } else {
                     XCTAssertFalse(spots.isEmpty, "\(k) t=\(t)")
                     XCTAssertNil(f.bolt)
-                    XCTAssertTrue(spots.contains { $0.kind == .drag }, "\(k): тянуть можно")
+                    if k == .perch {
+                        XCTAssertTrue(spots.contains { $0.kind == .button("shoo") }, "на окне: глаза — «кыш»")
+                    } else {
+                        XCTAssertTrue(spots.contains { $0.kind == .drag }, "\(k): тянуть можно")
+                    }
                     // После обрыва — ничего.
                     XCTAssertTrue(SceneLayout.hotspots(k, t: t, geometry: g, clips: all, options: o, abortedAt: t - 0.01).isEmpty)
                 }

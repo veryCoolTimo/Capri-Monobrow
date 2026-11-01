@@ -32,6 +32,8 @@ final class SceneTimelineTests: XCTestCase {
             switch k {
             case .thinking: XCTAssertEqual(SceneTimeline.duration(k), SceneTimeline.thinkingDuration)
             case .answer: XCTAssertLessThanOrEqual(SceneTimeline.duration(k, SceneOptions(answerLines: 6, answerChars: 5000, proposal: true)), 25)
+            case .vibe: XCTAssertEqual(SceneTimeline.duration(k), 60)
+            case .perch: XCTAssertLessThanOrEqual(SceneTimeline.duration(k), PerchTimeline.maxDuration)
             default: XCTAssertLessThanOrEqual(SceneTimeline.duration(k), 8)
             }
         }
@@ -50,9 +52,11 @@ final class SceneTimelineTests: XCTestCase {
                 XCTAssertNotNil(f.eyes, "\(k) \(t)")
                 t += 1.0 / 48
             }
-            XCTAssertEqual(SceneTimeline.frameInterval(k, t: c.lowerBound), 1.0 / 12)
             XCTAssertEqual(SceneTimeline.frameInterval(k, t: c.lowerBound, aborted: true), 1.0 / 24)
             XCTAssertEqual(SceneTimeline.frameInterval(k, t: c.upperBound), 1.0 / 24)
+            // «На окне» — кадр по событию (`PerchTests`), остальные — 12 fps.
+            if k == .perch { XCTAssertGreaterThanOrEqual(SceneTimeline.frameInterval(k, t: c.lowerBound), 1.0 / 24); continue }
+            XCTAssertEqual(SceneTimeline.frameInterval(k, t: c.lowerBound), 1.0 / 12)
         }
     }
 
@@ -183,5 +187,133 @@ final class SceneTimelineTests: XCTestCase {
                        SceneTimeline.takeoverSize)
         XCTAssertEqual(SceneLayout.appKit(CGRect(x: 10, y: 20, width: 100, height: 50), primaryHeight: 982),
                        CGRect(x: 10, y: 912, width: 100, height: 50))
+    }
+
+    // MARK: этап 1 — вайб ≈ 60 с и переходы
+
+    func testVibeSixtySecondsThenSuckedIntoNotch() {
+        let g = geometry(.vibe)
+        var o = SceneOptions()
+        o.seed = 9
+        func at(_ t: Double) -> SceneFrame { SceneTimeline.frame(.vibe, t: t, geometry: g, clips: all, options: o) }
+        let homeC = CGPoint(x: g.home.midX, y: g.home.midY)
+        for t in [1.0, 20, 45, 57.9] { XCTAssertEqual(at(t).phase, "vibe", "\(t)") }
+        XCTAssertEqual(SceneTimeline.calm(.vibe), 0.75..<58.0)
+        // 58–60 с: распад полосами → лента и молния к notch → вспышка в notch → глаза дома.
+        let suck = at(58.2)
+        XCTAssertEqual(suck.phase, "suck")
+        XCTAssertEqual(suck.fx?.kind, .glitchBars)
+        XCTAssertFalse(suck.fx!.bars.isEmpty)
+        let ribbon = at(58.9)
+        XCTAssertEqual(ribbon.phase, "ribbon")
+        XCTAssertNil(ribbon.eyes)
+        XCTAssertEqual(at(58.75).bolt?.to, homeC, "молния к notch, пока лента летит")
+        XCTAssertNil(at(59.1).bolt, "молния короткая")
+        XCTAssertEqual(ribbon.fx?.ribbon?.points.last, homeC)
+        XCTAssertEqual(at(59.3).phase, "flash")
+        XCTAssertEqual(at(59.3).flashAt, homeC)
+        XCTAssertGreaterThan(at(59.3).flash, 0)
+        XCTAssertEqual(at(59.8).phase, "home")
+        XCTAssertEqual(at(59.8).eyes, g.home)
+        XCTAssertTrue(at(60).done)
+        // Потолок — 60 с, смена трека его не продлевает, только глитч 1.
+        o.glitchMarks = [10.0]
+        XCTAssertEqual(SceneTimeline.duration(.vibe, o), 60)
+        XCTAssertGreaterThanOrEqual(at(10.1).glitch, 1)
+        XCTAssertTrue(at(60).done)
+    }
+
+    func testVibePauseGoesHomeFast() {
+        let g = geometry(.vibe)
+        XCTAssertLessThanOrEqual(SceneTimeline.recallDuration, 0.6)
+        let first = SceneTimeline.frame(.vibe, t: 20.02, geometry: g, clips: all, abortedAt: 20)
+        XCTAssertEqual(first.phase, "recall")
+        XCTAssertEqual(first.fx?.kind, .glitchBars)
+        XCTAssertEqual(SceneTimeline.frame(.vibe, t: 20.25, geometry: g, clips: all, abortedAt: 20).bolt?.to,
+                       CGPoint(x: g.home.midX, y: g.home.midY))
+        XCTAssertTrue(SceneTimeline.frame(.vibe, t: 20.6, geometry: g, clips: all, abortedAt: 20).done)
+    }
+
+    func testScenesUseSharedTransitions() {
+        let g = geometry(.teleport)
+        var o = SceneOptions()
+        o.enter = .columnSmear
+        o.exit = .ribbonOut
+        o.seed = 3
+        func at(_ t: Double) -> SceneFrame { SceneTimeline.frame(.teleport, t: t, geometry: g, clips: all, options: o) }
+        XCTAssertEqual(at(0.1).fx?.kind, .glitchBars, "из notch — полосами")
+        XCTAssertEqual(at(0.7).fx?.kind, .columnSmear)
+        XCTAssertEqual(at(0.7).fx?.role, .enter)
+        XCTAssertEqual(at(4.5).fx?.kind, .ribbonOut)
+        XCTAssertEqual(at(4.5).fx?.role, .exit)
+        XCTAssertNil(at(2).fx, "в покое перехода нет")
+        // Окна тоже: прилёт окна сессий через общий вход.
+        let w = geometry(.sessions)
+        XCTAssertEqual(SceneTimeline.frame(.sessions, t: 0.5, geometry: w, clips: all, options: o).fx?.kind, .columnSmear)
+        // Reduce Motion: вспышки в конце перелёта нет.
+        XCTAssertGreaterThan(at(0.43).flash, 0)
+        o.reduceMotion = true
+        XCTAssertEqual(at(0.43).flash, 0)
+    }
+
+    func testVibeSpotPrefersVisiblePlayerWindow() {
+        let screen = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let primary: CGFloat = 982
+        // CG-координаты (от верхнего левого): плеер ниже строки меню, переднее окно — другое приложение слева.
+        let player = WindowInfo(pid: 20, layer: 0, bounds: CGRect(x: 700, y: 200, width: 700, height: 500))
+        let front = WindowInfo(pid: 10, layer: 0, bounds: CGRect(x: 40, y: 150, width: 600, height: 600))
+        let spot = SceneLayout.vibeSpot(windows: [front, player], players: [20], front: 10, own: 1, screen: screen,
+                                        visible: visible, primaryHeight: primary)!
+        XCTAssertTrue(spot.player)
+        let pw = SceneLayout.appKit(player.bounds, primaryHeight: primary)
+        XCTAssertEqual(spot.window, pw)
+        XCTAssertTrue(spot.eyes.minY < pw.maxY && spot.eyes.maxY > pw.maxY, "на верхнем крае плеера")
+        XCTAssertTrue(visible.contains(spot.eyes))
+        // Правый верх плеера закрыт другим окном — левый верх (правее кнопок окна).
+        let cover = WindowInfo(pid: 10, layer: 0, bounds: CGRect(x: 1150, y: 120, width: 300, height: 300))
+        let left = SceneLayout.vibeSpot(windows: [cover, player], players: [20], front: 10, own: 1, screen: screen,
+                                        visible: visible, primaryHeight: primary)!
+        XCTAssertTrue(left.player)
+        XCTAssertGreaterThanOrEqual(left.eyes.minX, pw.minX + 80, "кнопки окна не закрываем")
+        // Плеер развёрнут до строки меню — сверху места нет, сидит внутри под верхним краем справа.
+        let big = WindowInfo(pid: 20, layer: 0, bounds: CGRect(x: 0, y: 38, width: 1512, height: 900))
+        let inside = SceneLayout.vibeSpot(windows: [big], players: [20], front: 20, own: 1, screen: screen,
+                                          visible: visible, primaryHeight: primary)!
+        XCTAssertTrue(SceneLayout.appKit(big.bounds, primaryHeight: primary).contains(inside.eyes))
+        // Плеера нет: переднее окно (только над верхним краем); развёрнутое переднее — места нет (кивание в notch).
+        let onFront = SceneLayout.vibeSpot(windows: [front], players: [], front: 10, own: 1, screen: screen,
+                                           visible: visible, primaryHeight: primary)!
+        XCTAssertFalse(onFront.player)
+        let maxed = WindowInfo(pid: 10, layer: 0, bounds: CGRect(x: 0, y: 38, width: 1512, height: 900))
+        XCTAssertNil(SceneLayout.vibeSpot(windows: [maxed], players: [], front: 10, own: 1, screen: screen,
+                                          visible: visible, primaryHeight: primary))
+        // Плеер на другом экране — не он.
+        let elsewhere = WindowInfo(pid: 20, layer: 0, bounds: CGRect(x: 2000, y: 200, width: 700, height: 500))
+        XCTAssertFalse(SceneLayout.vibeSpot(windows: [elsewhere, front], players: [20], front: 10, own: 1, screen: screen,
+                                            visible: visible, primaryHeight: primary)!.player)
+        // Своё окно Capri не закрывает и само не место.
+        XCTAssertNil(SceneLayout.vibeSpot(windows: [WindowInfo(pid: 1, layer: 0, bounds: front.bounds)], players: [], front: 1,
+                                          own: 1, screen: screen, visible: visible, primaryHeight: primary))
+    }
+
+    func testCompactPanelHoldsEverythingOfCalmPart() {
+        for kind in [SceneKind.vibe, .teleport] {
+            var g = geometry(kind)
+            g.cursor = CGPoint(x: 0, y: 0)
+            let box = SceneLayout.compactPanel(kind, geometry: g)!
+            XCTAssertLessThan(box.width * box.height, g.bounds.width * g.bounds.height / 4, "намного меньше полной панели")
+            let calm = SceneTimeline.calm(kind)!
+            var t = calm.lowerBound
+            while t < calm.upperBound {
+                let f = SceneTimeline.frame(kind, t: t, geometry: g, clips: all)
+                XCTAssertTrue(box.contains(f.eyes!), "\(kind) \(t)")
+                for n in f.notes { XCTAssertTrue(box.insetBy(dx: 12, dy: 12).contains(n.center), "нота \(kind) \(t)") }
+                XCTAssertNil(f.bolt)
+                XCTAssertNil(f.fx)
+                t += 0.05
+            }
+            for b in SceneTimeline.eyeControls(g.target) { XCTAssertTrue(box.contains(b.rect)) }
+        }
+        XCTAssertNil(SceneLayout.compactPanel(.sessions, geometry: geometry(.sessions)))
     }
 }

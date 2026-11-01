@@ -7,3 +7,4 @@ work/
 refs/
 __pycache__/
 *.pyc
+tools/capri-asr/.build/

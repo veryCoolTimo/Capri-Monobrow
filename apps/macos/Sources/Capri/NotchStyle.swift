@@ -10,6 +10,7 @@ enum Palette {
     static let acid = Color(red: 0.24, green: 0.96, blue: 0.54)
     static let acidNS = NSColor(srgbRed: 0.24, green: 0.96, blue: 0.54, alpha: 1)
     static let violet = Color(red: 0.42, green: 0.29, blue: 1.0)
+    static let violetNS = NSColor(srgbRed: 0.42, green: 0.29, blue: 1.0, alpha: 1)
     /// Всё, что сказал Codex: светлый фиолетовый, читается на чёрном.
     static let codex = Color(red: 0.68, green: 0.6, blue: 1.0)
     static let text = Color(red: 0.95, green: 0.91, blue: 0.92)

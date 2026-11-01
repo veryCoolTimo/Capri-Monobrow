@@ -36,6 +36,18 @@ struct ChatMessageBody: View {
                     .foregroundColor(m.hasPrefix("✗") ? Palette.crimson : m.hasPrefix("♪") ? Palette.acid : Palette.codex)
                     .lineLimit(2).fixedSize(horizontal: false, vertical: true)
             }
+            if !message.links.isEmpty {
+                // Источники веб-поиска: открываются в браузере только по клику.
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(message.links, id: \.url) { l in
+                        Button { NSWorkspace.shared.open(l.url) } label: {
+                            Text("↗ " + l.title).font(.mono(size * 0.8, .semibold)).foregroundColor(Palette.codex).lineLimit(1)
+                        }
+                        .buttonStyle(.plain)
+                        .help(l.url.absoluteString)
+                    }
+                }
+            }
             ForEach(message.proposals) { p in ProposalCard(codex: codex, message: message.id, proposal: p) }
         }
     }
@@ -78,9 +90,9 @@ struct AssistantView: View {
                             .textFieldStyle(.plain).font(.system(size: 12.5))
                             .focused($focused)
                             .onSubmit(send)
-                        Button {} label: { Image(systemName: "mic").font(.system(size: 11)) }
-                            .buttonStyle(.plain).foregroundColor(Palette.dim.opacity(0.6)).disabled(true)
-                            .help("Голос — позже")
+                        Image(systemName: "mic").font(.system(size: 11))
+                            .foregroundColor(Palette.dim.opacity(0.8))
+                            .help("Голос: держите ⌃⌥Space и говорите, отпустите — Capri выполнит")
                     }
                     .padding(.horizontal, 9).padding(.vertical, 7)
                     .hud(stroke: Palette.codex.opacity(focused ? 0.85 : 0.5), fill: Color.black.opacity(0.55), cut: 7)

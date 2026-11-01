@@ -476,3 +476,156 @@ struct CapriShotView: View {
         }
     }
 }
+
+/// Палитра из библии персонажа (по кадрам сериала; сами кадры в репозиторий не входят).
+enum BiblePalette {
+    /// Акцент переходов (скан-линия, кромка) — розовый, как прежняя молния.
+    static let bolt = Color(red: 0xFB / 255, green: 0x46 / 255, blue: 0x88 / 255)
+    /// Маска.
+    static let mask = Color(red: 0, green: 0xFC / 255, blue: 0x67 / 255)
+    /// Волосы/тело.
+    static let hair = Color(red: 0xFB / 255, green: 0x0D / 255, blue: 0x49 / 255)
+    /// Блёстки волос.
+    static let sparkle = Color(red: 0xFB / 255, green: 0x46 / 255, blue: 0x88 / 255)
+    /// Фиолетовая RGB-кромка.
+    static let rim = Color(red: 0x7A / 255, green: 0x2C / 255, blue: 0xF4 / 255)
+
+    static func flash(_ t: FlashTint) -> Color { t == .mask ? mask : hair }
+}
+
+/// Отрисовка общих переходов (`TransitionFrame` из CapriKit): содержимое полосами/столбцами, вспышка сплошным
+/// цветом, лента волос, розовая игольчатая молния. Координаты уже локальные (панель, сверху вниз), кроме точек
+/// молнии и ленты — их переводит `map`.
+enum TransitionArt {
+    /// Содержимое (глаза/лицо — символ Canvas размера `r`) по кадру перехода: полосы со сдвигом и RGB-разносом,
+    /// столбцы со сдвигом и растяжением, сплющивание к средней линии.
+    static func drawContent(_ fx: TransitionFrame, symbol: GraphicsContext.ResolvedSymbol, in r: CGRect, squash: CGFloat,
+                            _ ctx: GraphicsContext) {
+        var base = ctx
+        let sq = max(0.02, squash * fx.squash)
+        if sq < 1 {
+            base.translateBy(x: 0, y: r.midY)
+            base.scaleBy(x: 1 + (1 - sq) * 0.25, y: sq)
+            base.translateBy(x: 0, y: -r.midY)
+        }
+        if !fx.bars.isEmpty {
+            for bar in fx.bars where bar.shown {
+                let band = CGRect(x: r.minX - abs(bar.dx) - 12, y: r.minY + r.height * bar.y, width: r.width + abs(bar.dx) * 2 + 24,
+                                  height: r.height * bar.h + 0.5)
+                var c = base
+                c.clip(to: Path(band))
+                if bar.split > 0.5 {
+                    var red = c
+                    red.addFilter(.colorMultiply(BiblePalette.hair))
+                    red.blendMode = .screen
+                    red.draw(symbol, in: r.offsetBy(dx: bar.dx - bar.split, dy: 0))
+                    var cyan = c
+                    cyan.addFilter(.colorMultiply(BiblePalette.bolt))
+                    cyan.blendMode = .screen
+                    cyan.draw(symbol, in: r.offsetBy(dx: bar.dx + bar.split, dy: 0))
+                }
+                c.draw(symbol, in: r.offsetBy(dx: bar.dx, dy: 0))
+            }
+            return
+        }
+        if !fx.columns.isEmpty {
+            for col in fx.columns where col.shown {
+                let x = r.minX + r.width * col.x
+                var c = base
+                c.clip(to: Path(CGRect(x: x, y: r.minY - r.height * 3, width: r.width * col.w + 0.5, height: r.height * 8)))
+                c.opacity = Double(max(0, 1 - (col.stretch - 1) / 1.5 * 0.8))
+                c.translateBy(x: 0, y: r.minY + col.drop)
+                c.scaleBy(x: 1, y: col.stretch)
+                c.draw(symbol, in: CGRect(x: r.minX, y: 0, width: r.width, height: r.height))
+            }
+            return
+        }
+        base.draw(symbol, in: r)
+    }
+
+    /// Вспышка сплошным цветом (как кадр сериала, залитый целиком): плашка из строк с рваными краями, сквозь
+    /// неё — пара бирюзовых строк развёртки.
+    static func drawFlash(_ f: TransitionFlash, in r: CGRect, _ ctx: GraphicsContext) {
+        var c = ctx
+        c.opacity = Double(f.alpha)
+        var block = Path(), scan = Path()
+        var y = r.minY, k = 0
+        while y < r.maxY {
+            let h = 3 + 5 * CGFloat(TickNoise.unit(f.seed &+ k, 1410))
+            let l = (CGFloat(TickNoise.unit(f.seed &+ k, 1411)) - 0.3) * r.width * 0.18
+            let w = r.width * (0.82 + 0.3 * CGFloat(TickNoise.unit(f.seed &+ k, 1412)))
+            let row = CGRect(x: r.minX + l, y: y, width: w, height: min(h, r.maxY - y))
+            if TickNoise.unit(f.seed &+ k, 1413) < 0.12 { scan.addRect(row.insetBy(dx: 0, dy: row.height * 0.35)) } else { block.addRect(row) }
+            y += h
+            k += 1
+        }
+        c.fill(block, with: .color(BiblePalette.flash(f.tint)))
+        c.fill(scan, with: .color(BiblePalette.bolt))
+    }
+
+    /// Рваный многоугольник «взрыва» в прямоугольнике.
+    static func burst(seed: Int, in r: CGRect) -> Path {
+        var path = Path()
+        let n = 18
+        for i in 0..<n {
+            let a = CGFloat(i) / CGFloat(n) * 2 * .pi
+            let k: CGFloat = i % 2 == 0 ? 0.75 + 0.25 * CGFloat(TickNoise.unit(seed &+ i, 1400)) : 0.38 + 0.2 * CGFloat(TickNoise.unit(seed &+ i, 1401))
+            let p = CGPoint(x: r.midX + cos(a) * r.width / 2 * k, y: r.midY + sin(a) * r.height / 2 * k)
+            if i == 0 { path.move(to: p) } else { path.addLine(to: p) }
+        }
+        path.closeSubpath()
+        return path
+    }
+
+    /// Лента волос: видимая часть ломаной между `tail` и `head`; малиновая с фиолетовой кромкой и блёстками.
+    static func drawRibbon(_ rb: TransitionRibbon, map: (CGPoint) -> CGPoint, _ ctx: GraphicsContext) {
+        let pts = rb.points.map(map)
+        guard pts.count > 1 else { return }
+        let lens = zip(pts, pts.dropFirst()).map { hypot($1.x - $0.x, $1.y - $0.y) }
+        let total = lens.reduce(0, +)
+        func point(_ f: CGFloat) -> (CGPoint, Int) {
+            var left = total * f
+            for (i, l) in lens.enumerated() {
+                if left <= l, l > 0 {
+                    let k = left / l
+                    return (CGPoint(x: pts[i].x + (pts[i + 1].x - pts[i].x) * k, y: pts[i].y + (pts[i + 1].y - pts[i].y) * k), i)
+                }
+                left -= l
+            }
+            return (pts[pts.count - 1], pts.count - 2)
+        }
+        let (a, ia) = point(rb.tail), (b, ib) = point(rb.head)
+        var line = Path()
+        line.move(to: a)
+        if ib > ia { for i in (ia + 1)...ib { line.addLine(to: pts[i]) } }
+        line.addLine(to: b)
+        let style = { (w: CGFloat) in StrokeStyle(lineWidth: w, lineCap: .butt, lineJoin: .miter) }
+        // Фиолетовая RGB-кромка, малиновое тело, светлая блёстка по краю.
+        ctx.stroke(line.offsetBy(dx: 2.5, dy: 2), with: .color(BiblePalette.rim), style: style(rb.width))
+        ctx.stroke(line.offsetBy(dx: -1.5, dy: -1), with: .color(BiblePalette.bolt.opacity(0.7)), style: style(rb.width * 0.9))
+        ctx.stroke(line, with: .color(BiblePalette.hair), style: style(rb.width))
+        ctx.stroke(line.offsetBy(dx: -rb.width * 0.22, dy: -rb.width * 0.22), with: .color(BiblePalette.sparkle),
+                   style: style(max(1, rb.width * 0.18)))
+        // Голова ленты — острый клин.
+        let d = CGVector(dx: b.x - a.x, dy: b.y - a.y), len = max(1, hypot(d.dx, d.dy))
+        let ux = d.dx / len, uy = d.dy / len
+        var tip = Path()
+        tip.addLines([CGPoint(x: b.x - uy * rb.width * 0.6, y: b.y + ux * rb.width * 0.6),
+                      CGPoint(x: b.x + ux * rb.width * 1.4, y: b.y + uy * rb.width * 1.4),
+                      CGPoint(x: b.x + uy * rb.width * 0.6, y: b.y - ux * rb.width * 0.6)])
+        tip.closeSubpath()
+        ctx.fill(tip, with: .color(BiblePalette.hair))
+    }
+
+    /// Молния — прежняя розовая игольчатая (`CapriFX.boltPath`) с фиолетовой тенью: Тимофею она нравится
+    /// больше бирюзовой из отрезков. Путь `TransitionBolt` задаёт только концы и «кипение».
+    static func drawBolt(_ b: TransitionBolt, map: (CGPoint) -> CGPoint, width: CGFloat, _ ctx: GraphicsContext) {
+        guard let first = b.main.first, let last = b.main.last else { return }
+        let a = map(first), z = map(last)
+        let seed = Int(first.x * 7 + first.y * 13 + last.x * 3) & 0xFFFF
+        let boil = b.main.count &+ Int(b.main.reduce(0) { $0 + $1.x + $1.y }) & 0xFF
+        let path = CapriFX.boltPath(from: a, to: z, seed: seed / 2 + 7, boil: boil, width: width)
+        ctx.fill(path.offsetBy(dx: 1.2, dy: 1.5), with: .color(Palette.violet))
+        ctx.fill(path, with: .color(Palette.crimson))
+    }
+}

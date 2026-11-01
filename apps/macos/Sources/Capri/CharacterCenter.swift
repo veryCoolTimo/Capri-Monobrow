@@ -25,6 +25,9 @@ final class CharacterCenter {
     /// Конец «спрятан на час» — снова взвести фоновые сцены.
     private var unhideTimer: Timer?
     private var vibeWork: DispatchWorkItem?
+    /// Пауза плеера во время вайба: уходим, если не заиграло снова за `vibePauseDelay`.
+    private var vibePauseWork: DispatchWorkItem?
+    static let vibePauseDelay = 0.8
     private var musicRefresh: DispatchWorkItem?
     /// Погасить строку трека через 4 с после смены (одноразовый, не повторяющийся таймер).
     private var revealWork: DispatchWorkItem?
@@ -37,10 +40,19 @@ final class CharacterCenter {
     /// Когда спросили помощника (ответ без «думает» показываем, только если спросили недавно).
     private var askedAt: Double?
     /// Команда плееру ушла — ждём его событие (≤ 6 с): что просили и сообщение чата.
-    private var musicWait: (cmd: MusicCommand, message: UUID?)?
+    private var musicWait: (cmd: MusicCommand, message: UUID?, status: ((String) -> Void)?)?
     private var musicWaitWork: DispatchWorkItem?
     /// Решения и сцены в `~/.capri/tmp/debug.log` (только с `--debug-control`).
     var debugLog = false
+    /// «Сидит на окнах» (этап 2 присутствия).
+    private(set) var perch: PerchCenter!
+    /// Общий бюджет появлений на столе — для всех путей (переживает перезапуск).
+    private(set) var budget: ScreenBudget
+    static let budgetKey = "capri.screenBudget"
+    /// Музыку только что включила сама Capri (голос, кнопки, помощник) — до этого времени вайба на столе нет.
+    private var capriMusicUntil: Double?
+    /// Несколько сессий доработали пачкой (статус дребезжит) — один повод через 2 с.
+    private var finishedWork: DispatchWorkItem?
 
     init(store: SessionStore, codex: CodexService, notch: NotchController, settings: Settings, attention: AttentionCenter,
          music: MusicController) {
@@ -53,16 +65,90 @@ final class CharacterCenter {
         let now = Date().timeIntervalSince1970
         director = CharacterDirector(now: now, seed: Int(now) & 0xFFFF, rate: settings.characterRate)
         playing = NowPlayingState(now: now)
+        budget = UserDefaults.standard.data(forKey: Self.budgetKey).flatMap { try? JSONDecoder().decode(ScreenBudget.self, from: $0) }
+            ?? ScreenBudget()
+    }
+
+    // MARK: общий бюджет стола
+
+    private func saveBudget() {
+        if let d = try? JSONEncoder().encode(budget) { UserDefaults.standard.set(d, forKey: Self.budgetKey) }
+    }
+
+    /// Выключатель «Capri на рабочем столе», тихие часы, звонок, общий счёт: nil — на стол можно.
+    func screenGate() -> String? {
+        let now = Date().timeIntervalSince1970
+        let c = Calendar.current.dateComponents([.hour, .minute], from: Date(timeIntervalSince1970: now))
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let cond = ScreenBudget.Conditions(now: now, minuteOfDay: (c.hour ?? 12) * 60 + (c.minute ?? 0), desktop: settings.desktop,
+                                           quiet: settings.quietHours, inCall: false)
+        if let why = ScreenBudget.blocked(cond) { return why }
+        // Звонок — свойства устройств читаются только здесь, в момент решения.
+        let own = ProcessInfo.processInfo.processIdentifier
+        if CallGuard.inCall(front: front, camera: DeviceBusy.camera(), mic: DeviceBusy.microphone(except: own), ownVoice: false) {
+            return "call"
+        }
+        return budget.limited(now: now, dayStart: PerchPolicy.dayStart(now: now))
+    }
+
+    /// Сцена на столе началась (любой путь, кроме демо): общий счёт.
+    func recordScreen() {
+        budget.record(Date().timeIntervalSince1970)
+        saveBudget()
     }
 
     func start() {
+        perch = PerchCenter(stage: stage, settings: settings, notch: notch, codex: codex) { [weak self] in
+            self?.input ?? CharacterDirector.Input(now: Date().timeIntervalSince1970)
+        }
+        perch.log = { [weak self] line in self?.log(line) }
+        perch.facts = { [weak self] in
+            guard let self else { return (0, 0, nil) }
+            let s = self.store.sessions
+            return (s.filter { $0.status == .running }.count, s.filter { $0.status == .needsInput }.count,
+                    self.playing.playing ? self.playing.track?.name : nil)
+        }
+        // Терминал с Claude: сессии, имена, хвост экрана (приватные хосты — без текста: только статус).
+        perch.sessions = { [weak self] in self?.store.sessions ?? [] }
+        perch.hostOnline = { [weak self] h in self?.store.hosts.first { $0.name == h }?.connected ?? true }
+        perch.sessionName = { [weak self] s in self?.store.name(s).title ?? s.project }
+        perch.tail = { [weak self] s in
+            guard let self, !self.settings.codexPrivateHosts.contains(s.key.host) else { return nil }
+            return self.store.details.lines(s).map { Array($0.suffix(40).map(\.plain)) }
+        }
+        perch.screensChanged = { [weak self] in
+            self?.store.details.$screens.map { _ in () }.eraseToAnyPublisher() ?? Empty().eraseToAnyPublisher()
+        }
+        perch.recordScreen = { [weak self] in self?.recordScreen() }
+        perch.lastScreenEnd = { [weak self] in self?.budget.lastEnd }
+        perch.start()
+        stage.onEnded = { [weak self] kind in
+            guard let self else { return }
+            if kind == .perch { self.perch.teardown() }
+            // Конец любой сцены на столе — тишина `ScreenBudget.afterScene` для всех путей.
+            self.budget.ended(Date().timeIntervalSince1970)
+            self.saveBudget()
+        }
         stage.home = { [weak notch] in notch?.eyesRect }
         stage.screen = { [weak notch] in notch?.notchScreen }
         stage.content = { [weak self] in self?.content() ?? SceneContent() }
         stage.onRunning = { [weak self] on in self?.notch.ui.faceAway = on }
         stage.log = { [weak self] line in self?.log(line) }
         stage.onAction = { [weak self] kind, spot, mods in self?.stageAction(kind, spot, mods) }
-        stage.makeMenu = { [weak notch] in notch?.makeMenu?() ?? NSMenu() }
+        stage.makeMenu = { [weak self] in
+            let menu = self?.notch.makeMenu?() ?? NSMenu()
+            // Сидит на окне: «Не садиться на …» и «Прогнать с окон на час» — сверху, «Выйти» — как всегда, внизу.
+            let extra = self?.perch.menuItems() ?? []
+            if !extra.isEmpty { menu.insertItem(.separator(), at: 0) }
+            for item in extra.reversed() { menu.insertItem(item, at: 0) }
+            return menu
+        }
+        // Вайб доиграл минуту и втянулся в «монобровь» — там ещё коротко кивает.
+        stage.onFinished = { [weak self] kind in
+            if kind == .perch { self?.perch.finished() }
+            guard let self, kind == .vibe, self.settings.music, self.playing.playing else { return }
+            self.notchVibe(seconds: 4)
+        }
         notch.onStateChange = { [weak self] s in self?.notchStateChanged(s) }
         store.onSent = { [weak self] key, _ in self?.replySent(key) }
         store.$deliveries
@@ -86,6 +172,13 @@ final class CharacterCenter {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] sessions in self?.sessionsChanged(sessions) }
             .store(in: &cancellables)
+        // Связь с хостом пропала, пока она смотрит в терминал его сессии — пиксельный призрак.
+        store.$hosts
+            .map { $0.filter { !$0.connected }.map(\.name) }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.perch.hostsChanged() }
+            .store(in: &cancellables)
         let ws = NSWorkspace.shared.notificationCenter
         // Сон системы или смена пользователя посреди сцены: таймер конца сцены идёт по uptime и во сне стоит —
         // гасим сцену сразу, иначе глаза в notch останутся спрятанными после пробуждения.
@@ -94,6 +187,7 @@ final class CharacterCenter {
             observers.append(ws.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 self?.stage.stop()
                 self?.stopNotchVibe()
+                self?.onSleep?()
             })
         }
         monitor.onEvent = { [weak self] source, e in self?.musicEvent(source, e) }
@@ -110,6 +204,9 @@ final class CharacterCenter {
         musicSettingChanged()
         settingsChanged()
     }
+
+    /// Сон/блокировка/смена пользователя (голос — оборвать фразу и выключить микрофон).
+    var onSleep: (() -> Void)?
 
     // MARK: настройки
 
@@ -130,7 +227,8 @@ final class CharacterCenter {
             unhideTimer = t
             return
         }
-        guard settings.character else { return }
+        // Фоновые сцены по таймеру — только если их явно включили (Экспериментальное): иначе таймера нет вовсе.
+        guard settings.character, settings.characterAmbient else { return }
         director.scheduleAmbient(Date().timeIntervalSince1970, rate: settings.characterRate)
         let t = Timer(timeInterval: 60, repeats: true) { [weak self] _ in self?.ambientTick() }
         t.tolerance = 15
@@ -162,10 +260,16 @@ final class CharacterCenter {
 
     private func sessionsChanged(_ sessions: [Session]) {
         let next = statuses(sessions)
-        defer { prevStatus = next }
+        let prev = prevStatus
+        defer {
+            prevStatus = next
+            // Смотрит в терминал — реплики на перемены; терминал передний и сессия заработала — может, это повод.
+            perch.sessionsChanged(prev: prev, next: sessions)
+        }
         if SceneTriggers.needsInputAppeared(prev: prevStatus, next: next) {
             // «Ждёт меня» всегда выше: сцена — домой (и закреплённая), кивание — стоп.
-            stage.abort("needsInput")
+            // Ждут сразу несколько — мини-маска перегружается (рой глаз) перед молнией домой.
+            stage.abort("needsInput", overload: sessions.filter { $0.status == .needsInput }.count >= 2)
             stopNotchVibe()
             return
         }
@@ -176,7 +280,16 @@ final class CharacterCenter {
                 self.stage.update(content: self.content())
             }
         }
-        if !SceneTriggers.finished(prev: prevStatus, next: next).isEmpty { trigger(.sessionFinished, retry: true) }
+        if !SceneTriggers.finished(prev: prevStatus, next: next).isEmpty {
+            // Пачка переходов (дребезг статуса, несколько сессий разом) — одно решение через 2 с.
+            finishedWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                self?.finishedWork = nil
+                self?.trigger(.sessionFinished, retry: true)
+            }
+            finishedWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
+        }
     }
 
     /// Раскрытие notch обрывает сцену, кроме закреплённой и окон помощника (они и есть ответ на действие);
@@ -211,13 +324,16 @@ final class CharacterCenter {
         return i
     }
 
+    /// `continuing` — она уже на столе (кнопки под глазами идущей сцены): нового появления нет, бюджет не тратится.
     @discardableResult
     private func playAction(_ event: CharacterDirector.ActionEvent, content: SceneContent? = nil, variant: String? = nil,
-                            terminal: CGRect? = nil, around: CGRect? = nil) -> Bool {
-        let d = director.decideAction(event, actionInput)
+                            terminal: CGRect? = nil, around: CGRect? = nil, continuing: Bool = false) -> Bool {
+        let d = director.decideAction(event, actionInput, continuing: continuing)
         log("action \(event.rawValue): \(d.log)")
         guard case .play(let kind) = d else { return false }
-        return stage.play(kind, variant: variant, terminal: terminal, content: content, around: around)
+        let ok = stage.play(kind, variant: variant, terminal: terminal, content: content, around: around)
+        if ok, !continuing { recordScreen() }
+        return ok
     }
 
     /// Ответ сессии ушёл (любой путь): телепорт к её терминалу; notch раскрыт — когда свернётся.
@@ -316,6 +432,11 @@ final class CharacterCenter {
 
     /// Клик по строке/кнопке окна сцены. Всё — явные действия человека (основное окно, помощник, терминал, плеер).
     private func stageAction(_ kind: SceneKind, _ spot: SceneHotspot.Kind, _ mods: NSEvent.ModifierFlags) {
+        if kind == .perch {
+            if spot == .button("shoo") { perch.shoo() }
+            if spot == .button("bubble") { perch.bubble() }
+            return
+        }
         if case .button(let id) = spot, let cmd = MusicCommand(button: id) {
             musicButton(cmd, from: "stage")
             return
@@ -409,13 +530,33 @@ final class CharacterCenter {
         log("music \(source.rawValue): \(change)")
         updateMusicUI()
         musicHeard(e, change)
+        if playing.playing { vibePauseWork?.cancel(); vibePauseWork = nil }
         switch change {
         case .started(let afterSilence):
-            if afterSilence, case .play = trigger(.musicStarted) { return }
+            if afterSilence {
+                switch trigger(.musicStarted) {
+                case .play, .notchVibe: return
+                case .skip: break
+                }
+            }
+            if stage.kind == .vibe { stage.markTrackChange(); return }
             trigger(.trackChanged)
         case .changed:
+            // Вайб на столе: глитч на месте, таймер не продлевается; кивание в notch — после него.
+            if stage.kind == .vibe { stage.markTrackChange(); return }
             trigger(.trackChanged)
         case .paused, .stopped:
+            // Пауза/стоп во время вайба — молния домой, если за 0,8 с не заиграло снова (Spotify иногда шлёт
+            // «пауза» → «играет» с разницей в полсекунды, без настоящей паузы).
+            if stage.kind == .vibe {
+                vibePauseWork?.cancel()
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self, self.stage.kind == .vibe, !self.playing.playing else { return }
+                    self.stage.abort("music paused")
+                }
+                vibePauseWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.vibePauseDelay, execute: work)
+            }
             stopNotchVibe()
             musicRefresh?.cancel()
             let work = DispatchWorkItem { [weak self] in self?.updateMusicUI() }
@@ -454,10 +595,11 @@ final class CharacterCenter {
 
     /// ⏮ ⏯ ⏭: notch, peek, глаза на столе, окно музыки, меню. С глаз на столе (идёт сцена) — короткое окно музыки
     /// на том же месте; из notch ради паузы не телепортируемся — там кивок.
+
     func musicButton(_ cmd: MusicCommand, from: String) {
         if from == "stage", stage.running, stage.kind != .music {
             let at = stage.model.run.map { $0.geometry.area ?? $0.geometry.target }
-            playAction(.musicRequested, content: content(), around: at)
+            playAction(.musicRequested, content: content(), around: at, continuing: true)
         }
         performMusic(cmd, intent: .button(from), message: nil)
     }
@@ -472,32 +614,47 @@ final class CharacterCenter {
         case .playURI: c.query = "ссылка Spotify"
         default: c.query = nil
         }
-        if stage.kind == .music { stage.update(content: c) } else { playAction(.musicRequested, content: c) }
+        let shown = stage.kind == .music || playAction(.musicRequested, content: c)
+        if stage.kind == .music, shown { stage.update(content: c) }
         switch cmd {
-        case .play, .playURI: stage.mark(music: .searching)
+        case .play, .playURI: if stage.kind == .music { stage.mark(music: .searching) }
         default: break
         }
         performMusic(cmd, intent: .assistant(question), message: message)
     }
 
-    private func performMusic(_ cmd: MusicCommand, intent: MusicIntent, message: UUID?) {
+    /// Музыка голосом: та же команда, но без окна музыки на столе — итог строкой в notch (`status`).
+    func musicVoice(_ cmd: MusicCommand, question: String, status: @escaping (String) -> Void) {
+        performMusic(cmd, intent: .assistant(question), message: nil, status: status)
+    }
+
+    /// `status` — итог строкой для того, кто именно этой просьбой спросил (голос); у каждой просьбы свой.
+    private func performMusic(_ cmd: MusicCommand, intent: MusicIntent, message: UUID?, status: ((String) -> Void)? = nil) {
+        // Прошлая просьба ещё ждала плеер — её итог уже не узнать: пусть не висит.
+        if let w = musicWait { w.status?("· следующая команда") }
         musicWaitWork?.cancel()
         musicWaitWork = nil
         musicWait = nil
+        switch cmd {
+        case .pause: break
+        // Музыку включила Capri — вайба на столе в ответ на «пошла музыка» не будет (только кивок в notch).
+        default: capriMusicUntil = Date().timeIntervalSince1970 + 15
+        }
         let wasPlaying = playing.playing
         music.perform(cmd, intent: intent) { [weak self] r in
-            self?.musicResult(cmd, r, intent: intent, message: message, wasPlaying: wasPlaying)
+            self?.musicResult(cmd, r, intent: intent, message: message, wasPlaying: wasPlaying, status: status)
         }
     }
 
-    private func musicResult(_ cmd: MusicCommand, _ r: MusicResult, intent: MusicIntent, message: UUID?, wasPlaying: Bool) {
+    private func musicResult(_ cmd: MusicCommand, _ r: MusicResult, intent: MusicIntent, message: UUID?, wasPlaying: Bool,
+                             status to: ((String) -> Void)?) {
         let q: String = { if case .play(let q) = cmd { return "«\(q)»" }; return "" }()
         switch r {
         case .sent(let player):
             log("music sent → \(player.rawValue)")
             let pausing: Bool = { if case .pause = cmd { return true }; if case .toggle = cmd { return wasPlaying }; return false }()
             if pausing {
-                musicDone(.paused, message, status: "❚❚ пауза")
+                musicDone(.paused, message, to: to, status: "❚❚ пауза")
                 return
             }
             if case .button(let from) = intent, from == "notch" || from == "peek", settings.music, !settings.characterHidden {
@@ -505,10 +662,10 @@ final class CharacterCenter {
             }
             guard monitor.running else {
                 // Музыку Capri не слушает (настройка выкл.) — события не будет, верим скрипту.
-                musicDone(.playing, message, status: "▶ отправила плееру")
+                musicDone(.playing, message, to: to, status: "▶ отправила плееру")
                 return
             }
-            musicWait = (cmd, message)
+            musicWait = (cmd, message, to)
             let work = DispatchWorkItem { [weak self] in
                 guard let self, let w = self.musicWait else { return }
                 self.musicWait = nil
@@ -516,41 +673,43 @@ final class CharacterCenter {
                 // но скрипт прошёл и музыка идёт: это не провал.
                 if self.playing.playing, let t = self.playing.track {
                     self.log("music: плеер молчит 6 с, но играет — считаем сделанным")
-                    self.musicDone(.playing, w.message, status: "♪ " + t.line)
+                    self.musicDone(.playing, w.message, to: w.status, status: "♪ " + t.line)
                     return
                 }
                 self.log("music: плеер молчит 6 с")
-                self.musicDone(.failed, w.message, status: "✗ не включилось", note: "не включилось")
+                self.musicDone(.failed, w.message, to: w.status, status: "✗ не включилось", note: "не включилось")
             }
             musicWaitWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: work)
         case .needsKeys(let err):
             log("music: искать по названию нечем (\(err == nil ? "нет ключей" : "ключи не сработали"))")
             let why = err.map { "Ключи Spotify не сработали (\($0))." } ?? "Без ключа Spotify искать по названию не умею."
-            musicDone(.failed, message, status: "✗ нужен ключ Spotify",
+            musicDone(.failed, message, to: to, status: "✗ нужен ключ Spotify",
                       text: "\(why) Пришли ссылку на трек — включу сразу, или добавь ключи в настройках (Музыка).",
                       note: "нужен ключ Spotify")
         case .notFound:
-            musicDone(.failed, message, status: "✗ не нашла \(q)", text: "Не нашла \(q).", note: "не нашла \(q)")
+            musicDone(.failed, message, to: to, status: "✗ не нашла \(q)", text: "Не нашла \(q).", note: "не нашла \(q)")
         case .notRunning:
-            musicDone(.info, message, status: "✗ плеер не запущен", text: "Ничего не играет — Spotify и Музыка не запущены.",
+            musicDone(.info, message, to: to, status: "✗ плеер не запущен", text: "Ничего не играет — Spotify и Музыка не запущены.",
                       note: "плеер не запущен")
         case .noPlayer:
-            musicDone(.failed, message, status: "✗ нет Spotify и Музыки", text: "Не нашла ни Spotify, ни Музыку.", note: "нет плеера")
+            musicDone(.failed, message, to: to, status: "✗ нет Spotify и Музыки", text: "Не нашла ни Spotify, ни Музыку.", note: "нет плеера")
         case .denied:
-            musicDone(.failed, message, status: "✗ нет доступа к плееру",
+            musicDone(.failed, message, to: to, status: "✗ нет доступа к плееру",
                       text: "macOS не дала мне управлять плеером: Системные настройки → Конфиденциальность → Автоматизация → Capri.",
                       note: "нет доступа (Автоматизация)")
         case .skipped:
-            musicDone(.info, message, status: "· пропущено (плеер был занят)", note: "пропущено")
+            musicDone(.info, message, to: to, status: "· пропущено (плеер был занят)", note: "пропущено")
         case .failed(let m):
-            musicDone(.failed, message, status: "✗ \(m)", note: m)
+            musicDone(.failed, message, to: to, status: "✗ \(m)", note: m)
         }
     }
 
     /// Итог музыки: строка в чате (и текст ответа), окно музыки — новое состояние.
-    private func musicDone(_ state: SceneMusicState, _ message: UUID?, status: String, text: String? = nil, note: String? = nil) {
+    private func musicDone(_ state: SceneMusicState, _ message: UUID?, to: ((String) -> Void)? = nil, status: String,
+                           text: String? = nil, note: String? = nil) {
         if let message { codex.setMusic(message, status: status, text: text) }
+        to?(status.hasPrefix("✗") ? text.map { "✗ " + $0 } ?? status : status)
         guard stage.kind == .music, var c = stage.model.run?.content else { return }
         c.note = note
         stage.update(content: c)
@@ -571,7 +730,7 @@ final class CharacterCenter {
             musicWait = nil
             musicWaitWork?.cancel()
             musicWaitWork = nil
-            musicDone(.paused, w.message, status: "❚❚ пауза")
+            musicDone(.paused, w.message, to: w.status, status: "❚❚ пауза")
             return
         }
         guard let w = musicWait, case .playing(let t) = e else { return }
@@ -580,7 +739,7 @@ final class CharacterCenter {
         musicWait = nil
         musicWaitWork?.cancel()
         musicWaitWork = nil
-        musicDone(.playing, w.message, status: "♪ " + t.line)
+        musicDone(.playing, w.message, to: w.status, status: "♪ " + t.line)
     }
 
     // MARK: решения
@@ -593,16 +752,22 @@ final class CharacterCenter {
             displaysAsleep: attention.displaysAsleep || AttentionCenter.screenLocked, notchOpen: notch.state != .collapsed,
             sceneRunning: stage.running, idleSec: Self.idleSeconds(), lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled,
             reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, onAction: settings.characterOnAction,
-            sessionsActive: store.sessions.contains { $0.status == .needsInput || $0.status == .running })
+            sessionsActive: store.sessions.contains { $0.status == .needsInput || $0.status == .running },
+            ambient: settings.characterAmbient, budget: screenGate(),
+            musicByCapri: capriMusicUntil.map { Date().timeIntervalSince1970 < $0 } ?? false)
     }
 
     @discardableResult
     func trigger(_ event: CharacterDirector.Event, retry: Bool = false) -> CharacterDirector.Decision {
-        let i = input
+        var i = input
+        // Есть ли где кивать под музыку (одно чтение списка окон — только на старт музыки).
+        if event == .musicStarted, let screen = notch.notchScreen { i.musicPerch = StageController.vibeSpot(on: screen) != nil }
         let d = director.decide(event, i)
         log("director \(event.rawValue): \(d.log) (idle \(Int(i.idleSec)) с)")
         switch d {
-        case .play(let kind): stage.play(kind)
+        case .play(let kind):
+            // Место пропало между решением и показом — кивание в notch, не угол.
+            if stage.play(kind) { recordScreen() } else if kind == .vibe { notchVibe() }
         case .notchVibe: notchVibe()
         case .skip("busy") where retry:
             // Человек прямо сейчас печатает — одна повторная попытка через 4 с.
@@ -634,6 +799,16 @@ final class CharacterCenter {
             let ok = stage.play(.music, variant: variant, content: c)
             if c.track == nil { stage.mark(music: .info) }
             return ok
+        case .perch:
+            // Демо: на переднее окно (мимо правил); муляж — `scene perch mock`.
+            if variant?.hasPrefix("mock") == true { return stage.play(.perch, variant: variant) }
+            perch.debug(["demo"])
+            return true
+        case .vibe:
+            // Демо: сесть некуда — кивание в notch (как в жизни).
+            if stage.play(.vibe, variant: variant) { return true }
+            notchVibe()
+            return false
         default:
             return stage.play(kind, variant: variant)
         }
@@ -726,6 +901,10 @@ final class CharacterCenter {
             switch what {
             case "stop": stage.stop()
             case "abort": stage.abort("control")
+            // Живые сцены в отладке выключены (`stage.offscreenOnly`) — только с явного «да» Тимофея.
+            case "live":
+                stage.offscreenOnly = parts.count > 1 && parts[1] == "off"
+                log("scene live: \(stage.offscreenOnly ? "off" : "on")")
             case "sheet":
                 guard parts.count > 1, let kind = SceneKind(rawValue: parts[1]) else { return }
                 let variant = parts.count > 2 ? parts[2] : nil
@@ -809,6 +988,8 @@ final class CharacterCenter {
             ProcessTable.locate(transport: transport, pane: parts[1], screen: screen) { [weak self] loc, rect in
                 self?.log("locate \(host) \(parts[1]): \(loc.path) pid=\(loc.pid ?? 0) window=\(rect.map { NSStringFromRect($0) } ?? "-")")
             }
+        case "perch":
+            perch.debug(parts)
         case "director":
             guard let name = parts.first else { return }
             if name == "ambient" { director.scheduleAmbient(Date().timeIntervalSince1970 - 3 * 3600, rate: settings.characterRate) }
@@ -822,7 +1003,8 @@ final class CharacterCenter {
         return [
             "stage": stage.status,
             "director": ["last": director.lastDecision, "nextAmbientIn": Int(director.nextAmbient - now),
-                         "enabled": settings.character, "onAction": settings.characterOnAction,
+                         "enabled": settings.character, "ambient": settings.characterAmbient,
+                         "ambientTimer": ambientTimer != nil, "onAction": settings.characterOnAction,
                          "hidden": settings.characterHidden, "idleSec": Int(Self.idleSeconds()),
                          "fullscreen": attention.fullscreen],
             // Без названий треков.
@@ -832,6 +1014,12 @@ final class CharacterCenter {
                            "backend": music.backend.name, "automation": music.automation, "spotifyKeys": music.spotify.hasKeys,
                            "waiting": musicWait != nil, "chatMusic": codex.chat.last?.music != nil,
                            "chatText": codex.chat.last.map { String($0.text.prefix(60)) } ?? ""],
+            "perch": perch.dump,
+            "budget": { () -> [String: Any] in
+                let c = budget.counts(now: now, dayStart: PerchPolicy.dayStart(now: now))
+                return ["hour": c.hour, "day": c.day, "gate": screenGate() ?? "ok", "desktop": settings.desktop,
+                        "lastEndAgo": budget.lastEnd.map { Int(now - $0) } ?? -1]
+            }(),
             "notchVibing": notch.ui.vibing,
             "faceAway": notch.ui.faceAway,
         ]

@@ -28,9 +28,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hotKey: HotKey?
     private let spotify = SpotifySearch()
     private var music: MusicController!
+    private var voice: VoiceCenter!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMainMenu()
+        // Хелпер речи может умереть посреди записи в pipe — это ошибка записи, а не падение Capri.
+        signal(SIGPIPE, SIG_IGN)
         store = SessionStore(sources: Self.sources())
         codex = CodexService(store: store)
         notch = NotchController(store: store, codex: codex)
@@ -52,8 +55,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.windowUI.chatOpen = true
             self?.openWindow()
         }
-        settings.onHotKeyChange = { [weak self] in self?.updateHotKey() }
-        updateHotKey()
         notch.onDebug = { [weak self] cmd, arg in self?.debugCommand(cmd, arg) }
         attention = AttentionCenter(store: store, notch: notch, settings: settings) { [weak self] key in self?.openWindow(select: key) }
         attention.onPauseChange = { [weak self] in self?.updateStatusIcon() }
@@ -66,10 +67,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         character = CharacterCenter(store: store, codex: codex, notch: notch, settings: settings, attention: attention, music: music)
         settings.onCharacterChange = { [weak self] in self?.character.settingsChanged() }
         settings.onMusicChange = { [weak self] in self?.character.musicSettingChanged() }
-        notch.dumpExtra = { [weak self] in self?.character.dump ?? [:] }
+        // Голос: Заметки и Напоминания в отладке — фейк (скрипты в журнал), как плеер.
+        let automation: AutomationRunner = {
+            guard args.contains("--debug-control") else { return OsaScriptRunner() }
+            let f = FakeAutomationRunner()
+            f.log = { NotchController.debugWrite("voice \($0)") }
+            return f
+        }()
+        voice = VoiceCenter(settings: settings, notch: notch, codex: codex, store: store, automation: automation)
+        voice.debugLog = args.contains("--debug-control")
+        voice.onMusic = { [weak self] cmd, q, status in self?.character.musicVoice(cmd, question: q, status: status) }
+        notch.onOpen = { [weak self] in self?.voice.warmOnOpen() }
+        settings.onHotKeyChange = { [weak self] in self?.updateHotKey() }
+        updateHotKey()
+        notch.dumpExtra = { [weak self] in
+            var d = self?.character.dump ?? [:]
+            d["voice"] = self?.voice.dump ?? [:]
+            return d
+        }
         notch.start()
         attention.start()
         character.debugLog = CommandLine.arguments.contains("--debug-control")
+        // В отладке живые сцены на столе не играют (только офскрин-листы), пока не скажут `scene live on`.
+        character.stage.offscreenOnly = character.debugLog
+        character.onSleep = { [weak self] in self?.voice.sleep() }
         if character.debugLog { codex.log = { NotchController.debugWrite("codex \($0)") } }
         character.start()
         LoginItem.setUpOnFirstRun()
@@ -111,6 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        voice?.helper.stop()
         codex?.stop()
         store?.stop()
     }
@@ -233,10 +255,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sub.addItem(it)
         }
         sub.addItem(.separator())
-        let toggle = NSMenuItem(title: "Персонаж на рабочем столе", action: #selector(toggleCharacter), keyEquivalent: "")
+        let toggle = NSMenuItem(title: "Сцены, когда сессия доработала", action: #selector(toggleCharacter), keyEquivalent: "")
         toggle.target = self
         toggle.state = settings.character ? .on : .off
         sub.addItem(toggle)
+        let perchToggle = NSMenuItem(title: "Садиться на окна", action: #selector(togglePerch), keyEquivalent: "")
+        perchToggle.target = self
+        perchToggle.state = settings.perch ? .on : .off
+        sub.addItem(perchToggle)
+        let snooze = settings.perchHidden
+            ? NSMenuItem(title: "Снова садиться на окна", action: #selector(unsnoozePerch), keyEquivalent: "")
+            : NSMenuItem(title: "Прогнать с окон на час", action: #selector(snoozePerch), keyEquivalent: "")
+        snooze.target = self
+        sub.addItem(snooze)
         characterItem.submenu = sub
         menu.addItem(characterItem)
         if settings.music, let line = notch.ui.music {
@@ -279,6 +310,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func hideCharacter() { character.hide(hours: 1) }
     @objc private func unhideCharacter() { character.unhide() }
     @objc private func toggleCharacter() { settings.character.toggle() }
+    @objc private func togglePerch() { settings.perch.toggle() }
+    @objc private func snoozePerch() { character.perch.snooze(hours: 1) }
+    @objc private func unsnoozePerch() { settings.perchHiddenUntil = nil }
     @objc private func showAssistant() { notch.go(.assistant, reason: "menu") }
 
     private func updateHotKey() {
@@ -286,7 +320,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.hotKeyError = nil
         guard settings.assistantHotKey else { return }
         let k = HotKey.assistant
-        hotKey = HotKey(keyCode: k.keyCode, modifiers: k.modifiers) { [weak self] in self?.notch.toggleAssistant() }
+        // Коротко — помощник (как раньше), держать — голос (`VoiceCenter`).
+        hotKey = HotKey(keyCode: k.keyCode, modifiers: k.modifiers,
+                        onPress: { [weak self] in self?.voice.press() },
+                        onRelease: { [weak self] in self?.voice.release() })
         if hotKey == nil { settings.hotKeyError = "\(k.label) занят другим приложением" }
     }
     @objc private func codexSignIn() { codex.signIn() }
@@ -317,7 +354,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             w.isReleasedWhenClosed = false
             w.isRestorable = false
             w.collectionBehavior = [.managed, .participatesInCycle, .fullScreenNone]
-            let host = NSHostingView(rootView: SettingsView(settings: settings, hosts: store.hostList, spotify: spotify))
+            let host = NSHostingView(rootView: SettingsView(settings: settings, hosts: store.hostList, spotify: spotify, voice: voice))
             w.contentView = host
             w.setContentSize(NSSize(width: 480, height: 600))
             w.center()
@@ -400,8 +437,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window?.close()
         case "window-snapshot":
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.snapshotWindow() }
-        case "scene", "music", "director", "stage", "locate":
+        case "scene" where arg.hasPrefix("sheet voice"):
+            Task { @MainActor in
+                let urls = VoiceSheet.render()
+                NotchController.debugWrite("character sheet voice: \(urls.map(\.lastPathComponent).joined(separator: ", "))")
+            }
+        case "rig":
+            // `rig sheet` — лист выражений/поз/моментов в ~/.capri/tmp/rig-*.png; `rig reload` — перечитать арт.
+            Task { @MainActor in
+                let name = RigArt.reload()
+                if arg.hasPrefix("sheet") {
+                    let urls = RigSheet.render()
+                    NotchController.debugWrite("rig sheet (\(name)): \(urls.map(\.lastPathComponent).joined(separator: ", "))")
+                } else {
+                    NotchController.debugWrite("rig reload: \(name)")
+                }
+            }
+        case "scene", "music", "director", "stage", "locate", "perch":
             character.debugCommand(cmd, arg)
+        case "voice":
+            voice.debug(arg.split(separator: " ").map(String.init))
         default:
             break
         }

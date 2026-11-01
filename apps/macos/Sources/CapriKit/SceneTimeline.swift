@@ -62,6 +62,8 @@ public enum SceneKind: String, CaseIterable, Codable {
     case reply
     /// Окно `CAPRI//MUSIC`: «включи …» или кнопки музыки — ищет, включает, ⏮ ⏯ ⏭.
     case music
+    /// Человек открыл приложение: телепорт на край его окна, реплика в пузыре, посидела, домой (`PerchTimeline`).
+    case perch
 
     public var title: String {
         switch self {
@@ -74,6 +76,7 @@ public enum SceneKind: String, CaseIterable, Codable {
         case .answer: "Ответ"
         case .reply: "К терминалу"
         case .music: "Музыка"
+        case .perch: "На окне"
         }
     }
 
@@ -117,6 +120,25 @@ public struct SceneOptions: Equatable {
     /// Окно сессий: строка под курсором и стена, когда наведение сменилось (наезд в глаз / глитч возврата).
     public var hoverRow: Int?
     public var hoverAt = 0.0
+    /// Переходы сцены (`Transitions`): чем появиться у цели и чем уйти от неё; зерно формы полос, столбцов, молнии.
+    public var enter: TransitionKind = .glitchBars
+    public var exit: TransitionKind = .glitchBars
+    public var seed = 0
+    /// Reduce Motion: без вспышек сплошного цвета (только полосы).
+    public var reduceMotion = false
+    /// Вайб: моменты смены трека (время таймлайна) — короткий глитч 1, таймер не продлевается.
+    public var glitchMarks: [Double] = []
+    /// «На окне»: длина реплики в пузыре.
+    public var perchChars = 0
+    /// «На окне»: окно сдвинули — мини-прыжок с прошлого места (`hopFrom`, глобально) в момент таймлайна `hopAt`.
+    public var hopAt: Double?
+    public var hopFrom: CGRect?
+    /// «На окне»: окно тащат — держится на месте.
+    public var perchHold = false
+    /// «На окне» терминала: смотрит за сессией (`WatchTimeline`); nil — обычная посадка.
+    public var watch: SceneWatch?
+    /// Обрыв из-за того, что ждут сразу несколько сессий: на риге — рой глаз перед молнией домой.
+    public var overload = false
 
     public init(text: Int = 0, lines: [Int] = [], rows: Int = 0, waiting: Int = 0, answerLines: Int = 0, answerChars: Int = 0,
                 proposal: Bool = false, continued: Bool = false, burstAt: Double? = nil, caption: Int = 0, failedAt: Double? = nil) {
@@ -138,15 +160,19 @@ public struct SceneGeometry: Equatable {
     public var visible: CGRect
     /// Курсор — куда глаза «смотрят» (только наклон).
     public var cursor: CGPoint?
+    /// Пузырь реплики (`perch`).
+    public var bubble: CGRect?
 
-    public init(home: CGRect, target: CGRect, area: CGRect? = nil, visible: CGRect, cursor: CGPoint? = nil) {
+    public init(home: CGRect, target: CGRect, area: CGRect? = nil, visible: CGRect, cursor: CGPoint? = nil, bubble: CGRect? = nil) {
         self.home = home; self.target = target; self.area = area; self.visible = visible; self.cursor = cursor
+        self.bubble = bubble
     }
 
     /// Всё, что сцена может занять, с запасом под молнию и вспышку.
     public var bounds: CGRect {
         var r = home.union(target)
         if let area { r = r.union(area) }
+        if let bubble { r = r.union(bubble) }
         return r.insetBy(dx: -90, dy: -90)
     }
 
@@ -158,6 +184,7 @@ public struct SceneGeometry: Equatable {
         var g = self
         g.target = target.offsetBy(dx: dx, dy: dy)
         g.area = area?.offsetBy(dx: dx, dy: dy)
+        g.bubble = bubble?.offsetBy(dx: dx, dy: dy)
         return g
     }
 }
@@ -283,6 +310,26 @@ public struct SceneFrame: Equatable {
     public var face: SceneFace?
     /// `clipT` уже считан по стене (`SceneOptions.lag`) — показ не добавляет отставание удержания.
     public var wallClock = false
+    /// Переход (полосы, столбцы, вспышка, лента): как рисовать глаза и что поверх; nil — глаза как есть.
+    public var fx: TransitionFrame?
+    /// Цвет вспышки в конце перелёта.
+    public var flashTint: FlashTint = .hair
+    /// Пузырь реплики (`perch`).
+    public var bubble: SceneBubble?
+    /// Терминал краснеет и стекает столбцами (вход сцены «смотрит в терминал»).
+    public var smear: WindowSmear?
+    /// Мини-маска (риг) вместо клипа глаз: на окне и у терминала; nil — клип сериала.
+    public var rig: RigPose?
+    /// Уход/появление (`out`/`into`): роль, доля 0…1 и где — `frame` превращает в `fx` по видам из `SceneOptions`.
+    var step: (role: TransitionRole, p: CGFloat, at: CGRect)?
+
+    public static func == (a: SceneFrame, b: SceneFrame) -> Bool {
+        a.phase == b.phase && a.eyes == b.eyes && a.clip == b.clip && a.clipT == b.clipT && a.clipMode == b.clipMode
+            && a.squash == b.squash && a.glitch == b.glitch && a.bolt == b.bolt && a.flash == b.flash && a.flashAt == b.flashAt
+            && a.window == b.window && a.takeover == b.takeover && a.notes == b.notes && a.rings == b.rings
+            && a.caption == b.caption && a.done == b.done && a.face == b.face && a.wallClock == b.wallClock && a.fx == b.fx
+            && a.flashTint == b.flashTint && a.bubble == b.bubble && a.smear == b.smear && a.rig == b.rig
+    }
 
     public init(phase: String, eyes: CGRect?, clip: String = SceneClip.look, clipT: Double = 0, loop: Bool = true,
                 glitch: Int = 0, done: Bool = false) {
@@ -311,6 +358,11 @@ public enum SceneTimeline {
     public static let takeoverSize = CGSize(width: 480, height: 300)
     /// Обрыв (`needsInput`): молния домой.
     public static let recallDuration = 0.35
+
+    /// Длина обрыва сцены: молния домой, у мини-маски при перегрузке — ещё рой глаз перед ней.
+    public static func recallLen(_ kind: SceneKind, _ o: SceneOptions) -> Double {
+        recallDuration + (kind == .perch && o.overload ? RigMoments.overloadLen : 0)
+    }
     /// Темп кивания (ударов в минуту).
     public static let bpm = 112.0
     /// Строки «захвата».
@@ -326,7 +378,7 @@ public enum SceneTimeline {
         case .teleport: 5.0
         case .window: 8.0
         case .takeover: 4.6
-        case .vibe: 7.0
+        case .vibe: vibeDuration
         case .sessions: 8.0
         case .thinking: thinkingDuration
         case .answer:
@@ -336,8 +388,13 @@ public enum SceneTimeline {
         case .music:
             // Не меньше 8 с и ≥ 5 с после последней смены состояния (ждём плеер не дольше 6 с — потом «не нашла»).
             min(musicCap, max(8, (o.musicMarks.map(\.t).max() ?? 0) + 5))
+        case .perch: PerchTimeline.duration(o)
         }
     }
+
+    /// Вайб на окне плеера: ≈ 60 с кивания, на 58–60 с — втягивается в «монобровь» (глаза в notch).
+    public static let vibeDuration = 60.0
+    static let vibeLeave = 58.0
 
     /// Потолок окна музыки без «📌».
     public static let musicCap = 40.0
@@ -351,15 +408,18 @@ public enum SceneTimeline {
         switch kind {
         case .teleport: 1.0..<4.4
         case .window: 1.0..<7.0
-        case .vibe: 0.75..<6.5
+        case .vibe: 0.75..<vibeLeave
         case .takeover: nil
         case .sessions, .thinking, .answer, .music: arrival(kind, o)..<(duration(kind, o) - foldDuration)
         case .reply: 1.5..<3.4
+        case .perch: PerchTimeline.calm(o)
         }
     }
 
     /// Шаг кадра в момент `t` (после обрыва — всегда 24 fps).
     public static func frameInterval(_ kind: SceneKind, t: Double, aborted: Bool = false, options o: SceneOptions = SceneOptions()) -> Double {
+        // «На окне» в покое — кадр только когда что-то меняется (моргание, печать, глитч).
+        if kind == .perch, !aborted { return PerchTimeline.step(t, o) }
         if !aborted, let c = calm(kind, o), c.contains(t) { return 1.0 / 12 }
         return 1.0 / 24
     }
@@ -374,16 +434,39 @@ public enum SceneTimeline {
     public static func frame(_ kind: SceneKind, t: Double, geometry g: SceneGeometry, clips: Set<String> = [],
                              options o: SceneOptions, abortedAt: Double? = nil) -> SceneFrame {
         if let a = abortedAt, t >= a {
-            return recall(kind, t: t, at: a, geometry: g, clips: clips, options: o)
+            var f = recall(kind, t: t, at: a, geometry: g, clips: clips, options: o)
+            decorate(&f, t: t, g, o)
+            return f
         }
         guard t >= 0, t < duration(kind, o) else { return .home() }
+        var f: SceneFrame
         switch kind {
-        case .teleport: return teleport(t, g, clips)
-        case .window: return windowForm(t, g, clips, o)
-        case .takeover: return takeover(t, g, clips, o.lines)
-        case .vibe: return vibe(t, g, clips)
-        case .sessions, .thinking, .answer, .music: return boxed(kind, t, g, clips, o)
-        case .reply: return reply(t, g, clips, o)
+        case .teleport: f = teleport(t, g, clips)
+        case .window: f = windowForm(t, g, clips, o)
+        case .takeover: f = takeover(t, g, clips, o.lines)
+        case .vibe: f = vibe(t, g, clips, o)
+        case .sessions, .thinking, .answer, .music: f = boxed(kind, t, g, clips, o)
+        case .reply: f = reply(t, g, clips, o)
+        case .perch: f = PerchTimeline.frame(t, g, clips, o)
+        }
+        decorate(&f, t: t, g, o)
+        return f
+    }
+
+    /// Уход/появление → переход из общей библиотеки. В notch (`out` из дома, `home`) — всегда полосы: глаза там
+    /// крошечные; у цели — виды сцены (`o.enter`/`o.exit`), лента уходит к notch. Reduce Motion — без вспышек.
+    static func decorate(_ f: inout SceneFrame, t: Double, _ g: SceneGeometry, _ o: SceneOptions) {
+        if let s = f.step {
+            let atHome = f.phase == "out" || f.phase == "home"
+            let kind = atHome ? .glitchBars : s.role == .enter ? o.enter : o.exit
+            f.fx = Transitions.frame(kind, s.role, progress: s.p, tick: Int(t * 24), from: s.at, to: s.role == .exit ? g.home : s.at,
+                                     seed: o.seed &+ (atHome ? 17 : 0), reduceMotion: o.reduceMotion)
+            f.step = nil
+        }
+        f.flashTint = TickNoise.unit(o.seed, 1311) < 0.5 ? .hair : .mask
+        if o.reduceMotion {
+            f.flash = 0
+            f.fx?.flash = nil
         }
     }
 
@@ -393,6 +476,7 @@ public enum SceneTimeline {
     static func out(_ phase: String, at r: CGRect, _ t: Double, len: Double, _ clips: Set<String>) -> SceneFrame {
         let p = CGFloat(min(1, max(0, t / len)))
         var f = SceneFrame(phase: phase, eyes: r, glitch: 3)
+        f.step = (.exit, p, r)
         if clips.contains(SceneClip.teleOut) {
             f.clip = SceneClip.teleOut; f.clipT = t * 1.1 / len; f.loop = false
             f.squash = 1 - 0.85 * max(0, p - 0.6) / 0.4
@@ -406,6 +490,7 @@ public enum SceneTimeline {
     /// Появление: `tele_in` или `appear` с глитчем 4 в начале.
     static func into(_ phase: String, at r: CGRect, _ t: Double, len: Double, _ clips: Set<String>) -> SceneFrame {
         var f = SceneFrame(phase: phase, eyes: r)
+        f.step = (.enter, CGFloat(min(1, max(0, t / len))), r)
         if clips.contains(SceneClip.teleIn) {
             f.clip = SceneClip.teleIn; f.clipT = t * 1.1 / len; f.loop = false
             f.glitch = t < len * 0.3 ? 2 : 0
@@ -624,38 +709,71 @@ public enum SceneTimeline {
         return beat - floor(beat) < 0.18
     }
 
-    static func vibe(_ t: Double, _ g: SceneGeometry, _ c: Set<String>) -> SceneFrame {
+    /// Вайб: молния из notch на окно плеера, ≈ 58 с кивает под бит с нотами, потом «втягивается в монобровь»:
+    /// распад полосами (0,5 с) → лента и бирюзовая молния к notch (0,7 с) → вспышка в notch → глаза снова там.
+    static func vibe(_ t: Double, _ g: SceneGeometry, _ c: Set<String>, _ o: SceneOptions) -> SceneFrame {
+        let leave = vibeLeave
         switch t {
         case ..<0.25: return out("out", at: g.home, t, len: 0.25, c)
         case ..<0.4: return jump("jump", from: g.home, to: g.target, t - 0.25, len: 0.15)
         case ..<0.75: return into("in", at: g.target, t - 0.4, len: 0.35, c)
-        case ..<6.5:
+        case ..<leave:
             let k = t - 0.75
             var f = SceneFrame(phase: "vibe", eyes: g.target.offsetBy(dx: 0, dy: -nod(k)))
             f.clip = onBeat(k) && c.contains(SceneClip.slits) ? SceneClip.slits : SceneClip.look
             f.clipT = onBeat(k) ? 0.4 : k
             f.loop = true
             f.glitch = k.truncatingRemainder(dividingBy: 60 / bpm * 8) < 0.08 ? 1 : 0
-            // Ноты: всплывают над глазами раз в долю, живут 1.6 с.
-            let beatLen = 60 / bpm
-            let first = max(0, Int((k - 1.6) / beatLen) + 1)
-            for i in first...max(first, Int(k / beatLen)) where Double(i) * beatLen <= k {
-                let age = (k - Double(i) * beatLen) / 1.6
-                guard age < 1 else { continue }
-                let side: CGFloat = i % 2 == 0 ? -1 : 1
-                let x = g.target.midX + side * (g.target.width * 0.35 + CGFloat(TickNoise.unit(i, 51)) * 18)
-                let y = g.target.maxY + 4 + CGFloat(age) * 46
-                f.notes.append(SceneNote(center: CGPoint(x: x + CGFloat(sin(age * 6)) * 4, y: y),
-                                         alpha: CGFloat(age < 0.2 ? age / 0.2 : 1 - (age - 0.2) / 0.8), glyph: i % 3))
+            // Смена трека — короткий глитч 1 (0,25 с).
+            if o.glitchMarks.contains(where: { t >= $0 && t < $0 + 0.25 }) { f.glitch = max(f.glitch, 1) }
+            f.notes = vibeNotes(k, g.target)
+            return f
+        case ..<(leave + 0.5):
+            // Распад на полосы прямо там, где кивала.
+            let k = t - leave
+            var f = SceneFrame(phase: "suck", eyes: g.target, clip: c.contains(SceneClip.slits) ? SceneClip.slits : SceneClip.look,
+                               clipT: 0.4, loop: false, glitch: 2)
+            f.fx = Transitions.frame(.glitchBars, .exit, t: k, len: 0.5, from: g.target, to: g.home, seed: o.seed &+ 23)
+            return f
+        case ..<(leave + 1.2):
+            // Лента волос и молния к notch.
+            let k = (t - leave - 0.5) / 0.7
+            var f = SceneFrame(phase: "ribbon", eyes: nil)
+            f.fx = Transitions.frame(.ribbonOut, .exit, progress: 0.3 + 0.7 * CGFloat(k), tick: Int(t * 24), from: g.target,
+                                     to: g.home, seed: o.seed &+ 29)
+            // Молния бьёт коротко, пока лента в полёте (≈ 8 кадров), не всё время.
+            if k >= 0.2, k < 0.55 {
+                f.bolt = SceneBolt(from: center(g.target), to: center(g.home), seed: Int(t * 12), reach: CGFloat(min(1, (k - 0.2) / 0.15)))
             }
             return f
-        case ..<6.75: return out("leave", at: g.target, t - 6.5, len: 0.25, c)
-        case ..<6.9: return jump("back", from: g.target, to: g.home, t - 6.75, len: 0.15)
+        case ..<(leave + 1.45):
+            // Вспышка в notch: «вошла в монобровь».
+            var f = SceneFrame(phase: "flash", eyes: nil)
+            f.flash = CGFloat(max(0, 1 - (t - leave - 1.2) / 0.25))
+            f.flashAt = center(g.home)
+            return f
         default:
-            var f = into("home", at: g.home, t - 6.9, len: 0.1, c)
+            var f = into("home", at: g.home, t - leave - 1.45, len: duration(.vibe) - leave - 1.45, c)
             f.glitch = 2
             return f
         }
+    }
+
+    /// Ноты: всплывают над глазами раз в долю, живут 1,6 с.
+    static func vibeNotes(_ k: Double, _ target: CGRect) -> [SceneNote] {
+        let beatLen = 60 / bpm
+        let first = max(0, Int((k - 1.6) / beatLen) + 1)
+        var notes: [SceneNote] = []
+        for i in first...max(first, Int(k / beatLen)) where Double(i) * beatLen <= k {
+            let age = (k - Double(i) * beatLen) / 1.6
+            guard age < 1 else { continue }
+            let side: CGFloat = i % 2 == 0 ? -1 : 1
+            let x = target.midX + side * (target.width * 0.35 + CGFloat(TickNoise.unit(i, 51)) * 18)
+            let y = target.maxY + 4 + CGFloat(age) * 46
+            notes.append(SceneNote(center: CGPoint(x: x + CGFloat(sin(age * 6)) * 4, y: y),
+                                   alpha: CGFloat(age < 0.2 ? age / 0.2 : 1 - (age - 0.2) / 0.8), glyph: i % 3))
+        }
+        return notes
     }
 
     // MARK: обрыв
@@ -670,13 +788,24 @@ public enum SceneTimeline {
 
     static func recall(_ kind: SceneKind, t: Double, at a: Double, geometry g: SceneGeometry, clips: Set<String>,
                        options o: SceneOptions) -> SceneFrame {
-        let k = t - a
-        guard k < recallDuration else { return .home("recalled") }
+        var k = t - a
         let from = eyesAt(kind, a, g, clips, o)
+        // Перегрузка (мини-маска): рой глаз на месте, потом как обычно.
+        if kind == .perch, o.overload {
+            if k < RigMoments.overloadLen {
+                var f = SceneFrame(phase: "overload", eyes: from, glitch: Int(k * 24) % 3 == 0 ? 2 : 1)
+                f.rig = RigMoments.overload(k, o)
+                return f
+            }
+            k -= RigMoments.overloadLen
+        }
+        guard k < recallDuration else { return .home("recalled") }
         if k < 0.1 {
             var f = SceneFrame(phase: "recall", eyes: from, glitch: 4)
             f.squash = CGFloat(max(0.05, 1 - k / 0.1))
             if usesFace(kind) { f.face = SceneFace() }
+            if kind == .perch { f.rig = o.overload ? RigMoments.overload(RigMoments.overloadLen, o) : frame(kind, t: a, geometry: g, clips: clips, options: o).rig }
+            f.fx = Transitions.frame(.glitchBars, .exit, t: k, len: 0.1, from: from, to: g.home, seed: o.seed &+ 31)
             return f
         }
         return jump("recall", from: from, to: g.home, k - 0.1, len: recallDuration - 0.1)
@@ -713,6 +842,64 @@ public enum SceneLayout {
               window.maxY + size.height * 0.75 + 8 <= visible.maxY else { return nil }
         return CGRect(x: window.maxX - 48 - size.width, y: window.maxY - size.height * 0.25,
                       width: size.width, height: size.height)
+    }
+
+    /// Сжатая панель спокойной фазы: глаза на столе (вайб, телепорт) — только вокруг них (ноты сверху, ⏮ ⏯ ⏭ снизу,
+    /// наклон и кивок), а не от notch до цели: каждый кадр перерисовывает панель целиком. nil — сцена не сжимается.
+    public static func compactPanel(_ kind: SceneKind, geometry g: SceneGeometry) -> CGRect? {
+        if kind == .perch {
+            var r = PerchLayout.rigBox(g.target)
+            if let b = g.bubble { r = r.union(b.insetBy(dx: -4, dy: -4)) }
+            return r.integral
+        }
+        guard kind == .vibe || kind == .teleport else { return nil }
+        let t = g.target
+        return CGRect(x: t.minX - 80, y: t.minY - 56, width: t.width + 160, height: t.height + 56 + 76)
+    }
+
+    /// Музыкальные плееры (bundle id), на окна которых садится вайб.
+    public static let players: Set<String> = ["com.spotify.client", "com.apple.Music"]
+
+    /// Где кивать под музыку. `windows` — `CGWindowListCopyWindowInfo` спереди назад (координаты CG), `players` — pid
+    /// плееров, `front` — переднее приложение. Сначала окно плеера, видимое на экране notch (на верхнем крае справа,
+    /// слева — правее кнопок окна, иначе внутри под верхним краем справа), потом переднее окно (только над верхним
+    /// краем). Точку не должно закрывать другое обычное окно спереди. nil — места нет: кивание только в notch.
+    public static func vibeSpot(windows: [WindowInfo], players: Set<Int32>, front: Int32?, own: Int32, screen: CGRect,
+                                visible: CGRect, primaryHeight: CGFloat,
+                                size: CGSize = SceneTimeline.eyesSize) -> (eyes: CGRect, window: CGRect, player: Bool)? {
+        func usable(_ w: WindowInfo) -> Bool {
+            w.pid != own && w.layer == 0 && w.alpha > 0 && w.bounds.width >= 200 && w.bounds.height >= 120
+        }
+        func free(_ spot: CGRect, before i: Int) -> Bool {
+            guard visible.contains(spot) else { return false }
+            let probe = spot.insetBy(dx: 4, dy: 4)
+            return !windows[..<i].contains { o in
+                o.pid != own && o.layer == 0 && o.alpha > 0 && appKit(o.bounds, primaryHeight: primaryHeight).intersects(probe)
+            }
+        }
+        func spots(_ w: CGRect, inside: Bool) -> [CGRect] {
+            var out: [CGRect] = []
+            if let on = onWindow(w, visible: visible, size: size) {
+                out.append(on)
+                // Слева — правее «закрыть/свернуть/развернуть» (≈ 70 pt), их не закрываем.
+                out.append(CGRect(x: w.minX + 90, y: on.minY, width: size.width, height: size.height))
+            }
+            if inside, w.width >= size.width + 120, w.height >= size.height + 80 {
+                out.append(CGRect(x: w.maxX - 48 - size.width, y: w.maxY - 14 - size.height, width: size.width, height: size.height))
+            }
+            return out
+        }
+        let order: [(Int, Bool)] = windows.indices.compactMap { i in
+            let w = windows[i]
+            guard usable(w), players.contains(w.pid) else { return nil }
+            return (i, true)
+        } + (windows.firstIndex { usable($0) && $0.pid == front && !players.contains($0.pid) }.map { [($0, false)] } ?? [])
+        for (i, player) in order {
+            let w = appKit(windows[i].bounds, primaryHeight: primaryHeight)
+            guard screen.contains(CGPoint(x: w.midX, y: w.midY)) else { continue }
+            if let spot = spots(w, inside: player).first(where: { free($0, before: i) }) { return (spot, w, player) }
+        }
+        return nil
     }
 
     /// Область захвата: рамка окна терминала (обрезанная экраном), если она не крошечная; иначе угол 480×300.

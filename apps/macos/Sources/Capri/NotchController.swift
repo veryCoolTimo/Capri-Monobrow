@@ -109,6 +109,8 @@ final class NotchController: NSObject {
     var onDebug: ((String, String) -> Void)?
     /// Смена состояния (персонаж обрывает сцену, когда notch раскрыли).
     var onStateChange: ((NotchState) -> Void)?
+    /// Notch раскрыли (или открыли помощника) — прогрев голоса.
+    var onOpen: (() -> Void)?
     /// Дополнительные поля `dump` (персонаж, музыка).
     var dumpExtra: (() -> [String: Any])?
     /// ⏮ ⏯ ⏭ в раскрытом notch и peek → `CharacterCenter` → `MusicController` (второе — где нажали).
@@ -122,6 +124,11 @@ final class NotchController: NSObject {
     private let maskLayer = CAShapeLayer()
     private let strokeLayer = CAShapeLayer()
     private let glitchSlice = CALayer()
+    /// Молния вдоль нижнего края, пока держат ⌃⌥Space (голос): малиновая игла с фиолетовой тенью.
+    private let voiceBolt = CAShapeLayer()
+    private let voiceBoltShadow = CAShapeLayer()
+    private var voiceTimer: Timer?
+    private var voiceTick = 0
     private var contentView: NSView!
     private var topRow: FadingHost<TopRowView>!
     private var peekLine: FadingHost<Gated<PeekLineView>>!
@@ -185,6 +192,14 @@ final class NotchController: NSObject {
         glitchSlice.opacity = 0
         glitchSlice.zPosition = 11
         container.layer?.addSublayer(glitchSlice)
+        for (l, color, z) in [(voiceBoltShadow, Palette.violetNS, 12.0), (voiceBolt, Palette.crimsonNS, 13.0)] as [(CAShapeLayer, NSColor, CGFloat)] {
+            l.fillColor = color.cgColor
+            l.strokeColor = nil
+            l.zPosition = z
+            l.isHidden = true
+            l.actions = ["path": NSNull(), "hidden": NSNull()]
+            container.layer?.addSublayer(l)
+        }
         panel.contentView = container
 
         let actions = NotchActions(
@@ -327,7 +342,7 @@ final class NotchController: NSObject {
         contentView.frame = bounds
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for l in [dropLayer, maskLayer, strokeLayer] as [CALayer] { l.frame = bounds }
+        for l in [dropLayer, maskLayer, strokeLayer, voiceBolt, voiceBoltShadow] as [CALayer] { l.frame = bounds }
         dropLayer.path = path(state)
         maskLayer.path = path(state)
         strokeLayer.path = strokePath(state)
@@ -384,6 +399,7 @@ final class NotchController: NSObject {
         ui.expandedOpen = target == .expanded
         if target != .expanded, ui.musicHover { ui.musicHover = false }
         onStateChange?(target)
+        if target == .expanded || target == .assistant { onOpen?() }
         if suppressed {
             if target != .collapsed { setPanelVisible(true) }   // кликабельность — updateMouseThrough() в конце go()
             else {
@@ -511,6 +527,61 @@ final class NotchController: NSObject {
         go(state == .assistant ? .collapsed : .assistant, reason: "assistant")
     }
 
+    // MARK: голос
+
+    /// Строка голоса в peek (раскрытый notch и помощник не трогаем — там своё поле).
+    func voiceShow(_ line: VoiceLine) {
+        ui.voice = line
+        guard state == .collapsed else { return }
+        if suppressed { setPanelVisible(true) }
+        go(.peek, reason: "voice")
+    }
+
+    /// Убрать строку голоса; peek сворачивается, если курсор не над ним.
+    func voiceHide() {
+        voiceListening(false)
+        guard ui.voice != nil else { return }
+        ui.voice = nil
+        if state == .peek, !hovering { go(.collapsed, reason: "voiceDone") }
+    }
+
+    /// Молния вдоль края notch, пока слушает: 12 fps, только пока держат клавишу (вне голоса таймера нет).
+    func voiceListening(_ on: Bool) {
+        if !on {
+            voiceTimer?.invalidate()
+            voiceTimer = nil
+            voiceBolt.isHidden = true
+            voiceBoltShadow.isHidden = true
+            return
+        }
+        guard voiceTimer == nil, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        voiceTick = 0
+        drawVoiceBolt()
+        let t = Timer(timeInterval: 1 / CapriFace.fps, repeats: true) { [weak self] _ in self?.drawVoiceBolt() }
+        RunLoop.main.add(t, forMode: .common)
+        voiceTimer = t
+    }
+
+    private func drawVoiceBolt() {
+        guard state == .peek, ui.voice?.phase == .listening else {
+            voiceBolt.isHidden = true
+            voiceBoltShadow.isHidden = true
+            return
+        }
+        voiceTick += 1
+        let r = local(.peek)
+        let p = VoiceBolt.paths(left: r.minX + 14, right: r.maxX - 14, bottom: r.minY, down: -1, tick: voiceTick, level: ui.voiceLevel)
+        var main = p.main
+        if let fork = p.fork { main.addPath(fork) }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        voiceBolt.path = main.cgPath
+        voiceBoltShadow.path = main.offsetBy(dx: 1.2, dy: -1.5).cgPath
+        voiceBolt.isHidden = false
+        voiceBoltShadow.isHidden = false
+        CATransaction.commit()
+    }
+
     /// Глаза Capri в свёрнутом notch (глобально): откуда персонаж уходит на стол и куда возвращается.
     var eyesRect: CGRect? {
         guard screen != nil else { return nil }
@@ -561,7 +632,7 @@ final class NotchController: NSObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) { [weak self] in self?.glitch() }
         alertWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.state == .peek, !self.hovering else { return }
+            guard let self, self.state == .peek, !self.hovering, self.ui.voice == nil else { return }
             self.go(.collapsed, reason: "alertTimeout")
         }
         alertWork = work
@@ -635,7 +706,7 @@ final class NotchController: NSObject {
             if state == .collapsed { go(.peek, reason: "hover") }
         } else if state == .peek {
             let work = DispatchWorkItem { [weak self] in
-                guard let self, !self.hovering, self.state == .peek else { return }
+                guard let self, !self.hovering, self.state == .peek, self.ui.voice == nil else { return }
                 self.go(.collapsed, reason: "hoverOut")
             }
             collapseWork = work

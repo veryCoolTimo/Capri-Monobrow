@@ -26,6 +26,10 @@ final class CodexService: ObservableObject {
         var proposals: [Proposal] = []
         /// Музыка по просьбе: «▶ ищу «X»…» → «♪ Artist — Track» / «не нашла».
         var music: String?
+        /// Ссылки ответа веб-поиска (голосовое «найди …»): кнопки, открывает только клик.
+        var links: [SearchAnswer.Link] = []
+        /// Сказано голосом (в разговоре — с микрофоном).
+        var voice = false
     }
 
     struct Proposal: Identifiable, Equatable {
@@ -80,7 +84,8 @@ final class CodexService: ObservableObject {
     private var summaryAsked: Set<String> = []
 
     private struct Job {
-        enum Kind { case summary, draft, chat }
+        /// `search` — веб-поиск по голосовой просьбе «найди …»: свой тред, `web_search` включён только в нём.
+        enum Kind { case summary, draft, chat, search }
         let id = UUID()
         var kind: Kind
         var prompt: String
@@ -283,6 +288,11 @@ final class CodexService: ObservableObject {
             "cwd": .string(NSTemporaryDirectory()), "developerInstructions": .string(CodexPrompts.developer)
         ]
         if let m = model { params["model"] = .string(m.id) }
+        if job.kind == .search {
+            // Сервер запущен с web_search="disabled"; этот тред — единственный, где поиск включён.
+            params["config"] = .object(["web_search": .string("live")])
+            params["developerInstructions"] = .string(VoicePrompts.developer)
+        }
         c.call("thread/start", .object(params), timeout: 60) { [weak self] r in
             guard let self, self.running?.id == job.id else { return }
             switch r {
@@ -464,6 +474,66 @@ final class CodexService: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + min(8, max(1.5, Double(text.count) / 18)), execute: task)
     }
 
+    /// Голосовое «найди …»: вопрос в разговор, ответ — коротко со ссылками (кнопки под ответом).
+    func search(_ query: String, said: String) {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty, !chatBusy else { return }
+        for i in chat.indices { for j in chat[i].proposals.indices where chat[i].proposals[j].state == .pending { chat[i].proposals[j].state = .cancelled } }
+        var asked = ChatMessage(role: .user, text: said)
+        asked.voice = true
+        chat.append(asked)
+        guard isReady else {
+            chat.append(ChatMessage(role: .local, text: state == .signedOut ? "Искать в интернете могу через Codex — войдите в него (меню ✦)."
+                                                                         : "Codex сейчас не подключён — искать в интернете не могу."))
+            return
+        }
+        let reply = ChatMessage(role: .codex, text: "")
+        chat.append(reply)
+        chatBusy = true
+        let id = reply.id
+        log?("search (\(q.count) зн.)")
+        enqueue(Job(kind: .search, prompt: VoicePrompts.search(q), onDelta: { [weak self] text in
+            guard let self, let i = self.chat.firstIndex(where: { $0.id == id }) else { return }
+            let shown = SearchAnswer.split(text).text
+            if !shown.isEmpty { self.chat[i].text = shown }
+        }) { [weak self] r in
+            guard let self else { return }
+            self.chatBusy = false
+            guard let i = self.chat.firstIndex(where: { $0.id == id }) else { return }
+            switch r {
+            case .success(let t):
+                let a = SearchAnswer.split(t)
+                self.chat[i].text = a.text.isEmpty ? "(пустой ответ)" : a.text
+                self.chat[i].links = a.links
+                self.log?("search done: \(a.links.count) ссылок")
+                self.speak(for: self.chat[i].text)
+            case .failure(let e): self.chat[i] = ChatMessage(role: .error, text: Self.message(e))
+            }
+        })
+    }
+
+    /// Голосовое «ответь <сессия> …»: сначала текстом, отправка — только после подтверждения (⌘⏎ или кнопка).
+    func proposeReply(_ key: SessionKey, text: String, said: String) {
+        guard !chatBusy, let s = store.session(key) else { return }
+        for i in chat.indices { for j in chat[i].proposals.indices where chat[i].proposals[j].state == .pending { chat[i].proposals[j].state = .cancelled } }
+        var asked = ChatMessage(role: .user, text: said)
+        asked.voice = true
+        chat.append(asked)
+        let name = store.name(s).title
+        var m = ChatMessage(role: .local, text: "Отправить в \(name)?")
+        m.proposals = [Proposal(key: s.key, title: name, action: .text(text), choiceLabel: nil,
+                                fingerprint: s.requestFingerprint, status: s.status)]
+        chat.append(m)
+    }
+
+    /// Голосовая просьба помощнику: как ввод с клавиатуры, но в разговоре помечена микрофоном.
+    func askVoice(_ text: String) {
+        ask(text)
+        if let i = chat.lastIndex(where: { $0.role == .user && $0.text == text.trimmingCharacters(in: .whitespacesAndNewlines) }) {
+            chat[i].voice = true
+        }
+    }
+
     /// Человек подтвердил действие помощника — отправка теми же путями и проверками, что и ответ руками.
     func confirm(_ message: UUID, _ proposal: UUID) {
         guard let i = chat.firstIndex(where: { $0.id == message }),
@@ -516,6 +586,12 @@ final class CodexService: ObservableObject {
     var pendingProposal: (message: UUID, proposal: Proposal)? {
         guard let m = chat.last, let p = m.proposals.first(where: { $0.state == .pending }) else { return nil }
         return (m.id, p)
+    }
+
+    /// Реплика Capri с окна (клик по пузырю) — в разговор помощника, как её собственная фраза (без Codex).
+    func remark(_ text: String) {
+        guard !chatBusy, chat.last?.text != text else { return }
+        chat.append(ChatMessage(role: .local, text: text))
     }
 
     func clearChat() {

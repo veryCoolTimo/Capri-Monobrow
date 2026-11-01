@@ -24,7 +24,44 @@ enum ProcessTable {
             let tv = kp.kp_proc.p_un.__p_starttime
             return TerminalLocator.Proc(pid: pid, ppid: kp.kp_eproc.e_ppid, name: name,
                                         start: Double(tv.tv_sec) + Double(tv.tv_usec) / 1e6,
-                                        args: name == "ssh" ? arguments(pid) : [])
+                                        args: argNames.contains(name) ? arguments(pid) : [])
+        }
+    }
+
+    /// У кого читаем аргументы: ssh (хост), tmux (`attach -t`), агенты (codex — это `node …/codex`).
+    static let argNames: Set<String> = ["ssh", "tmux", "node", "codex", "claude"]
+
+    /// Рабочая папка своего процесса (`PROC_PIDVNODEPATHINFO`, без разрешений). nil — не вышло.
+    static func cwd(_ pid: Int32) -> String? {
+        var info = proc_vnodepathinfo()
+        let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return nil }
+        let path = withUnsafeBytes(of: info.pvi_cdir.vip_path) { raw in
+            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        return path.isEmpty ? nil : path
+    }
+
+    /// Что под окном терминала `term`: находки, имена сессий локальных tmux-клиентов (≤ 1 с) и папки агентов.
+    /// Результат — на главной очереди.
+    static func underneath(terminal term: Int32,
+                           completion: @escaping ([TerminalLocator.Found], [Int32: String], [Int32: String]) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let found = TerminalLocator.targets(underTerminal: term, procs: snapshot())
+            var cwds: [Int32: String] = [:]
+            for f in found { if case .agent(let pid, _) = f.what, let c = cwd(pid) { cwds[pid] = c } }
+            let needClients = found.contains { if case .tmux(_, nil) = $0.what { return true }; return false }
+            guard needClients, TerminalOpener.localTmux.hasPrefix("/") else {
+                return DispatchQueue.main.async { completion(found, [:], cwds) }
+            }
+            HostCommand.run([TerminalOpener.localTmux, "list-clients", "-F", "#{client_pid} #{session_name}"], timeout: 1) { out in
+                var clients: [Int32: String] = [:]
+                for line in out.stdout.split(whereSeparator: \.isNewline) {
+                    let f = line.split(separator: " ", maxSplits: 1)
+                    if f.count == 2, let pid = Int32(f[0]) { clients[pid] = String(f[1]) }
+                }
+                DispatchQueue.main.async { completion(found, clients, cwds) }
+            }
         }
     }
 

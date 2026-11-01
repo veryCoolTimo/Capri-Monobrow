@@ -123,3 +123,129 @@ public enum TerminalLocator {
         return args
     }
 }
+
+// MARK: обратный поиск: что живёт под окном терминала (этап 3 присутствия)
+
+extension TerminalLocator {
+    /// Что под терминалом: локальный tmux-клиент, ssh к хосту, агент прямо в оболочке.
+    public enum Underneath: Equatable {
+        /// tmux-клиент; `session` — из `-t` (attach), иначе — по `tmux list-clients`.
+        case tmux(pid: Int32, session: String?)
+        /// ssh к алиасу; `session` — tmux-сессия из удалённой команды (`tmux attach -t X`), если есть.
+        case ssh(pid: Int32, host: String, session: String?)
+        /// claude/codex запущен прямо в оболочке (локально, без tmux).
+        case agent(pid: Int32, agent: Agent)
+
+        public var pid: Int32 {
+            switch self {
+            case .tmux(let p, _), .ssh(let p, _, _), .agent(let p, _): p
+            }
+        }
+    }
+
+    /// Находка под терминалом и когда её процесс стартовал (свежая — человек только что открыл/подключился).
+    public struct Found: Equatable {
+        public var what: Underneath
+        public var start: Double
+        public init(_ what: Underneath, start: Double) { self.what = what; self.start = start }
+    }
+
+    /// Потомки приложения-терминала `term` (вниз по ppid): tmux-клиенты, ssh, агенты. Внутрь найденного не спускаемся
+    /// (ssh → tmux attach — это удалённая команда, не локальный клиент). Свежие сверху.
+    public static func targets(underTerminal term: Int32, procs: [Proc]) -> [Found] {
+        var children: [Int32: [Proc]] = [:]
+        for p in procs where p.pid != p.ppid { children[p.ppid, default: []].append(p) }
+        var out: [Found] = []
+        var queue = children[term] ?? []
+        var seen: Set<Int32> = [term]
+        var steps = 0
+        while !queue.isEmpty, steps < 4096 {
+            steps += 1
+            let p = queue.removeFirst()
+            guard seen.insert(p.pid).inserted else { continue }
+            if let what = classify(p) {
+                out.append(Found(what, start: p.start))
+                continue
+            }
+            queue += children[p.pid] ?? []
+        }
+        return out.sorted { $0.start > $1.start }
+    }
+
+    static func base(_ s: String) -> String { (s as NSString).lastPathComponent }
+
+    /// Процесс — tmux-клиент, ssh или агент? (сервер tmux живёт под launchd — сюда не попадает).
+    static func classify(_ p: Proc) -> Underneath? {
+        let exe = p.args.first.map(base) ?? p.name
+        switch p.name {
+        case "ssh":
+            guard let t = sshTarget(p.args) else { return nil }
+            return .ssh(pid: p.pid, host: t.host, session: t.session)
+        case "tmux":
+            return .tmux(pid: p.pid, session: tmuxSession(Array(p.args.dropFirst())))
+        case "claude":
+            return .agent(pid: p.pid, agent: .claude)
+        case "codex":
+            return .agent(pid: p.pid, agent: .codex)
+        case "node":
+            // `node …/bin/codex …` или `node …/claude …`.
+            if let script = p.args.dropFirst().first(where: { !$0.hasPrefix("-") }).map(base) {
+                if script == "codex" || script.hasPrefix("codex.") { return .agent(pid: p.pid, agent: .codex) }
+                if script == "claude" || script == "cli.js" && p.args.joined(separator: " ").contains("claude-code") {
+                    return .agent(pid: p.pid, agent: .claude)
+                }
+            }
+            return nil
+        default:
+            if exe == "claude" { return .agent(pid: p.pid, agent: .claude) }
+            return nil
+        }
+    }
+
+    /// Опции ssh со значением (`-p 22`, `-i key` …): значение — не хост.
+    static let sshValueFlags = Set("BbcDEeFIiJLlmOoPpQRSWw".map { $0 })
+
+    /// Хост (алиас) и tmux-сессия из удалённой команды: `ssh [-опции] [--] host [команда…]`. nil — не разобрали.
+    public static func sshTarget(_ args: [String]) -> (host: String, session: String?)? {
+        var i = 1
+        while i < args.count {
+            let a = args[i]
+            if a == "--" { i += 1; break }
+            guard a.hasPrefix("-"), a.count > 1 else { break }
+            // `-p22` — значение слитно; `-p 22` — следующим аргументом; `-tt`, `-A` — без значения.
+            if let last = a.last, a.count == 2, sshValueFlags.contains(last) { i += 2 } else { i += 1 }
+        }
+        guard i < args.count else { return nil }
+        var host = args[i]
+        if let at = host.lastIndex(of: "@") { host = String(host[host.index(after: at)...]) }
+        guard !host.isEmpty, !host.hasPrefix("-") else { return nil }
+        // Удалённая команда может прийти одной строкой («tmux attach -t votek») или словами.
+        let words = args[(i + 1)...].flatMap { $0.split(separator: " ").map(String.init) }
+        var session: String?
+        if let k = words.firstIndex(where: { base($0) == "tmux" }) { session = tmuxSession(Array(words[(k + 1)...])) }
+        return (host, session)
+    }
+
+    /// Имя сессии (или `%N` панели) из аргументов tmux: команда `attach|a|attach-session|new -A` где угодно в цепочке
+    /// (`select-window -t %5 \; attach-session -t %5` — так открывает «Открыть»), после неё `-t X` / `-s X`.
+    /// nil — не указано (или это не подключение).
+    public static func tmuxSession(_ args: [String]) -> String? {
+        let attach: Set<String> = ["attach", "a", "at", "attach-session", "new", "new-session"]
+        guard let k = args.firstIndex(where: { attach.contains($0) }) else { return nil }
+        var i = k + 1
+        while i < args.count {
+            let a = args[i]
+            if a == ";" || a == "\\;" { break }
+            if a == "-t" || a == "-s", i + 1 < args.count { return target(args[i + 1]) }
+            if a.hasPrefix("-t"), a.count > 2 { return target(String(a.dropFirst(2))) }
+            i += 1
+        }
+        return nil
+    }
+
+    /// `name:1.0` → `name`; `%5` — как есть.
+    static func target(_ v: String) -> String? {
+        let s = v.hasPrefix("%") ? v : v.split(separator: ":").first.map(String.init) ?? v
+        return s.isEmpty ? nil : s
+    }
+}

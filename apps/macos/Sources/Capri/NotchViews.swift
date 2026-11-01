@@ -36,6 +36,28 @@ final class NotchUI: ObservableObject {
     @Published var expandedOpen = false
     /// «Спрятать персонажа на час» — в notch не кивает.
     @Published var characterHidden = false
+    /// Голос (push-to-talk): что показывает строка peek; nil — голоса нет.
+    @Published var voice: VoiceLine?
+    /// Громкость микрофона 0…1 — для молнии вдоль notch. Не публикуется: её читает таймер молнии, не SwiftUI.
+    var voiceLevel: Double = 0
+}
+
+/// Строка голоса в notch.
+struct VoiceLine: Equatable {
+    enum Phase: Equatable {
+        /// Держат клавишу: глаза слушают, молния вдоль notch, частичный текст.
+        case listening
+        /// Отпустили: дослушиваю и разбираю.
+        case working
+        /// Итог (записала, напомню, включаю…).
+        case done
+        /// Не вышло (нет модели, нет микрофона, не расслышала).
+        case failed
+    }
+    var phase: Phase
+    var text: String
+    /// Мелкая подпись справа (`⌃⌥Space`, «⌘⏎ отправить»).
+    var hint: String = ""
 }
 
 /// Включён ли слой notch. Скрытый слой (свёрнутый notch) снимает содержимое целиком — вместе с подписками
@@ -224,7 +246,9 @@ struct TopRowView: View {
         let vibing = waiting == 0 && !codex.chatBusy && !ui.characterHidden
             && (ui.vibing || (ui.expandedOpen && ui.musicPlaying))
         HStack(spacing: 0) {
-            CapriFace(mood: waiting > 0 ? .alert : codex.chatBusy ? .thinking : vibing ? .vibing : .idle, style: .mask)
+            // Слушает голос — выше всего: человек прямо сейчас говорит с ней.
+            let listening = ui.voice?.phase == .listening
+            CapriFace(mood: listening ? .listening : waiting > 0 ? .alert : codex.chatBusy ? .thinking : vibing ? .vibing : .idle, style: .mask)
                 .frame(width: 32, height: 16)
                 .opacity(ui.faceAway ? 0 : 1)
                 .help("Capri — спросить (⌃⌥Space)")
@@ -270,7 +294,9 @@ struct PeekLineView: View {
         let waiting = store.waiting
         let focus = ui.alertKey.flatMap { k in waiting.first { $0.key == k } } ?? waiting.first
         HStack(spacing: 7) {
-            if let s = focus {
+            if let v = ui.voice {
+                VoiceLineView(line: v)
+            } else if let s = focus {
                 Image(systemName: "triangle.fill").font(.system(size: 7, weight: .bold)).foregroundColor(Palette.acid)
                 Caps(store.name(s).title, size: 10, color: Palette.acid, weight: .bold).fixedSize()
                 Rectangle().fill(Palette.line).frame(width: 1, height: 11)

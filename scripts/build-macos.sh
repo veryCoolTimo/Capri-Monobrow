@@ -44,9 +44,22 @@ cat > "$CAPRI_APP/Contents/Info.plist" <<'PLIST'
 <key>LSMultipleInstancesProhibited</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSHighResolutionCapable</key><true/>
-<key>NSAppleEventsUsageDescription</key><string>Capri включает, ставит на паузу и переключает треки в Spotify и Музыке, когда вы её об этом просите.</string>
+<key>NSAppleEventsUsageDescription</key><string>Capri включает, ставит на паузу и переключает треки в Spotify и Музыке, записывает в Заметки и Напоминания — только когда вы её об этом просите.</string>
+<key>NSMicrophoneUsageDescription</key><string>Capri слушает микрофон, только пока вы держите ⌃⌥Пробел, и распознаёт речь на этом Маке.</string>
 </dict></plist>
 PLIST
+# Голос: хелпер capri-asr и CTranscribe.framework (scripts/build-asr-macos.sh). Не собрался — Capri без голоса.
+rm -rf "$CAPRI_APP/Contents/Frameworks" "$CAPRI_APP/Contents/MacOS/capri-asr" "$CAPRI_APP/Contents/Resources/THIRD-PARTY-LICENSES.md"
+if [[ "${CAPRI_NO_ASR:-}" != 1 ]]; then
+  if ASR_BIN="$(bash "$CAPRI_ROOT/scripts/build-asr-macos.sh")"; then
+    mkdir -p "$CAPRI_APP/Contents/Frameworks"
+    cp "$ASR_BIN/capri-asr" "$CAPRI_APP/Contents/MacOS/capri-asr"
+    ditto "$ASR_BIN/CTranscribe.framework" "$CAPRI_APP/Contents/Frameworks/CTranscribe.framework"
+    cp "$ASR_BIN/THIRD-PARTY-LICENSES.md" "$CAPRI_APP/Contents/Resources/THIRD-PARTY-LICENSES.md"
+  else
+    echo "capri-asr не собрался — Capri без голоса" >&2
+  fi
+fi
 codesign --force --deep --sign - "$CAPRI_APP"
 codesign --verify --deep --strict "$CAPRI_APP"
 echo "$CAPRI_APP"

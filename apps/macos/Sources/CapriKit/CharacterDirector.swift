@@ -6,9 +6,10 @@ public struct CharacterDirector: Equatable {
     public enum Event: String, CaseIterable, Codable {
         /// Сессия доработала (`running → idle`).
         case sessionFinished
-        /// Фоновый таймер.
+        /// Фоновый таймер (по умолчанию выключен: `Input.ambient`).
         case ambient
-        /// Первое воспроизведение музыки после долгой тишины — вайб на столе.
+        /// Первое воспроизведение музыки после долгой тишины — вайб ≈ 60 с на окне плеера (это ответ на действие
+        /// человека: мимо «персонажа на столе», «печатает» и общих лимитов, со своим кулдауном).
         case musicStarted
         /// Старт или смена трека — вайб в notch.
         case trackChanged
@@ -92,17 +93,29 @@ public struct CharacterDirector: Equatable {
         public var onAction: Bool
         /// Кто-то ждёт ответа или работает — фоном окно сессий вместо окна статуса.
         public var sessionsActive: Bool
+        /// «Фоновые сцены по таймеру» (Экспериментальное; по умолчанию выкл.).
+        public var ambient: Bool
+        /// Есть где кивать под музыку (окно плеера или переднее окно); нет — кивание в notch, в угол не идём.
+        public var musicPerch: Bool
+        /// Общий бюджет стола (`ScreenBudget.gate`): nil — можно; иначе почему нет (выключатель «Capri на рабочем
+        /// столе», тихие часы, звонок, общий счёт появлений). Спрашивают все пути на стол.
+        public var budget: String?
+        /// Музыку только что включила сама Capri (голосом, кнопкой, помощником) — вайба на столе не будет.
+        public var musicByCapri: Bool
 
         public init(now: Double, enabled: Bool = true, hiddenUntil: Double? = nil, sessionEvents: Bool = true,
                     takeover: Bool = false, music: Bool = true, rate: Rate = .sometimes, paused: Bool = false,
                     fullscreen: Bool = false, displaysAsleep: Bool = false, notchOpen: Bool = false,
                     sceneRunning: Bool = false, idleSec: Double = 10, lowPower: Bool = false, reduceMotion: Bool = false,
-                    onAction: Bool = true, sessionsActive: Bool = false) {
+                    onAction: Bool = true, sessionsActive: Bool = false, ambient: Bool = false, musicPerch: Bool = true,
+                    budget: String? = nil, musicByCapri: Bool = false) {
             self.now = now; self.enabled = enabled; self.hiddenUntil = hiddenUntil; self.sessionEvents = sessionEvents
             self.takeover = takeover; self.music = music; self.rate = rate; self.paused = paused
             self.fullscreen = fullscreen; self.displaysAsleep = displaysAsleep; self.notchOpen = notchOpen
             self.sceneRunning = sceneRunning; self.idleSec = idleSec; self.lowPower = lowPower; self.reduceMotion = reduceMotion
             self.onAction = onAction; self.sessionsActive = sessionsActive
+            self.ambient = ambient; self.musicPerch = musicPerch
+            self.budget = budget; self.musicByCapri = musicByCapri
         }
     }
 
@@ -111,7 +124,8 @@ public struct CharacterDirector: Equatable {
     public static let perHour = 4
     public static let sessionCooldown = 10.0 * 60
     public static let musicCooldown = 30.0 * 60
-    public static let notchVibeCooldown = 3.0 * 60
+    /// Кивок в notch на смену трека — не чаще раза в 15 мин (раньше 3: «двигается без моего действия»).
+    public static let notchVibeCooldown = 15.0 * 60
     public static let takeoverGap = 2.0 * 3600
     /// «Человек прямо сейчас печатает / двигает мышь» и «никто не смотрит».
     public static let busyIdle = 3.0
@@ -183,7 +197,7 @@ public struct CharacterDirector: Equatable {
             last[event] = i.now
         case .skip(let why):
             // Фоновую сцену, которую нельзя показать по «вечным» причинам, переносим, чтобы не стучать каждую минуту.
-            if event == .ambient, ["off", "hidden", "fullscreen", "asleep", "away", "lowPower", "reduceMotion", "paused"].contains(why) {
+            if event == .ambient, ["off", "ambientOff", "hidden", "fullscreen", "asleep", "away", "lowPower", "reduceMotion", "paused"].contains(why) {
                 scheduleAmbient(i.now, rate: i.rate, short: true)
             }
         }
@@ -200,17 +214,21 @@ public struct CharacterDirector: Equatable {
             if i.paused { return .skip("paused") }
             if i.fullscreen { return .skip("fullscreen") }
             if i.displaysAsleep { return .skip("asleep") }
+            if ScreenBudget.isQuiet(i.budget) { return .skip(i.budget!) }
+            // Она уже на столе (сидит на окне, окно ответа…) — вторая Capri в notch не кивает.
+            if i.sceneRunning { return .skip("running") }
             if let l = lastNotchVibe, i.now - l < Self.notchVibeCooldown { return .skip("cooldown") }
             return .notchVibe
         }
-        if event == .musicStarted, !i.music { return .skip("musicOff") }
+        if event == .musicStarted { return music(i) }
+        if event == .ambient, !i.ambient { return .skip("ambientOff") }
         if event == .sessionFinished, !i.sessionEvents { return .skip("sessionEventsOff") }
         if let why = Self.blocked(i) { return .skip(why) }
+        if let why = i.budget { return .skip(why) }
         switch event {
         case .sessionFinished:
             if let l = last[.sessionFinished], i.now - l < Self.sessionCooldown { return .skip("cooldown") }
-        case .musicStarted:
-            if let l = last[.musicStarted], i.now - l < Self.musicCooldown { return .skip("cooldown") }
+        case .musicStarted: break
         case .ambient:
             guard ambientDue(i.now) else { return .skip("notDue") }
         case .trackChanged: break
@@ -224,6 +242,28 @@ public struct CharacterDirector: Equatable {
         }
     }
 
+    /// Музыка пошла после тишины: человек сам её включил — «персонаж на столе» и «печатает» не мешают; тихие причины
+    /// (спрятан, пауза, полноэкранное, сон, notch раскрыт, другая сцена, энергосбережение, Reduce Motion, отошёл) и
+    /// общий бюджет стола (выключатель, тихие часы, звонок, счёт появлений) — мешают. Музыку включила сама Capri
+    /// (голос, кнопки, помощник) — на стол не идёт: человек и так видит итог в notch. Кулдаун 30 мин. Сесть некуда —
+    /// кивание в notch (не угол). Пропуск — дальше обычный кивок на смену трека (со своим кулдауном).
+    func music(_ i: Input) -> Decision {
+        guard i.music else { return .skip("musicOff") }
+        if let h = i.hiddenUntil, h > i.now { return .skip("hidden") }
+        if i.paused { return .skip("paused") }
+        if i.fullscreen { return .skip("fullscreen") }
+        if i.displaysAsleep { return .skip("asleep") }
+        if i.notchOpen { return .skip("notch") }
+        if i.sceneRunning { return .skip("running") }
+        if i.lowPower { return .skip("lowPower") }
+        if i.reduceMotion { return .skip("reduceMotion") }
+        if i.idleSec > Self.awayIdle { return .skip("away") }
+        if i.musicByCapri { return .skip("byCapri") }
+        if let why = i.budget { return .skip(why) }
+        if let l = last[.musicStarted], i.now - l < Self.musicCooldown { return .skip("cooldown") }
+        return i.musicPerch ? .play(.vibe) : .notchVibe
+    }
+
     /// Фон: захват (если включён и прошло ≥ 2 ч) с вероятностью 1/4, иначе телепорт 70% / окно 30%; окно — сессий,
     /// если кто-то ждёт или работает, иначе статус.
     func pickAmbient(_ i: Input) -> SceneKind {
@@ -235,11 +275,13 @@ public struct CharacterDirector: Equatable {
         return i.sessionsActive ? .sessions : .window
     }
 
-    /// Сцена по действию человека: те же «тихие» запреты (спрятан, пауза, полноэкранное, сон, Reduce Motion) и своя
-    /// настройка, но без лимитов, кулдаунов, «занят/отошёл» и выключенного фонового персонажа. Лимиты фона не тратит.
-    public mutating func decideAction(_ event: ActionEvent, _ i: Input) -> Decision {
+    /// Сцена по действию человека: те же «тихие» запреты (спрятан, пауза, полноэкранное, сон, Reduce Motion), своя
+    /// настройка и общий бюджет стола — без своих лимитов, «занят/отошёл» и выключенного фонового персонажа.
+    /// `continuing` — она уже на столе (⏮ ⏯ ⏭ по глазам идущей сцены): нового появления нет, бюджет не спрашиваем.
+    public mutating func decideAction(_ event: ActionEvent, _ i: Input, continuing: Bool = false) -> Decision {
         let d: Decision
         if !i.onAction { d = .skip("actionOff") }
+        else if !continuing, let why = i.budget { d = .skip(why) }
         else if let h = i.hiddenUntil, h > i.now { d = .skip("hidden") }
         else if i.paused { d = .skip("paused") }
         else if i.fullscreen { d = .skip("fullscreen") }

@@ -393,6 +393,13 @@ extension SceneLayout {
         let f = SceneTimeline.frame(kind, t: t, geometry: g, clips: clips, options: o)
         guard let eyes = f.eyes else { return [] }
         let grab = SceneHotspot(.drag, eyes.insetBy(dx: -4, dy: -4))
+        if kind == .perch {
+            // На окне: клик по глазам — «кыш», по пузырю — помощник с этой репликой; тянуть нечего (она на чужом окне).
+            var out: [SceneHotspot] = []
+            if let b = f.bubble, !b.glitch { out.append(SceneHotspot(.button("bubble"), b.rect)) }
+            if f.phase != "hop" { out.append(SceneHotspot(.button("shoo"), eyes.insetBy(dx: -4, dy: -4))) }
+            return out
+        }
         guard kind.boxed else {
             guard kind != .takeover else { return [] }
             // Под глазами — ⏮ ⏯ ⏭, пока на глаза навели (и музыка известна).
