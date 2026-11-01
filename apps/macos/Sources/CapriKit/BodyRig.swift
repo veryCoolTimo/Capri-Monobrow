@@ -53,6 +53,8 @@ public struct BodyRig: Codable, Equatable {
         public var pivot: P
         /// Перед лицом (иначе — за головой).
         public var front: Bool?
+        /// Цвет осколка: нет — малиновый с кромкой; `ink` — чёрный вырез-молния в массе, `mask` — зелёное лезвие.
+        public var ink: RigInk?
     }
 
     public var version: Int
@@ -214,7 +216,7 @@ public struct BodyRig: Codable, Equatable {
         // Волосы: от основания головы, качаются вокруг своих точек; `lift` < 0 — повисают (кончики к низу),
         // > 0 — подлетают. Кромка — одной группой (только по внешнему краю массы), потом заливки.
         func hairShards(front: Bool) {
-            var fills: [(String, [CGPoint])] = []
+            var fills: [(String, [CGPoint], RigInk?)] = []
             for (i, s) in hair.enumerated() where (s.front ?? false) == front {
                 let sway = (0.05 * sin(pose.t * 1.6 + Double(i) * 1.37) + 0.02 * sin(pose.t * 3.1 + Double(i))) * pose.sway
                 let px = s.pivot[0] * pose.hair, py = s.pivot[1] * pose.hair
@@ -230,16 +232,16 @@ public struct BodyRig: Codable, Equatable {
                     return [px + dx * cos(rot) - dy * sin(rot), py + dx * sin(rot) + dy * cos(rot)]
                 }
                 // Вся масса целиком наклоняется вокруг основания головы (висит, падает).
-                fills.append(("hair\(i)", place(sk.headBase, sk.head + pose.hairTilt, -90, pts)))
+                fills.append(("hair\(i)", place(sk.headBase, sk.head + pose.hairTilt, -90, pts), s.ink))
             }
             let rimInk: RigInk = backlit > 0.5 ? .light : .rim
-            for (n, pts) in fills {
+            for (n, pts, ink) in fills where ink == nil {
                 layers.append(RigShape(n + ".rim", rimInk, pts.map { CGPoint(x: $0.x + pose.rim.dx * 1.4, y: $0.y + pose.rim.dy * 1.4) }))
                 if backlit > 0.5 {
                     layers.append(RigShape(n + ".rim2", rimInk, pts.map { CGPoint(x: $0.x - pose.rim.dx * 1.4, y: $0.y + pose.rim.dy) }))
                 }
             }
-            for (n, pts) in fills { layers.append(RigShape(n, backlit > 0.5 ? .deep : .hair, pts)) }
+            for (n, pts, ink) in fills { layers.append(RigShape(n, ink ?? (backlit > 0.5 ? .deep : .hair), pts)) }
         }
         // Руки поверх волос: чернильный контур ~1.5 ед. со всех сторон (как в сериале — пересечения через чёрное).
         func outlined(_ body: () -> Void) {
@@ -330,7 +332,7 @@ public struct BodyRig: Codable, Equatable {
 
     /// Белые и розовые точки на малиновом, каждый кадр (`tick`) — другие.
     /// Всего не больше `maxSparkles` за кадр (каждая — заливка на Canvas).
-    public static let maxSparkles = 450
+    public static let maxSparkles = 700
 
     func sparkles(_ shapes: [RigShape], _ pose: BodyPose, density: Double = 1) -> [RigShape] {
         var out: [RigShape] = []
@@ -341,7 +343,7 @@ public struct BodyRig: Codable, Equatable {
         // Сколько хочется по площади — и общий потолок: густо, но не тысяча заливок за кадр.
         func want(_ s: RigShape) -> Double {
             let area = abs(Double(RigGeometry.area(s.points)))
-            return area / (dim ? 60 : (s.layer.hasPrefix("hair") ? 9 : 16)) * dens
+            return area / (dim ? 60 : (s.layer.hasPrefix("hair") ? 5 : 14)) * dens
         }
         let total = red.reduce(0) { $0 + want($1.element) }
         let cap = total > Double(Self.maxSparkles) ? Double(Self.maxSparkles) / total : 1
@@ -478,7 +480,7 @@ extension BodyRig {
     /// Простое тело без рисунка сериала: клинья-сегменты, корона из девяти осколков, чёрная голова с рогами.
     public static let fallback: BodyRig = {
         func part(_ b: Bone, _ i: RigInk, _ p: [P]) -> Part { Part(bone: b, ink: i, points: p) }
-        func shard(_ p: [P], _ pv: P, front: Bool? = nil) -> Shard { Shard(points: p, pivot: pv, front: front) }
+        func shard(_ p: [P], _ pv: P, front: Bool? = nil) -> Shard { Shard(points: p, pivot: pv, front: front, ink: nil) }
         return BodyRig(
             name: "fallback",
             bones: standardBones,
