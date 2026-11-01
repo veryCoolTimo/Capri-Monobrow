@@ -82,41 +82,6 @@ struct VoiceMouthView: View {
     }
 }
 
-/// Лицо Capri в notch, пока идёт голос: мини-риг «значок» (`VoiceFace`) — слушает (зрачки крупнее), слышит
-/// (зрачки пульсируют с громкостью), не слышит (полувеко набок), думает (глаза вверх-вбок), ^^ / ><.
-struct VoiceFaceView: View {
-    var state: VoiceFace.State
-    var level: () -> Double
-    var fixedTick: Int? = nil
-
-    static func state(_ v: VoiceLine, heard: HearingWatch.Status?) -> VoiceFace.State {
-        switch v.phase {
-        case .listening: v.alarm ? .unsure : heard == .heard ? .hearing : .listening
-        case .working: .working
-        case .done: .done
-        case .failed: .failed
-        }
-    }
-
-    var body: some View {
-        if let t = fixedTick {
-            face(tick: t)
-        } else {
-            TimelineView(.periodic(from: .now, by: 1 / CapriFace.fps)) { ctx in
-                face(tick: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 5 : Int(ctx.date.timeIntervalSinceReferenceDate * CapriFace.fps))
-            }
-        }
-    }
-
-    private func face(tick: Int) -> some View {
-        Canvas { g, size in
-            let pose = VoiceFace.pose(state, level: level(), tick: tick)
-            RigArt.draw(pose, in: RigArt.badgeBox(fitting: CGRect(origin: .zero, size: size)), g)
-        }
-        .accessibilityLabel(Text("Capri слушает"))
-    }
-}
-
 /// Молния вдоль нижнего края notch, пока она слышит голос (выше порога `VoiceLevel.heard`; в тишине её нет):
 /// розовая игольчатая (иглы `CapriFX.needles`) с фиолетовой тенью. Растёт из-под её лица (слева) вправо:
 /// громче — длиннее, шире и с веткой вниз. Каждый тик (12 fps) колени «кипят», форма меняется раз в 3 кадра. `bottom` — y нижнего края, `down` — куда «вниз» (−1 в слоях AppKit, +1 в SwiftUI).
@@ -214,10 +179,21 @@ enum VoiceSheet {
             assistantCell(voice: nil, hint: false, text: "", level: 0, label: "после 3 раз — без подсказки")
         }
         .padding(10).background(Color(white: 0.55))
+        let answers = VStack(spacing: 8) {
+            answerCell(PeekAnswer(text: "Да, квота **Codex** почти кончилась — осталось 12% до 18:00.",
+                                  hint: PeekAnswerTiming.hint(confirm: false, links: false)))
+            answerCell(PeekAnswer(text: "Votek ждёт ответа: спрашивает, можно ли удалить старую миграцию и пересобрать базу на тестовом стенде. Остальные три сессии работают, quiz скрыт настройками. Если хочешь, могу предложить ответ.",
+                                  hint: PeekAnswerTiming.hint(confirm: false, links: true)))
+            answerCell(PeekAnswer(text: "Отправить в votek: «да, удаляй и пересобирай»?",
+                                  hint: PeekAnswerTiming.hint(confirm: true, links: false)))
+            answerCell(PeekAnswer(text: "Codex не ответил: нет сети", hint: PeekAnswerTiming.hint(confirm: false, links: false), failed: true))
+        }
+        .padding(10).background(Color(white: 0.55))
         for (name, view, scale) in [("scene-voice.png", AnyView(grid), 2.0),
                                     ("scene-voice-detail.png", AnyView(VStack(spacing: 8) { cell(frames[0]); cell(frames[2]); cell(frames[5]); cell(frames[7]) }
                                         .padding(10).background(Color(white: 0.55))), 3.0),
-                                    ("scene-voice-assistant.png", AnyView(assistant), 2.0)] {
+                                    ("scene-voice-assistant.png", AnyView(assistant), 2.0),
+                                    ("scene-voice-answer.png", AnyView(answers), 2.0)] {
             let r = ImageRenderer(content: view)
             r.scale = scale
             guard let cg = r.cgImage else { continue }
@@ -241,12 +217,8 @@ enum VoiceSheet {
             Path(dropPath(CGRect(x: left, y: 0, width: w, height: h), top: 8, bottom: 16, flipped: true))
                 .stroke(Palette.crimson.opacity(0.55), lineWidth: 1)
             // Вырез камеры — чёрный, как настоящий (на экране его не видно).
-            VoiceFaceView(state: VoiceFaceView.state(f.line, heard: f.heard), level: { f.level }, fixedTick: f.tick)
+            CapriFace(mood: VoiceLine.mood(f.line), style: .mask, active: false)
                 .frame(width: 32, height: 16).offset(x: left + 13, y: (top - 16) / 2)
-            if f.line.phase == .listening {
-                VoiceMouthView(level: { f.level }, fixedTick: f.tick).frame(width: 20, height: 12)
-                    .offset(x: left + 13 + 32 + 4, y: (top - 12) / 2)
-            }
             VoiceLineView(line: f.line).padding(.horizontal, 18)
                 .frame(width: w, height: h - top - 3).offset(x: left, y: top)
             if f.line.phase == .listening, VoiceLevel.speaking(f.level) {
@@ -261,6 +233,31 @@ enum VoiceSheet {
             Text(f.label).font(.mono(8)).foregroundColor(.white.opacity(0.6)).offset(x: 6, y: size.height - 14)
         }
         .frame(width: size.width, height: size.height)
+        .environment(\.colorScheme, .dark)
+    }
+
+    /// Peek с ответом: та же капля, глаза моноброви и `PeekAnswerView`, высота — по тексту (как в живом notch).
+    @MainActor
+    static func answerCell(_ a: PeekAnswer) -> some View {
+        let w: CGFloat = 377, top: CGFloat = 32
+        return VStack(spacing: 0) {
+            HStack {
+                CapriFace(mood: .idle, style: .mask, active: false).frame(width: 32, height: 16)
+                Spacer()
+            }
+            .padding(.horizontal, 13).frame(height: top)
+            PeekAnswerView(answer: a).fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(width: w)
+        .background(GeometryReader { g in
+            ZStack {
+                Path(dropPath(CGRect(x: 0, y: 0, width: w, height: g.size.height), top: 8, bottom: 16, flipped: true)).fill(Color.black)
+                Path(dropPath(CGRect(x: 0, y: 0, width: w, height: g.size.height), top: 8, bottom: 16, flipped: true))
+                    .stroke(Palette.crimson.opacity(0.55), lineWidth: 1)
+            }
+        })
+        .padding(.horizontal, 20).padding(.bottom, 8)
+        .background(Color(red: 0.16, green: 0.17, blue: 0.2))
         .environment(\.colorScheme, .dark)
     }
 

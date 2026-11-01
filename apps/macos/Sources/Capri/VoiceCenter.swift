@@ -48,6 +48,8 @@ final class VoiceCenter: ObservableObject {
     private var phraseOpen = false
     private var finalWork: DispatchWorkItem?
     private var hideWork: DispatchWorkItem?
+    /// Ждём ответ помощника на голосовой вопрос, чтобы показать его в peek.
+    private var answerWatch: AnyCancellable?
     /// Звук идёт в хелпер (на очереди микрофона): между `begin` и `end`.
     private var streaming = false
     /// Что открыто сейчас: UID входа (для «пропал — взять другой») и Bluetooth ли он (терпение «не слышу»).
@@ -540,22 +542,55 @@ final class VoiceCenter: ObservableObject {
                 }
             }
         case .search(let q):
-            hide(after: 0)
-            notch.go(.assistant, reason: "voice")
-            codex.search(q, said: said)
+            ask(id, said) { $0.codex.search(q, said: said) }
         case .reply(let name, let body):
             guard let s = store.sessions.first(where: { store.name($0).title == name || $0.tmux?.session == name }) else {
-                hide(after: 0); notch.go(.assistant, reason: "voice"); codex.askVoice(said); return
+                ask(id, said) { $0.codex.askVoice(said) }
+                return
             }
-            hide(after: 0)
-            notch.go(.assistant, reason: "voice")
-            codex.proposeReply(s.key, text: body, said: said)
+            ask(id, said) { $0.codex.proposeReply(s.key, text: body, said: said) }
         case .assistant(let q):
-            hide(after: 0)
-            notch.go(.assistant, reason: "voice")
-            if notch.ui.assistantText == lastHeard { notch.ui.assistantText = "" }
-            codex.askVoice(q)
+            ask(id, said) { $0.codex.askVoice(q) }
         }
+    }
+
+    /// Вопрос помощнику голосом. Помощник открыт — ответ в разговоре, как раньше. Закрыт — окно не открываем:
+    /// «думаю…» в peek, потом там же только ответ; клик по нему открывает помощник со всем разговором.
+    private func ask(_ id: Int, _ said: String, _ send: (VoiceCenter) -> Void) {
+        answerWatch?.cancel()
+        answerWatch = nil
+        if notch.state == .assistant {
+            hide(after: 0)
+            if notch.ui.assistantText == lastHeard { notch.ui.assistantText = "" }
+            send(self)
+            return
+        }
+        let before = codex.chat.last?.id
+        send(self)
+        let deliver: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.answerWatch = nil
+            guard self.current(id), self.notch.ui.voice?.phase == .working || self.notch.ui.voice == nil else { return }
+            guard let m = self.codex.chat.last, m.id != before, m.role != .user else { self.hide(after: 0); return }
+            self.hideWork?.cancel()
+            let confirm = m.proposals.contains { $0.state == .pending }
+            var text = m.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            // «Ответь сессии …»: в peek видно, что именно уйдёт.
+            if confirm, let p = m.proposals.first(where: { $0.state == .pending }), case .text(let t) = p.action {
+                text = "Отправить в \(p.title): \(Self.quote(t))?"
+            }
+            self.log("voice answer \(text.count) зн.\(confirm ? " · ждёт подтверждения" : "")")
+            self.notch.showAnswer(PeekAnswer(text: text.isEmpty ? "(пустой ответ)" : text,
+                                             hint: PeekAnswerTiming.hint(confirm: confirm, links: !m.links.isEmpty),
+                                             failed: m.role == .error))
+        }
+        guard codex.chatBusy else { deliver(); return }
+        show(.working, "Думаю: \(Self.quote(said))")
+        hide(after: 180)
+        // `chatBusy` публикуется до записи, а текст ответа пишется после — берём его на следующем витке.
+        answerWatch = codex.$chatBusy.dropFirst().filter { !$0 }.first()
+            .receive(on: DispatchQueue.main)
+            .sink { _ in deliver() }
     }
 
     /// Скрипт не ответил за 3 с — скорее всего, macOS спрашивает «Автоматизацию» (или ждёт прошлый такой вопрос).

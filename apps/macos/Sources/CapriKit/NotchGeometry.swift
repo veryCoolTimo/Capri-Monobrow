@@ -32,6 +32,8 @@ public enum NotchGeometry {
     public static let pillSize = CGSize(width: 200, height: 26)
     public static let peekExtraHeight: CGFloat = 34
     public static let peekExtraWidth: CGFloat = 40
+    /// Peek с ответом Capri растёт по тексту (`contentHeight`), но не выше этого запаса под строкой выреза.
+    public static let peekAnswerExtraHeight: CGFloat = 130
     /// Компактный раскрытый notch: ширина постоянная, высота — по содержимому (`contentHeight`).
     public static let expandedWidth: CGFloat = 400
     public static let expandedHeight: ClosedRange<CGFloat> = 96...300
@@ -84,7 +86,9 @@ public enum NotchGeometry {
         case .collapsed where quiet:
             return notchRect(s)?.size ?? CGSize(width: pillSize.width, height: 0)
         case .collapsed: return collapsed
-        case .peek: return CGSize(width: collapsed.width + peekExtraWidth, height: collapsed.height + peekExtraHeight)
+        case .peek:
+            let h = clamp(contentHeight, (collapsed.height + peekExtraHeight)...(collapsed.height + peekAnswerExtraHeight))
+            return CGSize(width: collapsed.width + peekExtraWidth, height: h)
         case .expanded: return CGSize(width: expandedWidth, height: clamp(contentHeight, expandedHeight))
         case .assistant: return CGSize(width: assistantWidth, height: clamp(contentHeight, assistantHeight))
         }

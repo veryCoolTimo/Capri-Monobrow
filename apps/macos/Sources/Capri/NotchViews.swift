@@ -47,6 +47,18 @@ final class NotchUI: ObservableObject {
     @Published var voiceHint = false
     /// Слышит ли она голос (меняется только при смене состояния) — для лица в notch.
     @Published var voiceHeard: HearingWatch.Status?
+    /// Ответ Capri на голосовой вопрос — показывается в peek, клик открывает помощник; nil — ответа нет.
+    @Published var answer: PeekAnswer?
+    /// Высота peek с ответом (капля подстраивается); nil — обычная строка.
+    @Published var peekHeight: CGFloat?
+}
+
+/// Ответ в peek: только текст ответа и подсказка, что клик откроет разговор.
+struct PeekAnswer: Equatable {
+    var text: String
+    /// Подсказка под ответом («нажми — ответить», «нажми — подтвердить»…).
+    var hint: String
+    var failed = false
 }
 
 /// Строка голоса в notch.
@@ -69,6 +81,16 @@ struct VoiceLine: Equatable {
     var note: String = ""
     /// `note` — тревога («не слышу»): малиновым.
     var alarm = false
+
+    /// Глаза моноброви на эту строку: слушает — смотрит не моргая, разбирает — думает, не вышло — глитч.
+    static func mood(_ v: VoiceLine) -> CapriMood {
+        switch v.phase {
+        case .listening: .listening
+        case .working: .thinking
+        case .done: .idle
+        case .failed: .error
+        }
+    }
 }
 
 /// Включён ли слой notch. Скрытый слой (свёрнутый notch) снимает содержимое целиком — вместе с подписками
@@ -257,23 +279,14 @@ struct TopRowView: View {
         let vibing = waiting == 0 && !codex.chatBusy && !ui.characterHidden
             && (ui.vibing || (ui.expandedOpen && ui.musicPlaying))
         HStack(spacing: 0) {
-            // Слушает голос — выше всего: человек прямо сейчас говорит с ней.
-            let listening = ui.voice?.phase == .listening
-            Group {
-                if let v = ui.voice {
-                    // Голос: лицо само показывает, что слушает, слышит, не слышит, думает (мини-риг «значок»).
-                    VoiceFaceView(state: VoiceFaceView.state(v, heard: ui.voiceHeard), level: { [ui] in ui.voiceLevel })
-                } else {
-                    CapriFace(mood: waiting > 0 ? .alert : codex.chatBusy ? .thinking : vibing ? .vibing : .idle, style: .mask)
-                }
-            }
+            // Голос — те же глаза моноброви: слушает — открыты и не моргают, думает — как над вопросом.
+            // Что она слышит, показывают молния вдоль края и строка peek.
+            CapriFace(mood: ui.voice.map(VoiceLine.mood) ?? (waiting > 0 ? .alert : codex.chatBusy ? .thinking : vibing ? .vibing : .idle),
+                      style: .mask)
                 .frame(width: 32, height: 16)
                 .opacity(ui.faceAway || ui.sweep != nil ? 0 : 1)
                 .help("Capri — спросить (⌃⌥Space)")
-            if listening {
-                // Рот: зигзаг по громкости, сразу справа от глаз.
-                VoiceMouthView(level: { [ui] in ui.voiceLevel }).frame(width: 20, height: 12).padding(.leading, 4)
-            } else if vibing {
+            if vibing && ui.voice == nil {
                 EqualizerBars(color: Palette.crimson, animating: true, height: 9).padding(.leading, 4)
             }
             Spacer(minLength: ui.hasNotch ? notchWidth : 8)
@@ -322,6 +335,23 @@ struct PeekLineView: View {
     var body: some View {
         let waiting = store.waiting
         let focus = ui.alertKey.flatMap { k in waiting.first { $0.key == k } } ?? waiting.first
+        Group {
+            if ui.voice == nil, let a = ui.answer {
+                PeekAnswerView(answer: a)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .reportHeight { ui.peekHeight = $0 + 3 }
+            } else {
+                line(focus: focus, waiting: waiting).frame(height: NotchGeometry.peekExtraHeight - 3)
+                    .onAppear { ui.peekHeight = nil }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .coordinateSpace(name: PeekLineView.space)
+        .onPreferenceChange(PeekMusicKey.self) { ui.peekMusicRects = $0 }
+        .onDisappear { ui.peekMusicRects = [:] }
+    }
+
+    private func line(focus: Session?, waiting: [Session]) -> some View {
         HStack(spacing: 7) {
             if let v = ui.voice {
                 VoiceLineView(line: v)
@@ -350,10 +380,27 @@ struct PeekLineView: View {
             }
         }
         .padding(.horizontal, 18)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .coordinateSpace(name: PeekLineView.space)
-        .onPreferenceChange(PeekMusicKey.self) { ui.peekMusicRects = $0 }
-        .onDisappear { ui.peekMusicRects = [:] }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+/// Ответ Capri в peek: несколько строк текста и тусклая подсказка «нажми — …». Без поля ввода и кнопок.
+struct PeekAnswerView: View {
+    var answer: PeekAnswer
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text((try? AttributedString(markdown: answer.text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+                 ?? AttributedString(answer.text))
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(answer.failed ? Palette.crimson : Palette.text)
+                .lineLimit(5).truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if !answer.hint.isEmpty { Caps(answer.hint, size: 7.5, color: Palette.dim) }
+        }
+        .padding(.horizontal, 18).padding(.top, 6).padding(.bottom, 9)
+        .environment(\.colorScheme, .dark)
+        .accessibilityElement(children: .combine)
     }
 }
 

@@ -141,6 +141,8 @@ final class NotchController: NSObject {
     /// Нет ни ждущих, ни работающих: свёрнутая капля совпадает с вырезом.
     private var quiet = true
     private var collapseWork: DispatchWorkItem?
+    /// Ответ в peek уберётся сам — через время на чтение (наведение откладывает).
+    private var answerWork: DispatchWorkItem?
     private var sweepEnd: DispatchWorkItem?
     private var alertWork: DispatchWorkItem?
     private var monitors: [Any] = []
@@ -267,6 +269,8 @@ final class NotchController: NSObject {
             .sink { [weak self] h in self?.contentResized(.expanded, h) }.store(in: &cancellables)
         ui.$assistantHeight.removeDuplicates()
             .sink { [weak self] h in self?.contentResized(.assistant, h) }.store(in: &cancellables)
+        ui.$peekHeight.removeDuplicates()
+            .sink { [weak self] h in self?.contentResized(.peek, h) }.store(in: &cancellables)
         // Изменения сессий: свёрнутая капля растёт/сжимается вокруг выреза.
         store.objectWillChange
             .receive(on: DispatchQueue.main)
@@ -356,7 +360,8 @@ final class NotchController: NSObject {
 
         let rowHeight = notchRect?.height ?? NotchGeometry.pillSize.height
         let collapsed = NotchGeometry.shapeRect(.collapsed, notch).offsetBy(dx: -host.minX, dy: -host.minY)
-        let peek = local(.peek)
+        // Слой peek — во всю высоту peek с ответом, строка прижата к верху; лишнее срезает маска капли.
+        let peek = NotchGeometry.shapeRect(.peek, notch, contentHeight: .greatestFiniteMagnitude).offsetBy(dx: -host.minX, dy: -host.minY)
         topRow.rootView = TopRowView(store: store, ui: ui, codex: codex, notchWidth: notchRect?.width ?? 0)
         topRow.frame = CGRect(x: collapsed.minX, y: bounds.height - rowHeight, width: collapsed.width, height: rowHeight)
         topRow.restingOrigin = topRow.frame.origin
@@ -420,7 +425,10 @@ final class NotchController: NSObject {
         collapseWork?.cancel()
         let interactive: Set<NotchState> = [.expanded, .assistant]
         panel.allowKey = interactive.contains(target)
-        if target != .peek { ui.alertKey = nil }
+        if target != .peek {
+            ui.alertKey = nil
+            if ui.answer != nil { answerWork?.cancel(); ui.answer = nil; ui.peekHeight = nil }
+        }
         ui.assistantShown = target == .assistant
         if target == .assistant { ui.assistantFocusTick += 1 }
         // Карточка не должна переключаться сама при пересортировке списка — закрепляем выбор.
@@ -537,6 +545,7 @@ final class NotchController: NSObject {
 
     /// Строка голоса в peek (раскрытый notch и помощник не трогаем — там своё поле).
     func voiceShow(_ line: VoiceLine) {
+        if ui.answer != nil { answerWork?.cancel(); ui.answer = nil; ui.peekHeight = nil }
         ui.voice = line
         guard state == .collapsed else { return }
         if suppressed { setPanelVisible(true) }
@@ -549,6 +558,33 @@ final class NotchController: NSObject {
         guard ui.voice != nil else { return }
         ui.voice = nil
         if state == .peek, !hovering { go(.collapsed, reason: "voiceDone") }
+    }
+
+    /// Ответ Capri на голосовой вопрос — в peek, без поля ввода; клик по нему открывает помощник с разговором.
+    /// Уходит сам через время на чтение (пока курсор над ним — ждёт). Открытый помощник не трогаем — там видно.
+    func showAnswer(_ answer: PeekAnswer) {
+        voiceListening(false)
+        ui.voice = nil
+        guard state == .collapsed || state == .peek else { return }
+        ui.alertKey = nil
+        ui.answer = answer
+        if suppressed && state == .collapsed { setPanelVisible(true) }
+        go(.peek, reason: "answer")
+        glitch()
+        scheduleAnswerHide(after: PeekAnswerTiming.seconds(answer.text))
+    }
+
+    private func scheduleAnswerHide(after s: Double) {
+        answerWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.ui.answer != nil else { return }
+            if self.hovering { self.scheduleAnswerHide(after: 2); return }
+            self.ui.answer = nil
+            self.ui.peekHeight = nil
+            if self.state == .peek { self.go(.collapsed, reason: "answerDone") }
+        }
+        answerWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + s, execute: work)
     }
 
     /// Молния вдоль края notch, пока слушает: 12 fps, только пока держат клавишу (вне голоса таймера нет).
@@ -677,7 +713,7 @@ final class NotchController: NSObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.32) { [weak self] in self?.glitch() }
         alertWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.state == .peek, !self.hovering, self.ui.voice == nil else { return }
+            guard let self, self.state == .peek, !self.hovering, self.ui.voice == nil, self.ui.answer == nil else { return }
             self.go(.collapsed, reason: "alertTimeout")
         }
         alertWork = work
@@ -751,7 +787,7 @@ final class NotchController: NSObject {
             if state == .collapsed { go(.peek, reason: "hover") }
         } else if state == .peek {
             let work = DispatchWorkItem { [weak self] in
-                guard let self, !self.hovering, self.state == .peek, self.ui.voice == nil else { return }
+                guard let self, !self.hovering, self.state == .peek, self.ui.voice == nil, self.ui.answer == nil else { return }
                 self.go(.collapsed, reason: "hoverOut")
             }
             collapseWork = work
@@ -804,6 +840,11 @@ final class NotchController: NSObject {
             if self.state == .peek, let id = self.peekMusicButton(at: NSEvent.mouseLocation), let cmd = MusicCommand(button: id) {
                 // ⏮ ⏯ ⏭ в peek: клик по кнопке — музыка, не раскрытие.
                 self.onMusic?(cmd, "peek")
+                return nil
+            }
+            if self.state == .peek, self.ui.answer != nil {
+                // Ответ в peek: клик — помощник, там весь разговор, ссылки и подтверждения.
+                self.go(.assistant, reason: "answer")
                 return nil
             }
             if self.state == .collapsed || self.state == .peek {

@@ -179,3 +179,16 @@ public struct PushToTalk {
     /// Снаружи оборвали (ошибка микрофона, notch раскрыли мышью).
     public mutating func reset() { phase = .idle }
 }
+
+/// Ответ Capri в peek (голосовой вопрос при закрытом помощнике): сколько держать и что подсказать под ним.
+public enum PeekAnswerTiming {
+    /// Время на чтение: ~14 знаков в секунду плюс 3 с, от 6 до 20 с.
+    public static func seconds(_ text: String) -> Double {
+        min(20, max(6, Double(text.count) / 14 + 3))
+    }
+
+    /// Подсказка: ждёт подтверждения — «подтвердить», есть ссылки — «ссылки», иначе — продолжить разговор.
+    public static func hint(confirm: Bool, links: Bool) -> String {
+        confirm ? "нажми — подтвердить" : links ? "нажми — ссылки" : "нажми — продолжить"
+    }
+}

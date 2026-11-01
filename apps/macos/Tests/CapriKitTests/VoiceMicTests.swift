@@ -144,24 +144,6 @@ final class VoiceMicTests: XCTestCase {
         XCTAssertEqual(MicChoice.uid(.device(usb), defaultUID: "d"), usb.uid)
     }
 
-    func testVoiceFaceStatesDiffer() {
-        let states: [VoiceFace.State] = [.listening, .hearing, .unsure, .working, .done, .failed]
-        let poses = states.map { VoiceFace.pose($0, level: 0.8, tick: 5) }
-        for i in 0..<poses.count { for j in (i + 1)..<poses.count { XCTAssertNotEqual(poses[i], poses[j], "\(states[i]) = \(states[j])") } }
-        XCTAssertGreaterThan(poses[0].pupil, 1.1, "слушает — зрачки крупнее")
-        XCTAssertGreaterThan(VoiceFace.pose(.hearing, level: 1, tick: 5).pupil, VoiceFace.pose(.hearing, level: 0, tick: 5).pupil, "пульс с громкостью")
-        XCTAssertEqual(poses[2].eyes, .half)
-        XCTAssertEqual(poses[4].eyes, .happy)
-        XCTAssertEqual(poses[5].eyes, .squint)
-        XCTAssertLessThan(poses[3].gaze.dy, 0, "думает — глаза вверх")
-        for p in poses { XCTAssertEqual(p.badge, 1); XCTAssertEqual(p.hair, 0) }
-        // Зрачки растут в фигурах рига.
-        func pupilArea(_ p: RigPose) -> CGFloat {
-            CapriRig.fallback.compose(p).filter { $0.layer.hasSuffix(".pupil") }.map { abs(RigGeometry.area($0.points)) }.reduce(0, +)
-        }
-        XCTAssertGreaterThan(pupilArea(poses[0]), pupilArea(VoiceFace.pose(.working, level: 0, tick: 5)) * 1.3)
-    }
-
     func testMouthFollowsLevel() {
         let r = CGRect(x: 0, y: 0, width: 20, height: 10)
         let quiet = VoiceMouth.points(in: r, tick: 3, level: 0)

@@ -254,3 +254,18 @@ final class VoiceActionsTests: XCTestCase {
         XCTAssertEqual(p.release(at: 80), [], "отпускание после обрыва")
     }
 }
+
+final class PeekAnswerTimingTests: XCTestCase {
+    func testReadingTimeBounded() {
+        XCTAssertEqual(PeekAnswerTiming.seconds("да"), 6)
+        XCTAssertEqual(PeekAnswerTiming.seconds(String(repeating: "а", count: 2000)), 20)
+        XCTAssertGreaterThan(PeekAnswerTiming.seconds(String(repeating: "а", count: 140)),
+                             PeekAnswerTiming.seconds(String(repeating: "а", count: 60)))
+    }
+
+    func testHint() {
+        XCTAssertEqual(PeekAnswerTiming.hint(confirm: true, links: true), "нажми — подтвердить")
+        XCTAssertEqual(PeekAnswerTiming.hint(confirm: false, links: true), "нажми — ссылки")
+        XCTAssertEqual(PeekAnswerTiming.hint(confirm: false, links: false), "нажми — продолжить")
+    }
+}
