@@ -40,6 +40,8 @@ public struct RigPose: Equatable {
     public var gaze = CGVector.zero
     /// Распахнутые глаза (удивление, перегрузка): 0…1.
     public var wide = 0.0
+    /// Размер зрачка с кольцом: 1 — как нарисовано, больше — «внимательно слушает».
+    public var pupil = 1.0
     public var mouth: Mouth = .fang
     public var left = RigArm.hidden
     public var right = RigArm.hidden
@@ -119,6 +121,7 @@ public struct RigPose: Equatable {
         }
         o.gaze = CGVector(dx: lerp(a.gaze.dx, b.gaze.dx, k), dy: lerp(a.gaze.dy, b.gaze.dy, k))
         o.wide = lerp(a.wide, b.wide, k)
+        o.pupil = lerp(a.pupil, b.pupil, k)
         o.left = RigArm.mix(a.left, b.left, k)
         o.right = RigArm.mix(a.right, b.right, k)
         o.turn = lerp(a.turn, b.turn, k)

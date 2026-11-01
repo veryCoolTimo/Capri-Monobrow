@@ -6,6 +6,8 @@ public enum RigInk: String, Codable, CaseIterable {
     case mask, ink, white, pupil, ring, hair, rim, sparkle, glint
     /// Пиксельный призрак: светлый, тёмный, красный.
     case ghostLight, ghostDark, ghostRed, stripe
+    /// Тело в полный рост: глубокий малиновый (дальние рука/нога, силуэт в контровом свете) и светлая кайма контрового света.
+    case deep, light
 }
 
 /// Готовая к заливке фигура: слой (для тестов и отладки), цвет, многоугольник в координатах рига (y вниз).
@@ -263,9 +265,10 @@ public struct CapriRig: Codable, Equatable {
         let travel = CGSize(width: eye.travel[0] * Double(k), height: eye.travel[1] * Double(k))
         let pc = CGPoint(x: center.x + CGFloat(pose.gaze.dx) * travel.width, y: center.y + CGFloat(pose.gaze.dy) * travel.height)
         let wideK = 1 - 0.25 * CGFloat(pose.wide)
-        let ring = RigGeometry.circle(pc, r: CGFloat(eye.ring) * k, n: 20)
-        let gap = RigGeometry.circle(pc, r: CGFloat((eye.ring + eye.pupil) / 2) * k, n: 20)
-        let pupil = RigGeometry.circle(pc, r: CGFloat(eye.pupil) * k * wideK, n: 18)
+        let pk = CGFloat(max(0.5, min(1.8, pose.pupil)))
+        let ring = RigGeometry.circle(pc, r: CGFloat(eye.ring) * k * pk, n: 20)
+        let gap = RigGeometry.circle(pc, r: CGFloat((eye.ring + eye.pupil) / 2) * k * pk, n: 20)
+        let pupil = RigGeometry.circle(pc, r: CGFloat(eye.pupil) * k * wideK * pk, n: 18)
         // Блик — то же смещение у обоих глаз (свет с одной стороны).
         let g = CGPoint(x: eye.glintAt[0], y: eye.glintAt[1])
         let glint = RigGeometry.circle(CGPoint(x: pc.x + g.x * k, y: pc.y + g.y * k), r: CGFloat(eye.glint) * k * (pose.wide > 0 ? 1.6 : 1), n: 10)
@@ -443,7 +446,7 @@ public struct CapriRig: Codable, Equatable {
                 if TickNoise.unit(r * 977 + c, 6100 + pose.seed) < drop { continue }
                 let ink: RigInk
                 switch top.ink {
-                case .mask, .ring: ink = .ghostLight
+                case .mask, .ring, .light: ink = .ghostLight
                 case .ink, .rim: ink = .ghostDark
                 case .white, .glint: ink = .glint
                 default: ink = .ghostRed

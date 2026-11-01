@@ -1,5 +1,7 @@
 import AppKit
 import AVFoundation
+import CoreAudio
+import CoreMedia
 import CapriKit
 
 /// Хелпер `capri-asr` (Contents/MacOS): отдельный процесс с моделью речи. Запускается при первой надобности
@@ -104,15 +106,114 @@ final class AsrHelper {
 /// Разборщик строк одного процесса хелпера (только на главной очереди).
 private final class SplitterBox: @unchecked Sendable { var value = LineSplitter() }
 
-/// Микрофон на время удержания клавиши: AVAudioEngine → 16 кГц mono Float32 кусками по ~100 мс.
-/// Движок создаётся на каждое нажатие (наушники могли смениться) и останавливается сразу при отпускании —
-/// оранжевая точка в строке меню горит, только пока держат клавишу.
-final class MicCapture {
+/// Входы звука (CoreAudio) для выбора в Настройках → Голос: список и системный по умолчанию, обновляются сами
+/// (подключили наушники, сменили вход в macOS). Разрешения не нужны — только имена и типы, не звук.
+final class MicDevices: ObservableObject {
+    @Published private(set) var devices: [MicDevice] = []
+    @Published private(set) var defaultUID: String?
+    private var listening = false
+
+    init() { refresh() }
+
+    /// Слушать изменения (при первом показе настроек или нажатии): блоки на главной очереди.
+    func watch() {
+        guard !listening else { return }
+        listening = true
+        let sys = AudioObjectID(kAudioObjectSystemObject)
+        for sel in [kAudioHardwarePropertyDevices, kAudioHardwarePropertyDefaultInputDevice] {
+            var a = AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+            AudioObjectAddPropertyListenerBlock(sys, &a, .main) { [weak self] _, _ in self?.refresh() }
+        }
+    }
+
+    func refresh() {
+        let list = Self.inputs()
+        let def = Self.defaultInput()
+        if list != devices { devices = list }
+        if def != defaultUID { defaultUID = def }
+    }
+
+    static func inputs() -> [MicDevice] {
+        let sys = AudioObjectID(kAudioObjectSystemObject)
+        var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal,
+                                           mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(sys, &a, 0, nil, &size) == noErr, size > 0 else { return [] }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(sys, &a, 0, nil, &size, &ids) == noErr else { return [] }
+        return ids.compactMap { id in
+            guard inputStreams(id) > 0, let uid = string(id, kAudioDevicePropertyDeviceUID) else { return nil }
+            var t = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType, mScope: kAudioObjectPropertyScopeGlobal,
+                                               mElement: kAudioObjectPropertyElementMain)
+            var code: UInt32 = 0
+            var sz = UInt32(MemoryLayout<UInt32>.size)
+            _ = AudioObjectGetPropertyData(id, &t, 0, nil, &sz, &code)
+            return MicDevice(uid: uid, name: string(id, kAudioObjectPropertyName) ?? uid, transport: MicDevice.transport(code: code))
+        }
+    }
+
+    static func defaultInput() -> String? {
+        var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice, mScope: kAudioObjectPropertyScopeGlobal,
+                                           mElement: kAudioObjectPropertyElementMain)
+        var id = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &size, &id) == noErr, id != 0 else { return nil }
+        return string(id, kAudioDevicePropertyDeviceUID)
+    }
+
+    private static func inputStreams(_ id: AudioDeviceID) -> Int {
+        var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: kAudioObjectPropertyScopeInput,
+                                           mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &a, 0, nil, &size) == noErr else { return 0 }
+        return Int(size) / MemoryLayout<AudioStreamID>.size
+    }
+
+    private static func string(_ id: AudioObjectID, _ sel: AudioObjectPropertySelector) -> String? {
+        var a = AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var value: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(id, &a, 0, nil, &size, &value) == noErr, let v = value?.takeRetainedValue() else { return nil }
+        let s = v as String
+        return s.isEmpty ? nil : s
+    }
+}
+
+/// Микрофон на время удержания клавиши: выбранный вход (`MicChoice`) через AVCaptureSession — системный вход
+/// по умолчанию не меняется, AirPods не трогаем, если выбран встроенный. Звук в родном формате входа →
+/// `PcmResampler` → 16 кГц mono Float32 кусками, как пришли (~10–100 мс). Сессия создаётся на каждое удержание
+/// и останавливается сразу при отпускании — оранжевая точка горит, только пока держат клавишу. Запуск — на своей
+/// очереди (Bluetooth включается до секунды — главный поток не ждёт).
+final class MicCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    /// Что открыто и сколько пришло — для журнала (`voice mic …`).
+    struct Stats {
+        var device = ""
+        var format = ""
+        var seconds = 0.0
+        var peak = 0.0
+        var formatChanges = 0
+    }
+
     /// Куски звука (на очереди `queue`) и громкость 0…1.
     var onAudio: (([Float], Double) -> Void)?
+    /// Вход пропал посреди фразы (выдернули, наушники в футляр) или сессия упала — на главной.
+    var onLost: ((String) -> Void)?
     let queue = DispatchQueue(label: "capri.mic", qos: .userInitiated)
-    private var engine: AVAudioEngine?
-    private let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
+
+    /// Только главная очередь.
+    private(set) var running = false
+    /// Номер открытия (главная очередь): поздний ответ прошлого `start` и второе уведомление о той же потере
+    /// не трогают текущую сессию.
+    private var generation = 0
+    private var lostHandled = -1
+    /// Только очередь `queue`.
+    private var session: AVCaptureSession?
+    private var output: AVCaptureAudioDataOutput?
+    private var resampler = PcmResampler()
+    private var stats = Stats()
+    private var observers: [NSObjectProtocol] = []
+    /// Формат входа по описанию CMFormatDescription — не создаём AVAudioFormat на каждый кусок.
+    private var formatCache: (CMFormatDescription, AVAudioFormat)?
 
     static var permission: AVAuthorizationStatus { AVCaptureDevice.authorizationStatus(for: .audio) }
 
@@ -121,56 +222,155 @@ final class MicCapture {
         AVCaptureDevice.requestAccess(for: .audio) { ok in DispatchQueue.main.async { done(ok) } }
     }
 
-    var running: Bool { engine?.isRunning == true }
-
-    /// nil — запустилось; иначе почему нет.
-    func start() -> String? {
-        guard engine == nil else { return nil }
-        guard Self.permission == .authorized else { return "нет доступа к микрофону" }
-        let e = AVAudioEngine()
-        let input = e.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else { return "нет микрофона" }
-        guard let conv = AVAudioConverter(from: format, to: target) else { return "микрофон: формат" }
-        let target = self.target
-        let ratio = target.sampleRate / format.sampleRate
-        // Конвертер — свой у этого движка, захвачен замыканием (не читаем поле из аудиопотока, пока `stop()` его меняет).
-        input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(format.sampleRate / 10), format: format) { [weak self] buf, _ in
-            guard let self else { return }
-            let cap = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 32
-            guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: cap) else { return }
-            var fed = false
-            var err: NSError?
-            conv.convert(to: out, error: &err) { _, status in
-                if fed { status.pointee = .noDataNow; return nil }
-                fed = true
-                status.pointee = .haveData
-                return buf
+    /// Открыть вход (главная очередь). `done` — на главной: nil — слушаем, иначе почему нет.
+    func start(_ pick: MicChoice.Pick, done: @escaping (String?) -> Void) {
+        guard !running else { done(nil); return }
+        guard Self.permission == .authorized else { done("нет доступа к микрофону"); return }
+        running = true
+        generation += 1
+        let gen = generation
+        queue.async {
+            let why = self.open(pick, gen)
+            DispatchQueue.main.async {
+                // Не открылся прошлый `start`, а уже идёт новый — новый не трогаем.
+                if why != nil, gen == self.generation { self.running = false }
+                done(why)
             }
-            guard err == nil, let ch = out.floatChannelData, out.frameLength > 0 else { return }
-            let pcm = Array(UnsafeBufferPointer(start: ch[0], count: Int(out.frameLength)))
-            var sum: Float = 0
-            for v in pcm { sum += v * v }
-            let rms = (sum / Float(max(1, pcm.count))).squareRoot()
-            // ~−50 дБ — тишина, ~−10 дБ — громко.
-            let db = 20 * log10(max(1e-6, Double(rms)))
-            let level = max(0, min(1, (db + 50) / 40))
-            self.queue.async { self.onAudio?(pcm, level) }
         }
-        e.prepare()
-        do { try e.start() } catch {
-            input.removeTap(onBus: 0)
-            return "микрофон не включился"
+    }
+
+    private func open(_ pick: MicChoice.Pick, _ gen: Int) -> String? {
+        let device: AVCaptureDevice?
+        switch pick {
+        case .device(let d): device = AVCaptureDevice(uniqueID: d.uid)
+        case .systemDefault: device = AVCaptureDevice.default(for: .audio)
         }
-        engine = e
+        guard let device else { return "нет микрофона" }
+        let s = AVCaptureSession()
+        let out = AVCaptureAudioDataOutput()
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            s.beginConfiguration()
+            guard s.canAddInput(input), s.canAddOutput(out) else { s.commitConfiguration(); return "микрофон занят" }
+            s.addInput(input)
+            s.addOutput(out)
+            s.commitConfiguration()
+        } catch {
+            return "не открылся"
+        }
+        out.setSampleBufferDelegate(self, queue: queue)
+        resampler = PcmResampler()
+        formatCache = nil
+        stats = Stats(device: device.localizedName)
+        // Одна потеря — одно переключение: `wasDisconnected` и ошибка сессии обычно приходят обе.
+        let lost: (String) -> Void = { [weak self] why in
+            DispatchQueue.main.async {
+                guard let self, self.running, self.generation == gen, self.lostHandled != gen else { return }
+                self.lostHandled = gen
+                self.onLost?(why)
+            }
+        }
+        observers = [
+            NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: device, queue: nil) { _ in
+                lost("отключился")
+            },
+            NotificationCenter.default.addObserver(forName: .AVCaptureSessionRuntimeError, object: s, queue: nil) { _ in
+                lost("ошибка входа")
+            },
+        ]
+        session = s
+        output = out
+        s.startRunning()
+        guard s.isRunning else {
+            for o in observers { NotificationCenter.default.removeObserver(o) }
+            observers = []
+            session = nil
+            output = nil
+            return "не включился"
+        }
         return nil
     }
 
-    func stop() {
-        guard let e = engine else { return }
-        e.inputNode.removeTap(onBus: 0)
-        e.stop()
-        engine = nil
+    /// Вход перестал отдавать звук (главная очередь, от `HearingWatch.stalled`): как потеря, один раз на открытие.
+    func reportStall() {
+        guard running, lostHandled != generation else { return }
+        lostHandled = generation
+        onLost?("перестал отдавать звук")
+    }
+
+    func captureOutput(_ captureOutput: AVCaptureOutput, didOutput sample: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard captureOutput === output, let buf = pcm(sample) else { return }
+        let pcm = resampler.convert(buf)
+        guard !pcm.isEmpty else { return }
+        if stats.format.isEmpty || resampler.formatChanges != stats.formatChanges {
+            stats.format = Self.describe(buf.format)
+            stats.formatChanges = resampler.formatChanges
+        }
+        let level = VoiceLevel.level(pcm)
+        stats.seconds += Double(pcm.count) / PcmResampler.target.sampleRate
+        stats.peak = max(stats.peak, level)
+        onAudio?(pcm, level)
+    }
+
+    /// Закрыть вход (главная очередь). Хвост фильтра уходит в `onAudio` до `done` (та же очередь).
+    func stop(done: ((Stats) -> Void)? = nil) {
+        guard running else { return }
+        running = false
+        queue.async {
+            for o in self.observers { NotificationCenter.default.removeObserver(o) }
+            self.observers = []
+            self.output?.setSampleBufferDelegate(nil, queue: nil)
+            self.session?.stopRunning()
+            self.session = nil
+            self.output = nil
+            let tail = self.resampler.flush()
+            if !tail.isEmpty { self.onAudio?(tail, 0) }
+            let st = self.stats
+            if let done { DispatchQueue.main.async { done(st) } }
+        }
+    }
+
+    /// CMSampleBuffer → AVAudioPCMBuffer в родном формате входа (Float32/Int16, любое число каналов, interleaved).
+    /// Больше 2 каналов без раскладки AVAudioFormat не создаётся — берём раскладку из описания формата, нет её —
+    /// раскладку «N отдельных каналов». Формат кэшируется по описанию (оно одно на поток кусков).
+    private func pcm(_ sample: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard let fd = CMSampleBufferGetFormatDescription(sample) else { return nil }
+        let format: AVAudioFormat
+        if let c = formatCache, CFEqual(c.0, fd) {
+            format = c.1
+        } else {
+            guard let f = Self.format(fd) else { return nil }
+            formatCache = (fd, f)
+            format = f
+        }
+        let n = CMSampleBufferGetNumSamples(sample)
+        guard n > 0, let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(n)) else { return nil }
+        buf.frameLength = AVAudioFrameCount(n)
+        let st = CMSampleBufferCopyPCMDataIntoAudioBufferList(sample, at: 0, frameCount: Int32(n), into: buf.mutableAudioBufferList)
+        return st == noErr ? buf : nil
+    }
+
+    static func format(_ fd: CMFormatDescription) -> AVAudioFormat? {
+        guard let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd) else { return nil }
+        if asbd.pointee.mChannelsPerFrame <= 2, let f = AVAudioFormat(streamDescription: asbd) { return f }
+        var size = 0
+        if let acl = CMAudioFormatDescriptionGetChannelLayout(fd, sizeOut: &size) {
+            let layout = AVAudioChannelLayout(layout: acl)
+            if layout.channelCount == asbd.pointee.mChannelsPerFrame { return AVAudioFormat(streamDescription: asbd, channelLayout: layout) }
+        }
+        guard let layout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | asbd.pointee.mChannelsPerFrame) else { return nil }
+        return AVAudioFormat(streamDescription: asbd, channelLayout: layout)
+    }
+
+    static func describe(_ f: AVAudioFormat) -> String {
+        let kind: String = switch f.commonFormat {
+        case .pcmFormatFloat32: "f32"
+        case .pcmFormatInt16: "i16"
+        case .pcmFormatInt32: "i32"
+        case .pcmFormatFloat64: "f64"
+        default: "?"
+        }
+        return "\(Int(f.sampleRate)) Гц \(f.channelCount) кан \(kind)\(f.isInterleaved && f.channelCount > 1 ? " interleaved" : "")"
     }
 }
 

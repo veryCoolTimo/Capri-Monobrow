@@ -68,6 +68,12 @@ final class Settings: ObservableObject {
     @Published var voice: Bool { didSet { d.set(voice, forKey: "capri.voice") } }
     /// Путь к модели речи (.gguf); пусто — кэш Hugging Face.
     @Published var voiceModelPath: String { didSet { d.set(voiceModelPath, forKey: "capri.voiceModelPath") } }
+    /// Микрофон голоса (`MicPreference.stored`): по умолчанию встроенный — он не переключает AirPods в гарнитуру.
+    @Published var voiceMic: String { didSet { d.set(voiceMic, forKey: "capri.voiceMic") } }
+    /// Имя выбранного входа — сказать, какого нет, когда он отключён.
+    @Published var voiceMicName: String { didSet { d.set(voiceMicName, forKey: "capri.voiceMicName") } }
+    /// Сколько раз голос сработал (непустая фраза): до 3 — подсказка «держи ⌃⌥Пробел» в помощнике.
+    @Published var voiceSuccesses: Int { didSet { d.set(voiceSuccesses, forKey: "capri.voiceSuccesses") } }
 
     var quietHours: QuietHours { QuietHours(start: perchQuietStart, end: perchQuietEnd) }
     var perchHidden: Bool { (perchHiddenUntil ?? 0) > Date().timeIntervalSince1970 }
@@ -110,6 +116,9 @@ final class Settings: ObservableObject {
         perchHiddenUntil = d.object(forKey: "capri.perchHiddenUntil") as? Double
         voice = d.object(forKey: "capri.voice") as? Bool ?? true
         voiceModelPath = d.string(forKey: "capri.voiceModelPath") ?? ""
+        voiceMic = d.string(forKey: "capri.voiceMic") ?? MicPreference.builtIn.stored
+        voiceMicName = d.string(forKey: "capri.voiceMicName") ?? ""
+        voiceSuccesses = d.object(forKey: "capri.voiceSuccesses") as? Int ?? 0
     }
 
     var characterHidden: Bool { (characterHiddenUntil ?? 0) > Date().timeIntervalSince1970 }
@@ -174,11 +183,28 @@ struct SettingsView: View {
     @ObservedObject var spotify: SpotifySearch
     /// Голос: где модель, скачивание.
     @ObservedObject var voice: VoiceCenter
+    /// Входы звука — список обновляется сам (подключили наушники).
+    @ObservedObject var mics: MicDevices
     @State private var spotifyID = ""
     @State private var spotifySecret = ""
     @State private var newHost = ""
     @State private var hostError: String?
     @State private var advanced = false
+
+    private var micOptions: [MicChoice.Option] {
+        MicChoice.options(devices: mics.devices, defaultUID: mics.defaultUID, pref: MicPreference(stored: settings.voiceMic),
+                          savedName: settings.voiceMicName.isEmpty ? nil : settings.voiceMicName)
+    }
+
+    /// Выбор входа: вместе с ним запоминаем имя (сказать, какого нет, когда он отключён).
+    private var micSelection: Binding<String> {
+        Binding(get: { MicPreference(stored: settings.voiceMic).stored }, set: { tag in
+            settings.voiceMic = tag
+            if case .device(let uid) = MicPreference(stored: tag), let d = mics.devices.first(where: { $0.uid == uid }) {
+                settings.voiceMicName = d.name
+            }
+        })
+    }
 
     var body: some View {
         Form {
@@ -212,6 +238,11 @@ struct SettingsView: View {
                     }
                 }
                 .disabled(!settings.voice)
+                Picker("Микрофон", selection: micSelection) {
+                    ForEach(micOptions, id: \.tag) { o in Text(o.title).tag(o.tag) }
+                }
+                .disabled(!settings.voice)
+                .onAppear { mics.watch(); mics.refresh() }
                 HStack {
                     TextField("Свой путь к .gguf (пусто — кэш Hugging Face)", text: $settings.voiceModelPath)
                         .onSubmit { voice.refreshModel() }
@@ -224,7 +255,7 @@ struct SettingsView: View {
             } header: {
                 Text("Голос")
             } footer: {
-                Text("Коротко нажать — помощник, держать — говорить; отпустите — Capri выполнит. «Включи …», «пауза», «запиши …» (Заметки), «напомни через 20 минут / в 18:00 / завтра в 9 …» (Напоминания), «найди в интернете …», «ответь votek2 …» (сначала покажет текст, отправит после ⌘⏎). Остальное — помощнику. Речь распознаётся на этом Маке (Nemotron), микрофон включён, только пока держите клавишу. Первый раз macOS спросит доступ к микрофону, к Заметкам и Напоминаниям.")
+                Text("Коротко нажать — помощник, держать — говорить; отпустите — Capri выполнит. «Включи …», «пауза», «запиши …» (Заметки), «напомни через 20 минут / в 18:00 / завтра в 9 …» (Напоминания), «найди в интернете …», «ответь votek2 …» (сначала покажет текст, отправит после ⌘⏎). Остальное — помощнику. Речь распознаётся на этом Маке (Nemotron), микрофон включён, только пока держите клавишу. Встроенный микрофон включается сразу; AirPods и другие Bluetooth-наушники macOS сначала переключает в режим гарнитуры — первые 1–2 с теряются. Первый раз macOS спросит доступ к микрофону, к Заметкам и Напоминаниям.")
                     .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Section("Уведомления") {

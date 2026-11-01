@@ -366,7 +366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             w.isReleasedWhenClosed = false
             w.isRestorable = false
             w.collectionBehavior = [.managed, .participatesInCycle, .fullScreenNone]
-            let host = NSHostingView(rootView: SettingsView(settings: settings, hosts: store.hostList, spotify: spotify, voice: voice))
+            let host = NSHostingView(rootView: SettingsView(settings: settings, hosts: store.hostList, spotify: spotify, voice: voice, mics: voice.mics))
             w.contentView = host
             w.setContentSize(NSSize(width: 480, height: 600))
             w.center()
@@ -466,6 +466,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     NotchController.debugWrite("rig sheet (\(name)): \(urls.map(\.lastPathComponent).joined(separator: ", "))")
                 } else {
                     NotchController.debugWrite("rig reload: \(name)")
+                }
+            }
+        case "body":
+            // `body sheet` — лист одобрения тела в полный рост в ~/.capri/tmp/body-sheet.png (вне экрана); `body reload`.
+            Task { @MainActor in
+                let name = BodyArt.reload()
+                if arg.hasPrefix("sheet") {
+                    let url = BodySheet.render()
+                    NotchController.debugWrite("body sheet (\(name)): \(url?.lastPathComponent ?? "failed")")
+                } else {
+                    NotchController.debugWrite("body reload: \(name)")
                 }
             }
         case "scene", "music", "director", "stage", "locate", "perch":

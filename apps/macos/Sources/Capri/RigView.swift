@@ -32,7 +32,21 @@ enum RigArt {
         case .ghostDark: Color(white: 0.16)
         case .ghostRed: Color(red: 0.86, green: 0.25, blue: 0.22)
         case .stripe: .white
+        case .deep: Color(red: 0xD9 / 255, green: 0x18 / 255, blue: 0x59 / 255)
+        case .light: Color(red: 1, green: 0.93, blue: 0.95)
         }
+    }
+
+    /// Коробка для `draw`, чтобы «значок» (маска без волос) заполнил `r` по центру.
+    static func badgeBox(fitting r: CGRect) -> CGRect {
+        let rig = rig
+        let xs = rig.badge.compactMap(\.first), ys = rig.badge.compactMap { $0.count > 1 ? $0[1] : nil }
+        guard let x0 = xs.min(), let x1 = xs.max(), let y0 = ys.min(), let y1 = ys.max(), x1 > x0, y1 > y0 else { return r }
+        let bw = CGFloat(x1 - x0), bh = CGFloat(y1 - y0)
+        let s = min(r.width / bw, r.height / bh)
+        let w = rig.size.width * s, h = rig.size.height * s
+        let midY = r.midY - CGFloat(y0 + y1) / 2 * s + h / 2
+        return CGRect(x: r.midX - CGFloat(x0 + x1) / 2 * s, y: midY - h / 2, width: w, height: h)
     }
 
     /// Поза в прямоугольник `box` (коробка рига вписана по ширине, по центру), сплющивание к середине, глитч:

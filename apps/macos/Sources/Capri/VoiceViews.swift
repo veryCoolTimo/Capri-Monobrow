@@ -7,18 +7,24 @@ struct VoiceLineView: View {
     var line: VoiceLine
 
     var body: some View {
-        let color: Color = switch line.phase {
-        case .listening: Palette.crimson
+        // Слушает — спокойный фиолетовый; малиновый — только тревога («не слышу») и ошибка.
+        let phaseColor: Color = switch line.phase {
+        case .listening: Palette.codex
         case .working: Palette.codex
         case .done: Palette.acid
         case .failed: Palette.crimson
         }
+        let color = line.alarm ? Palette.crimson : phaseColor
         HStack(spacing: 7) {
             Image(systemName: icon).font(.system(size: 9, weight: .bold)).foregroundColor(color)
+            let isNote = line.text.isEmpty && !line.note.isEmpty
             Text(shown)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(line.text.isEmpty ? Palette.dim : Palette.text)
-                .lineLimit(1).truncationMode(line.phase == .listening || line.phase == .working ? .head : .tail)
+                .font(.system(size: isNote ? 11 : 12, weight: isNote && line.alarm ? .semibold : .medium))
+                .minimumScaleFactor(isNote ? 0.8 : 1)
+                .layoutPriority(1)
+                .foregroundColor(!line.text.isEmpty ? Palette.text : line.alarm ? Palette.crimson
+                                 : line.note.isEmpty ? Palette.text.opacity(0.85) : Palette.codex)
+                .lineLimit(1).truncationMode(!isNote && (line.phase == .listening || line.phase == .working) ? .head : .tail)
             Spacer(minLength: 0)
             if !line.hint.isEmpty { Caps(line.hint, size: 8, color: Palette.dim).fixedSize() }
         }
@@ -27,7 +33,7 @@ struct VoiceLineView: View {
 
     private var icon: String {
         switch line.phase {
-        case .listening: "mic.fill"
+        case .listening: line.alarm ? "mic.slash.fill" : "mic.fill"
         case .working: "ellipsis"
         case .done: "checkmark"
         case .failed: "exclamationmark.triangle.fill"
@@ -36,23 +42,92 @@ struct VoiceLineView: View {
 
     private var shown: String {
         if !line.text.isEmpty { return line.text }
+        if !line.note.isEmpty { return line.note }
         return line.phase == .listening ? "слушаю…" : "…"
     }
 }
 
-/// Молния вдоль нижнего края notch, пока держат клавишу: прежняя розовая игольчатая (иглы `CapriFX.needles`) с
-/// фиолетовой тенью. Не бахрома по всему краю, а разряд, который бежит по кромке: короткий зигзаг с неровными
-/// коленями ползёт слева направо (~1.5 с на проход), громче — длиннее, шире и с веткой вниз. Каждый тик (12 fps)
-/// колени «кипят». `bottom` — y нижнего края, `down` — куда «вниз» (−1 в слоях AppKit, +1 в SwiftUI).
+/// Рот Capri рядом с глазами, пока она слушает: розовый зигзаг с фиолетовой тенью, колени — по громкости
+/// (`VoiceMouth`). Громкость читает сам по кадрам 12 fps (`level` — не публикуется); `tick`/`fixed` — для листа.
+struct VoiceMouthView: View {
+    var level: () -> Double
+    var fixedTick: Int? = nil
+
+    var body: some View {
+        if let t = fixedTick {
+            mouth(tick: t)
+        } else {
+            TimelineView(.periodic(from: .now, by: 1 / CapriFace.fps)) { ctx in
+                mouth(tick: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : Int(ctx.date.timeIntervalSinceReferenceDate * CapriFace.fps))
+            }
+        }
+    }
+
+    private func mouth(tick: Int) -> some View {
+        Canvas { g, size in
+            let r = CGRect(x: 1, y: 1, width: size.width - 2, height: size.height - 2)
+            let lv = level()
+            let pts = VoiceMouth.points(in: r, tick: tick, level: lv)
+            var p = Path()
+            p.addLines(pts)
+            // Тишина — ровная тусклая черта: голоса нет.
+            guard VoiceLevel.speaking(lv) else {
+                g.stroke(p, with: .color(Palette.codex.opacity(0.45)), style: StrokeStyle(lineWidth: 1.2, lineCap: .round))
+                return
+            }
+            g.stroke(p.offsetBy(dx: 0.8, dy: 1), with: .color(Palette.violet), style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .miter))
+            g.stroke(p, with: .color(Palette.crimson), style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .miter))
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// Лицо Capri в notch, пока идёт голос: мини-риг «значок» (`VoiceFace`) — слушает (зрачки крупнее), слышит
+/// (зрачки пульсируют с громкостью), не слышит (полувеко набок), думает (глаза вверх-вбок), ^^ / ><.
+struct VoiceFaceView: View {
+    var state: VoiceFace.State
+    var level: () -> Double
+    var fixedTick: Int? = nil
+
+    static func state(_ v: VoiceLine, heard: HearingWatch.Status?) -> VoiceFace.State {
+        switch v.phase {
+        case .listening: v.alarm ? .unsure : heard == .heard ? .hearing : .listening
+        case .working: .working
+        case .done: .done
+        case .failed: .failed
+        }
+    }
+
+    var body: some View {
+        if let t = fixedTick {
+            face(tick: t)
+        } else {
+            TimelineView(.periodic(from: .now, by: 1 / CapriFace.fps)) { ctx in
+                face(tick: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 5 : Int(ctx.date.timeIntervalSinceReferenceDate * CapriFace.fps))
+            }
+        }
+    }
+
+    private func face(tick: Int) -> some View {
+        Canvas { g, size in
+            let pose = VoiceFace.pose(state, level: level(), tick: tick)
+            RigArt.draw(pose, in: RigArt.badgeBox(fitting: CGRect(origin: .zero, size: size)), g)
+        }
+        .accessibilityLabel(Text("Capri слушает"))
+    }
+}
+
+/// Молния вдоль нижнего края notch, пока она слышит голос (выше порога `VoiceLevel.heard`; в тишине её нет):
+/// розовая игольчатая (иглы `CapriFX.needles`) с фиолетовой тенью. Растёт из-под её лица (слева) вправо:
+/// громче — длиннее, шире и с веткой вниз. Каждый тик (12 fps) колени «кипят», форма меняется раз в 3 кадра. `bottom` — y нижнего края, `down` — куда «вниз» (−1 в слоях AppKit, +1 в SwiftUI).
 enum VoiceBolt {
     static func points(left: CGFloat, right: CGFloat, bottom: CGFloat, down: CGFloat, tick: Int, level: Double) -> [CGPoint] {
         let lv = CGFloat(max(0, min(1, level)))
         let span = right - left
-        let len = span * (0.28 + 0.3 * lv)
-        // Голова бежит по кромке; за краем — заходит с другой стороны.
-        let head = CGFloat((tick % 18)) / 18
-        let x0 = left - len + (span + len) * head
-        let seed = 31 + tick / 18
+        // Разряд привязан к ней: начинается под глазами/ртом (слева) и тянется вправо — громче, длиннее.
+        let len = span * (0.3 + 0.45 * lv)
+        let x0 = left + span * 0.02
+        let seed = 31 + tick / 3
         let n = 6 + Int(TickNoise.hash(seed, 3) % 3)
         let amp = 1.5 + 6 * lv
         var pts: [CGPoint] = []
@@ -90,18 +165,27 @@ enum VoiceBolt {
 /// Контактный лист голоса в notch (`scene sheet voice` в `--debug-control`): форма peek, глаза, строка и молния —
 /// те же виды и пути, что в живом notch, по кадрам 12 fps.
 enum VoiceSheet {
-    struct Frame { var line: VoiceLine; var tick: Int; var level: Double; var label: String }
+    struct Frame { var line: VoiceLine; var tick: Int; var level: Double; var label: String; var heard: HearingWatch.Status? = nil }
 
     static let frames: [Frame] = [
-        Frame(line: VoiceLine(phase: .listening, text: ""), tick: 2, level: 0.05, label: "нажали, тишина"),
-        Frame(line: VoiceLine(phase: .listening, text: "Капри, напомни"), tick: 7, level: 0.45, label: "говорит"),
-        Frame(line: VoiceLine(phase: .listening, text: "Капри, напомни через 20 минут"), tick: 11, level: 0.9, label: "громко"),
+        Frame(line: VoiceLine(phase: .listening, text: ""), tick: 2, level: 0.05, label: "держат, тишина"),
+        Frame(line: VoiceLine(phase: .listening, text: "Капри, напомни"), tick: 7, level: 0.45, label: "говорит", heard: .heard),
+        Frame(line: VoiceLine(phase: .listening, text: "Капри, напомни через 20 минут"), tick: 11, level: 0.9, label: "громко", heard: .heard),
         Frame(line: VoiceLine(phase: .listening, text: "Капри, напомни через двадцать минут проверить, собрался ли деплой на quiz"),
-              tick: 15, level: 0.3, label: "длинная фраза"),
+              tick: 15, level: 0.12, label: "длинная фраза, пауза", heard: .heard),
+        Frame(line: VoiceLine(phase: .listening, text: "", note: "«USB Mic» не подключён — слушаю встроенный"), tick: 4, level: 0.12,
+              label: "выбранного нет"),
+        Frame(line: VoiceLine(phase: .listening, text: "", note: HearingWatch.quietText, alarm: true), tick: 9, level: 0.1,
+              label: "звук есть, тихо 1.5 с", heard: .quiet),
+        Frame(line: VoiceLine(phase: .listening, text: "", note: HearingWatch.deadText, alarm: true), tick: 9, level: 0,
+              label: "кусков нет 2.5 с", heard: .dead),
         Frame(line: VoiceLine(phase: .working, text: "Капри, напомни через 20 минут проверить деплой"), tick: 12, level: 0, label: "отпустили"),
         Frame(line: VoiceLine(phase: .done, text: "Напомню в 15:20: «проверить деплой»"), tick: 13, level: 0, label: "итог"),
         Frame(line: VoiceLine(phase: .done, text: "▶ ищу «Daft Punk»…"), tick: 14, level: 0, label: "музыка"),
-        Frame(line: VoiceLine(phase: .failed, text: "Нет модели речи — Настройки → Голос"), tick: 15, level: 0, label: "ошибка"),
+        Frame(line: VoiceLine(phase: .failed, text: "Не расслышала — держи ⌃⌥Пробел"), tick: 15, level: 0,
+              label: "пусто"),
+        Frame(line: VoiceLine(phase: .failed, text: "Микрофон отключился — Настройки → Голос"), tick: 15, level: 0,
+              label: "вход пропал"),
     ]
 
     static let size = CGSize(width: 360, height: 92)
@@ -123,9 +207,17 @@ enum VoiceSheet {
         }
         .padding(10)
         .background(Color(white: 0.55))
+        let assistant = VStack(spacing: 8) {
+            assistantCell(voice: nil, hint: true, text: "", level: 0, label: "помощник по тапу: подсказка")
+            assistantCell(voice: frames[1].line, hint: true, text: "Капри, напомни", level: 0.6, label: "держат при открытом помощнике")
+            assistantCell(voice: frames[5].line, hint: true, text: "", level: 0.02, label: "помощник: не слышу")
+            assistantCell(voice: nil, hint: false, text: "", level: 0, label: "после 3 раз — без подсказки")
+        }
+        .padding(10).background(Color(white: 0.55))
         for (name, view, scale) in [("scene-voice.png", AnyView(grid), 2.0),
-                                    ("scene-voice-detail.png", AnyView(VStack(spacing: 8) { cell(frames[2]); cell(frames[3]) }
-                                        .padding(10).background(Color(white: 0.55))), 3.0)] {
+                                    ("scene-voice-detail.png", AnyView(VStack(spacing: 8) { cell(frames[0]); cell(frames[2]); cell(frames[5]); cell(frames[7]) }
+                                        .padding(10).background(Color(white: 0.55))), 3.0),
+                                    ("scene-voice-assistant.png", AnyView(assistant), 2.0)] {
             let r = ImageRenderer(content: view)
             r.scale = scale
             guard let cg = r.cgImage else { continue }
@@ -148,14 +240,16 @@ enum VoiceSheet {
                 .fill(Color.black)
             Path(dropPath(CGRect(x: left, y: 0, width: w, height: h), top: 8, bottom: 16, flipped: true))
                 .stroke(Palette.crimson.opacity(0.55), lineWidth: 1)
-            // Вырез камеры.
-            RoundedRectangle(cornerRadius: 8).fill(Color(white: 0.02)).frame(width: 180, height: top - 2)
-                .offset(x: (size.width - 180) / 2, y: 0)
-            CapriMaskSprite(mood: f.line.phase == .listening ? .listening : .idle, active: false)
+            // Вырез камеры — чёрный, как настоящий (на экране его не видно).
+            VoiceFaceView(state: VoiceFaceView.state(f.line, heard: f.heard), level: { f.level }, fixedTick: f.tick)
                 .frame(width: 32, height: 16).offset(x: left + 13, y: (top - 16) / 2)
+            if f.line.phase == .listening {
+                VoiceMouthView(level: { f.level }, fixedTick: f.tick).frame(width: 20, height: 12)
+                    .offset(x: left + 13 + 32 + 4, y: (top - 12) / 2)
+            }
             VoiceLineView(line: f.line).padding(.horizontal, 18)
                 .frame(width: w, height: h - top - 3).offset(x: left, y: top)
-            if f.line.phase == .listening {
+            if f.line.phase == .listening, VoiceLevel.speaking(f.level) {
                 let p = VoiceBolt.paths(left: left + 14, right: left + w - 14, bottom: h, down: 1, tick: f.tick, level: f.level)
                 p.main.offsetBy(dx: 1.2, dy: 1.5).fill(Palette.violet)
                 p.main.fill(Palette.crimson)
@@ -167,6 +261,43 @@ enum VoiceSheet {
             Text(f.label).font(.mono(8)).foregroundColor(.white.opacity(0.6)).offset(x: 6, y: size.height - 14)
         }
         .frame(width: size.width, height: size.height)
+        .environment(\.colorScheme, .dark)
+    }
+
+    /// Нижняя часть помощника (поле, строка голоса, подсказки) — те же виды, что в `AssistantView`.
+    @MainActor
+    static func assistantCell(voice: VoiceLine?, hint: Bool, text: String, level: Double, label: String) -> some View {
+        let w: CGFloat = 460, h: CGFloat = 104
+        return ZStack(alignment: .topLeading) {
+            Color(red: 0.16, green: 0.17, blue: 0.2)
+            Path(dropPath(CGRect(x: 0, y: 0, width: w, height: h - 8), top: 8, bottom: 16, flipped: true)).fill(Color.black)
+            HStack(alignment: .bottom, spacing: 10) {
+                CapriSprite(mood: voice != nil ? .listening : .idle, active: false).frame(width: 112, height: 56)
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        Text(">").font(.mono(13, .bold)).foregroundColor(Palette.codex)
+                        Text(text.isEmpty ? "спроси Capri: что ждёт? ответь… включи …" : text).font(.system(size: 12.5))
+                            .foregroundColor(text.isEmpty ? Palette.dim : Palette.text).lineLimit(1)
+                        Spacer(minLength: 0)
+                        if voice != nil {
+                            VoiceMouthView(level: { level }, fixedTick: 7).frame(width: 20, height: 12)
+                        }
+                    }
+                    .padding(.horizontal, 9).padding(.vertical, 7)
+                    .hud(stroke: Palette.codex.opacity(0.85), fill: Color.black.opacity(0.55), cut: 7)
+                    AssistantVoiceRow(voice: voice, hint: hint)
+                    HStack(spacing: 8) { Caps("⏎ спросить", size: 7.5); Caps("esc закрыть", size: 7.5); Spacer() }
+                }
+            }
+            .padding(.horizontal, 14).padding(.bottom, 8).frame(width: w, height: h - 8, alignment: .bottom)
+            if voice != nil, VoiceLevel.speaking(level) {
+                let p = VoiceBolt.paths(left: 14, right: w - 14, bottom: h - 8, down: 1, tick: voice?.alarm == true ? 3 : 9, level: level)
+                p.main.offsetBy(dx: 1.2, dy: 1.5).fill(Palette.violet)
+                p.main.fill(Palette.crimson)
+            }
+            Text(label).font(.mono(8)).foregroundColor(.white.opacity(0.6)).offset(x: w - 230, y: 6)
+        }
+        .frame(width: w, height: h + 10)
         .environment(\.colorScheme, .dark)
     }
 

@@ -46,7 +46,8 @@ enum CapriArt {
             if p >= 9.1 && p < 10.1 { return .lookRight }
             return blinking(4.3) ? .blink : .open
         case .listening:
-            return blinking(5.2) ? .blink : .lookRight
+            // Слушает — смотрит прямо на того, кто говорит (не по сторонам), изредка моргает.
+            return blinking(5.2) ? .blink : .open
         case .thinking:
             guard !still else { return .slits }
             return t.truncatingRemainder(dividingBy: 1.6) < 0.8 ? .slits : .squint
@@ -191,13 +192,15 @@ struct ShowArt {
         let calm = clip("look").total * 3, k = tick % (calm + alert.total)
         let i: Int? = switch mood {
         case .idle: k < calm ? clip("look").frame(at: k, loop: true) : alert.frame(at: k - calm, loop: false)
-        case .listening: clip("look").frame(at: tick, loop: true)
+        // Слушает — открытые глаза прямо на человека, моргание раз в ~5 с (не «рассматривает» по сторонам).
+        case .listening: nil
         case .speaking: clip("talk").frame(at: tick, loop: true)
         case .thinking: clip("slits").frame(at: since, loop: false)
         case .alert: alert.frame(at: since, loop: true)
         case .error: clip(clips["crazy"] != nil ? "crazy" : "slits").frame(at: since, loop: clips["crazy"] != nil)
         case .vibing: nil
         }
+        if mood == .listening { return (Double(tick) / fps).truncatingRemainder(dividingBy: 5.2) < 0.16 ? shut : open }
         return i.map { images[$0] }
     }
 

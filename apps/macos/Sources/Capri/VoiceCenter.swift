@@ -27,7 +27,17 @@ final class VoiceCenter: ObservableObject {
     var debugLog = false
 
     let helper = AsrHelper()
+    /// Входы звука для настроек и выбора при нажатии.
+    let mics = MicDevices()
     private let mic = MicCapture()
+    /// «Не слышу»: с начала фразы; громкость для рта/молнии — пик кусков между кадрами 12 fps.
+    private var hearing: HearingWatch?
+    private var levelPeak = 0.0
+    private var levelTimer: Timer?
+    /// Вход взяли не выбранный (выбранного нет) — строка в notch, пока нет текста.
+    private var micNote = ""
+    /// Отладка `voice file`: финал в журнал, без notch и без команд.
+    private var probe = false
     private var ptt = PushToTalk()
     private var holdWork: DispatchWorkItem?
     /// Предохранитель: держат дольше `PushToTalk.maxHold` (залипла клавиша, потерялось отпускание).
@@ -38,9 +48,14 @@ final class VoiceCenter: ObservableObject {
     private var phraseOpen = false
     private var finalWork: DispatchWorkItem?
     private var hideWork: DispatchWorkItem?
-    /// Звук до начала фразы (пока не решили, что это удержание) — на очереди микрофона.
-    private var pending: [Float] = []
+    /// Звук идёт в хелпер (на очереди микрофона): между `begin` и `end`.
     private var streaming = false
+    /// Что открыто сейчас: UID входа (для «пропал — взять другой») и Bluetooth ли он (терпение «не слышу»).
+    private var openUID: String?
+    private var openSlow = false
+    /// Фраза с микрофона (а не отладочный wav) — считается в подсказку «держи ⌃⌥Пробел».
+    private var countsForHint = false
+    private var hintWatch: AnyCancellable?
     /// Ждём финальный текст хелпера.
     private var awaitingFinal = false
     /// Фраза пришла из отладочного wav (не с микрофона).
@@ -61,7 +76,22 @@ final class VoiceCenter: ObservableObject {
         helper.onExit = { [weak self] idle in self?.helperExited(idle: idle) }
         helper.log = { [weak self] in self?.log($0) }
         mic.onAudio = { [weak self] pcm, level in self?.audio(pcm, level) }
+        mic.onLost = { [weak self] why in self?.micLost(why) }
         refreshModel()
+        updateHint()
+        // Голос или клавишу выключили/включили в настройках — подсказка сразу (`@Published` шлёт новое значение
+        // до записи — берём из аргументов).
+        hintWatch = settings.$voice.combineLatest(settings.$assistantHotKey).dropFirst().sink { [weak self] voice, hotKey in
+            guard let self else { return }
+            let on = VoiceHint.show(voiceOn: voice && hotKey, successes: self.settings.voiceSuccesses)
+            DispatchQueue.main.async { if self.notch.ui.voiceHint != on { self.notch.ui.voiceHint = on } }
+        }
+    }
+
+    /// Подсказка «держи ⌃⌥Пробел» в помощнике — пока голосом не пользовались 3 раза.
+    func updateHint() {
+        let on = VoiceHint.show(voiceOn: settings.voice && settings.assistantHotKey, successes: settings.voiceSuccesses)
+        if notch.ui.voiceHint != on { notch.ui.voiceHint = on }
     }
 
     // MARK: модель
@@ -153,7 +183,7 @@ final class VoiceCenter: ObservableObject {
 
     /// ⌃⌥Space нажали.
     func press() {
-        guard settings.voice else { notch.toggleAssistant(); return }
+        guard settings.voice else { updateHint(); notch.toggleAssistant(); return }
         for a in ptt.press(at: now) { act(a) }
     }
 
@@ -168,7 +198,6 @@ final class VoiceCenter: ObservableObject {
     private func act(_ a: PushToTalk.Action) {
         switch a {
         case .prepare:
-            mic.queue.async { self.pending.removeAll(); self.streaming = false }
             // Микрофон и модель — только когда точно держат (не на тап): иначе каждое открытие помощника зажигает
             // оранжевую точку, переключает AirPods в гарнитуру и поднимает ~180 МБ модели. Помощник уже открыт —
             // тогда, скорее всего, будут говорить: модель можно греть сразу.
@@ -182,6 +211,7 @@ final class VoiceCenter: ObservableObject {
         case .tap:
             holdWork?.cancel()
             stopMic(discard: true)
+            updateHint()
             notch.toggleAssistant()
         case .listen:
             holdWork?.cancel()
@@ -217,6 +247,7 @@ final class VoiceCenter: ObservableObject {
         phraseOpen = false
         awaitingFinal = false
         finalWork?.cancel()
+        probe = false
     }
 
     /// Сон, экран погас, сменился пользователь: отпускание клавиши может не прийти — фразу забыть сейчас.
@@ -232,9 +263,9 @@ final class VoiceCenter: ObservableObject {
     /// Держат: проверить, что всё есть, и начать фразу.
     private func listen() {
         if MicCapture.permission == .notDetermined {
-            show(.failed, "Разрешите Capri микрофон — и держите ⌃⌥Space снова")
+            show(.failed, "Разреши Capri микрофон — и держи ⌃⌥Пробел снова")
             MicCapture.requestPermission { [weak self] ok in
-                self?.show(ok ? .done : .failed, ok ? "Готово — держите ⌃⌥Space и говорите" : "Без микрофона голоса не будет")
+                self?.show(ok ? .done : .failed, ok ? "Готово — держи ⌃⌥Пробел и говори" : "Без микрофона голоса не будет")
                 self?.hide(after: 3)
             }
             ptt.reset()
@@ -248,43 +279,133 @@ final class VoiceCenter: ObservableObject {
         refreshModel()
         guard let path = modelPath else { fail("Нет модели речи — Настройки → Голос"); return }
         guard helper.start(model: path) else { fail("Распознавание не запустилось"); return }
-        if !mic.running, let why = mic.start() { fail("Микрофон: \(why)"); return }
+        mics.refresh()
+        let choice = MicChoice.resolve(MicPreference(stored: settings.voiceMic), devices: mics.devices,
+                                       savedName: settings.voiceMicName.isEmpty ? nil : settings.voiceMicName)
+        micNote = choice.note ?? ""
+        if let n = choice.note { log("voice mic: \(n)") }
+        // Notch «слушает» сразу, микрофон включается следом (Bluetooth — до секунды, на очереди микрофона).
         beginPhrase()
+        countsForHint = true
         mic.queue.async {
             self.helper.send(.audio(Self.preSilence))
-            if !self.pending.isEmpty { self.helper.send(.audio(self.pending)) }
-            self.pending.removeAll()
             self.streaming = true
         }
+        openMic(choice.pick)
+    }
+
+    private func openMic(_ pick: MicChoice.Pick) {
+        let id = phrase
+        let def = MicDevices.defaultInput()
+        openUID = MicChoice.uid(pick, defaultUID: def)
+        openSlow = MicChoice.slow(pick, devices: mics.devices, defaultUID: def)
+        hearing = HearingWatch(start: now, slow: openSlow)
+        mic.start(pick) { [weak self] why in
+            guard let self, let why else { return }
+            self.log("voice mic: не открылся (\(why))")
+            guard id == self.phrase, self.phraseOpen, !self.awaitingFinal else { return }
+            self.ptt.reset()
+            self.abortPhrase()
+            self.fail("Микрофон: \(why) — Настройки → Голос")
+        }
+    }
+
+    /// Вход пропал (или встал) посреди фразы: ушедший выкинуть из списка, взять встроенный → системный → любой
+    /// и слушать дальше; в notch — что случилось.
+    private func micLost(_ why: String) {
+        guard phraseOpen, !awaitingFinal else { return }
+        log("voice mic: \(why) — беру другой")
+        let lost = openUID
+        mic.stop()
+        mics.refresh()
+        guard let choice = MicChoice.fallback(lost: lost, devices: mics.devices, defaultUID: MicDevices.defaultInput(), why: why) else {
+            ptt.reset()
+            abortPhrase()
+            fail("Микрофон \(why) — Настройки → Голос")
+            return
+        }
+        micNote = choice.note ?? ""
+        startLevels()
+        show(.listening, lastHeard, note: micNote)
+        openMic(choice.pick)
     }
 
     private func beginPhrase() {
         lastHeard = ""
         awaitingFinal = false
         finalWork?.cancel()
+        probe = false
+        countsForHint = false
         phrase += 1
         phraseOpen = true
         helper.send(.begin(language: nil))
-        show(.listening, "")
+        show(.listening, "", note: micNote)
         notch.voiceListening(true)
+        startLevels()
         log("voice listen")
+    }
+
+    /// 12 fps, пока слушаем: громкость для рта и молнии (пик кусков, плавно), «не слышу»/«тихо» (`HearingWatch`),
+    /// захват встал после голоса — как потеря входа.
+    private func startLevels() {
+        hearing = HearingWatch(start: now, slow: openSlow)
+        levelPeak = 0
+        notch.ui.voiceLevel = 0
+        levelTimer?.invalidate()
+        let t = Timer(timeInterval: 1 / CapriFace.fps, repeats: true) { [weak self] _ in self?.levelTick() }
+        RunLoop.main.add(t, forMode: .common)
+        levelTimer = t
+    }
+
+    private func stopLevels() {
+        levelTimer?.invalidate()
+        levelTimer = nil
+        hearing = nil
+        notch.ui.voiceLevel = 0
+        notch.ui.voiceHeard = nil
+    }
+
+    private func levelTick() {
+        notch.ui.voiceLevel = VoiceLevel.smooth(notch.ui.voiceLevel, levelPeak)
+        levelPeak = 0
+        guard let h = hearing, let v = notch.ui.voice, v.phase == .listening else { return }
+        let t = now
+        if mic.running, h.stalled(at: t) {
+            log("voice: звук перестал приходить (кусков \(h.chunks))")
+            mic.reportStall()
+            return
+        }
+        let st = h.status(at: t)
+        if notch.ui.voiceHeard != st { notch.ui.voiceHeard = st }
+        let alarm = HearingWatch.text(st)
+        if let alarm, v.note != alarm {
+            log("voice: \(st == .dead ? "микрофон молчит" : "тихо") (кусков \(h.chunks), пик \(String(format: "%.2f", h.peak)))")
+            show(.listening, v.text, note: alarm, alarm: true)
+        } else if alarm == nil, v.alarm {
+            show(.listening, v.text, note: micNote)
+        }
+    }
+
+    /// Громкость куска (главная очередь).
+    private func heardLevel(_ level: Double, seconds: Double) {
+        levelPeak = max(levelPeak, level)
+        hearing?.feed(level: level, at: now, seconds: seconds)
     }
 
     /// Звук с микрофона (очередь микрофона).
     private func audio(_ pcm: [Float], _ level: Double) {
-        if streaming { helper.send(.audio(pcm)) } else {
-            pending.append(contentsOf: pcm)
-            // До решения «удержание» — не больше 2 с.
-            if pending.count > 32_000 { pending.removeFirst(pending.count - 32_000) }
-        }
-        DispatchQueue.main.async { self.notch.ui.voiceLevel = level }
+        if streaming { helper.send(.audio(pcm)) }
+        let sec = Double(pcm.count) / 16_000
+        DispatchQueue.main.async { self.heardLevel(level, seconds: sec) }
     }
 
     /// Отпустили: дослать звук, финал.
     private func finish() {
+        let watch = hearing
         stopMic(discard: false)
         notch.voiceListening(false)
         guard phraseOpen else { return }   // не дошли до `begin` (ошибка, разрешение)
+        if let w = watch { log("voice: голос \(w.heardAt.map { String(format: "через %.1f с", $0 - w.start) } ?? "не услышан"), кусков \(w.chunks), пик \(String(format: "%.2f", w.peak))") }
         mic.queue.async {
             // Хвост после отпускания — короткая тишина: модель дописывает последнее слово.
             self.helper.send(.audio([Float](repeating: 0, count: 4_000)))
@@ -298,7 +419,7 @@ final class VoiceCenter: ObservableObject {
             self.awaitingFinal = false
             if self.phraseOpen, self.helper.running { self.helper.send(.cancel) }
             self.phraseOpen = false
-            self.fail(self.helper.state == .loading ? "Модель ещё грузится — попробуйте через пару секунд" : "Распознавание не ответило")
+            self.fail(self.helper.state == .loading ? "Модель ещё грузится — попробуй через пару секунд" : "Распознавание не ответило")
         }
         finalWork = work
         // Первая загрузка модели — до 6 с; финал обычно за 30 мс.
@@ -306,9 +427,12 @@ final class VoiceCenter: ObservableObject {
     }
 
     private func stopMic(discard: Bool) {
-        mic.stop()
-        notch.ui.voiceLevel = 0
-        if discard { mic.queue.async { self.pending.removeAll(); self.streaming = false } }
+        mic.stop { [weak self] st in
+            guard st.seconds > 0 || !st.device.isEmpty else { return }
+            self?.log("voice mic: \(st.device) · \(st.format.isEmpty ? "звука нет" : st.format) · \(String(format: "%.1f", st.seconds)) с, пик \(String(format: "%.2f", st.peak))\(st.formatChanges > 0 ? ", формат менялся \(st.formatChanges)×" : "")")
+        }
+        stopLevels()
+        if discard { mic.queue.async { self.streaming = false } }
     }
 
     // MARK: хелпер
@@ -318,7 +442,7 @@ final class VoiceCenter: ObservableObject {
         case .partial(let t):
             lastHeard = t
             guard let v = notch.ui.voice, v.phase == .listening || v.phase == .working else { return }
-            show(v.phase, t, hint: v.hint)
+            show(v.phase, t, hint: v.hint, note: v.note, alarm: v.alarm)
             if notch.state == .assistant { notch.ui.assistantText = t }
         case .final(let t, _):
             guard awaitingFinal else { return }
@@ -327,6 +451,11 @@ final class VoiceCenter: ObservableObject {
             finalWork?.cancel()
             lastHeard = t
             log("voice final (\(t.count) зн.)")
+            if probe {
+                probe = false
+                log("voice file final: «\(t)»")
+                return
+            }
             route(t)
         case .error(let m):
             log("asr error: \(m)")
@@ -346,7 +475,7 @@ final class VoiceCenter: ObservableObject {
         phraseOpen = false
         ptt.reset()
         abortPhrase()
-        fail(idle ? "Распознавание как раз выгружалось — держите ⌃⌥Space ещё раз" : "Распознавание упало — держите ⌃⌥Space ещё раз")
+        fail(idle ? "Распознавание как раз выгружалось — держи ⌃⌥Пробел ещё раз" : "Распознавание упало — держи ⌃⌥Пробел ещё раз")
     }
 
     /// Ответ относится к фразе `id` (не к следующей).
@@ -364,15 +493,19 @@ final class VoiceCenter: ObservableObject {
         let intent = VoiceIntent.parse(text, sessions: names, musicKnown: notch.ui.music != nil)
         let id = phrase
         log("voice intent \(Self.describe(intent))")
+        if countsForHint, intent != .empty, settings.voiceSuccesses < VoiceHint.enough {
+            settings.voiceSuccesses += 1
+            updateHint()
+        }
         let said = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let needsChat: Bool = { switch intent { case .search, .reply, .assistant: return true; default: return false } }()
         if needsChat, codex.chatBusy {
-            fail("Capri ещё отвечает на прошлый вопрос — скажите чуть позже")
+            fail("Capri ещё отвечает на прошлый вопрос — скажи чуть позже")
             return
         }
         switch intent {
         case .empty:
-            fail("Не расслышала")
+            fail("Не расслышала — держи ⌃⌥Пробел")
         case .music(let cmd):
             show(.working, CodexService.musicStarting(cmd))
             if let onMusic {
@@ -471,14 +604,14 @@ final class VoiceCenter: ObservableObject {
 
     // MARK: notch
 
-    private func show(_ phase: VoiceLine.Phase, _ text: String, hint: String = "") {
+    private func show(_ phase: VoiceLine.Phase, _ text: String, hint: String = "", note: String = "", alarm: Bool = false) {
         hideWork?.cancel()
         // Помощник открыт — строки peek не видно: итог (записала, напомню, музыка) — его репликой в разговоре.
         if notch.state == .assistant, phase == .done || phase == .failed {
             if notch.ui.assistantText == lastHeard { notch.ui.assistantText = "" }
             codex.remark(text)
         }
-        notch.voiceShow(VoiceLine(phase: phase, text: text, hint: hint))
+        notch.voiceShow(VoiceLine(phase: phase, text: text, hint: hint, note: note, alarm: alarm))
     }
 
     private func fail(_ text: String) {
@@ -523,7 +656,7 @@ final class VoiceCenter: ObservableObject {
                 guard i < pcm.count else {
                     t.invalidate()
                     self.wavTimer = nil
-                    self.notch.ui.voiceLevel = 0
+                    self.stopLevels()
                     self.notch.voiceListening(false)
                     self.helper.send(.audio([Float](repeating: 0, count: 4_000)))
                     self.helper.send(.end)
@@ -533,12 +666,39 @@ final class VoiceCenter: ObservableObject {
                 }
                 let chunk = Array(pcm[i..<min(i + 1600, pcm.count)])
                 i += 1600
-                var sum: Float = 0
-                for v in chunk { sum += v * v }
-                let db = 20 * log10(max(1e-6, Double((sum / Float(max(1, chunk.count))).squareRoot())))
-                self.notch.ui.voiceLevel = max(0, min(1, (db + 50) / 40))
+                self.heardLevel(VoiceLevel.level(chunk), seconds: Double(chunk.count) / 16_000)
                 self.helper.send(.audio(chunk))
             }
+        case "file":
+            // `voice file <путь>` — любой звук (24/48 кГц, стерео, Int16/Float32) через тот же `PcmResampler`, что
+            // микрофон, в хелпер; финал — только в журнал (без notch и без команд).
+            let url = URL(fileURLWithPath: (rest as NSString).expandingTildeInPath)
+            // Не во время живой фразы: иначе её финал ушёл бы только в журнал.
+            guard !phraseOpen, !awaitingFinal else { log("voice file: идёт фраза — позже"); return }
+            guard let (pcm, desc) = Self.resample(file: url) else { log("voice file: не прочитался"); return }
+            refreshModel()
+            guard let path = modelPath, helper.start(model: path) else { log("voice file: нет модели"); return }
+            log("voice file: \(desc) → \(pcm.count) кадров 16 кГц (\(String(format: "%.2f", Double(pcm.count) / 16_000)) с), пик \(String(format: "%.2f", pcm.map(abs).max() ?? 0))")
+            phrase += 1
+            phraseOpen = true
+            probe = true
+            lastHeard = ""
+            helper.send(.begin(language: nil))
+            helper.send(.audio(Self.preSilence))
+            var i = 0
+            while i < pcm.count { helper.send(.audio(Array(pcm[i..<min(i + 1600, pcm.count)]))); i += 1600 }
+            helper.send(.audio([Float](repeating: 0, count: 4_000)))
+            helper.send(.end)
+            awaitingFinal = true
+            // Финал не пришёл — не оставлять `probe`/фразу висеть (иначе следующая живая фраза уйдёт в журнал).
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.awaitingFinal, self.probe else { return }
+                self.log("voice file: финал не пришёл")
+                self.abortPhrase()
+            }
+            finalWork?.cancel()
+            finalWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
         case "say":
             route(rest)
         case "parse":
@@ -559,6 +719,22 @@ final class VoiceCenter: ObservableObject {
         }
     }
 
+    /// Файл в родном формате кусками по 100 мс (как приходит с входа) → `PcmResampler` → 16 кГц.
+    static func resample(file url: URL, int16: Bool = false) -> ([Float], String)? {
+        guard let f = try? AVAudioFile(forReading: url, commonFormat: int16 ? .pcmFormatInt16 : .pcmFormatFloat32, interleaved: int16) else { return nil }
+        let fmt = f.processingFormat
+        let r = PcmResampler()
+        var out: [Float] = []
+        let step = AVAudioFrameCount(max(160, fmt.sampleRate / 10))
+        while f.framePosition < f.length {
+            guard let b = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: step), (try? f.read(into: b, frameCount: step)) != nil,
+                  b.frameLength > 0 else { break }
+            out += r.convert(b)
+        }
+        out += r.flush()
+        return (out, MicCapture.describe(fmt))
+    }
+
     var dump: [String: Any] {
         var m = "missing"
         switch model {
@@ -568,7 +744,8 @@ final class VoiceCenter: ObservableObject {
         case .failed(let e): m = "failed: \(e)"
         }
         return ["enabled": settings.voice, "helper": AsrHelper.binary != nil, "running": helper.running, "state": "\(helper.state)",
-                "model": m, "mic": MicCapture.permission.rawValue, "micRunning": mic.running, "line": notch.ui.voice?.text ?? "",
+                "model": m, "mic": MicCapture.permission.rawValue, "micRunning": mic.running, "micChoice": settings.voiceMic,
+                "inputs": mics.devices.count, "hint": notch.ui.voiceHint, "successes": settings.voiceSuccesses, "line": notch.ui.voice?.text ?? "",
                 "phase": notch.ui.voice.map { "\($0.phase)" } ?? "", "automation": automation.name]
     }
 }

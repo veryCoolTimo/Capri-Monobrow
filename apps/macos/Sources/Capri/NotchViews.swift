@@ -40,8 +40,13 @@ final class NotchUI: ObservableObject {
     @Published var characterHidden = false
     /// Голос (push-to-talk): что показывает строка peek; nil — голоса нет.
     @Published var voice: VoiceLine?
-    /// Громкость микрофона 0…1 — для молнии вдоль notch. Не публикуется: её читает таймер молнии, не SwiftUI.
+    /// Громкость микрофона 0…1 (сглаженная, 12 fps) — для молнии вдоль notch и рта. Не публикуется: её читают
+    /// таймер молнии и `TimelineView` рта, не SwiftUI.
     var voiceLevel: Double = 0
+    /// Подсказка в помощнике «держи ⌃⌥Пробел — скажи голосом» (пока голосом не пользовались 3 раза).
+    @Published var voiceHint = false
+    /// Слышит ли она голос (меняется только при смене состояния) — для лица в notch.
+    @Published var voiceHeard: HearingWatch.Status?
 }
 
 /// Строка голоса в notch.
@@ -60,6 +65,10 @@ struct VoiceLine: Equatable {
     var text: String
     /// Мелкая подпись справа (`⌃⌥Space`, «⌘⏎ отправить»).
     var hint: String = ""
+    /// Пока текста нет — вместо «слушаю…»: какой вход взяли вместо выбранного, «не слышу — проверь микрофон».
+    var note: String = ""
+    /// `note` — тревога («не слышу»): малиновым.
+    var alarm = false
 }
 
 /// Включён ли слой notch. Скрытый слой (свёрнутый notch) снимает содержимое целиком — вместе с подписками
@@ -250,11 +259,21 @@ struct TopRowView: View {
         HStack(spacing: 0) {
             // Слушает голос — выше всего: человек прямо сейчас говорит с ней.
             let listening = ui.voice?.phase == .listening
-            CapriFace(mood: listening ? .listening : waiting > 0 ? .alert : codex.chatBusy ? .thinking : vibing ? .vibing : .idle, style: .mask)
+            Group {
+                if let v = ui.voice {
+                    // Голос: лицо само показывает, что слушает, слышит, не слышит, думает (мини-риг «значок»).
+                    VoiceFaceView(state: VoiceFaceView.state(v, heard: ui.voiceHeard), level: { [ui] in ui.voiceLevel })
+                } else {
+                    CapriFace(mood: waiting > 0 ? .alert : codex.chatBusy ? .thinking : vibing ? .vibing : .idle, style: .mask)
+                }
+            }
                 .frame(width: 32, height: 16)
                 .opacity(ui.faceAway || ui.sweep != nil ? 0 : 1)
                 .help("Capri — спросить (⌃⌥Space)")
-            if vibing {
+            if listening {
+                // Рот: зигзаг по громкости, сразу справа от глаз.
+                VoiceMouthView(level: { [ui] in ui.voiceLevel }).frame(width: 20, height: 12).padding(.leading, 4)
+            } else if vibing {
                 EqualizerBars(color: Palette.crimson, animating: true, height: 9).padding(.leading, 4)
             }
             Spacer(minLength: ui.hasNotch ? notchWidth : 8)

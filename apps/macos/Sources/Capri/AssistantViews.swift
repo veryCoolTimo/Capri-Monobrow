@@ -74,7 +74,8 @@ struct AssistantView: View {
 
     var body: some View {
         let waiting = store.waiting.count
-        let mood = assistantMood(codex: codex, waiting: waiting, typing: !ui.assistantText.isEmpty)
+        let voice = ui.voice?.phase == .listening ? ui.voice : nil
+        let mood = voice != nil ? .listening : assistantMood(codex: codex, waiting: waiting, typing: !ui.assistantText.isEmpty)
         VStack(alignment: .leading, spacing: 0) {
             Bubble(codex: codex, store: store, shown: ui.assistantShown)
                 .padding(.leading, 6)
@@ -90,12 +91,14 @@ struct AssistantView: View {
                             .textFieldStyle(.plain).font(.system(size: 12.5))
                             .focused($focused)
                             .onSubmit(send)
-                        Image(systemName: "mic").font(.system(size: 11))
-                            .foregroundColor(Palette.dim.opacity(0.8))
-                            .help("Голос: держите ⌃⌥Space и говорите, отпустите — Capri выполнит")
+                        // Значок микрофона не кликается — не рисуем (голос — удержанием ⌃⌥Пробел, подсказка ниже).
+                        if voice != nil {
+                            VoiceMouthView(level: { [ui] in ui.voiceLevel }).frame(width: 20, height: 12)
+                        }
                     }
                     .padding(.horizontal, 9).padding(.vertical, 7)
                     .hud(stroke: Palette.codex.opacity(focused ? 0.85 : 0.5), fill: Color.black.opacity(0.55), cut: 7)
+                    AssistantVoiceRow(voice: voice, hint: ui.voiceHint)
                     HStack(spacing: 8) {
                         Caps(codex.pendingProposal != nil ? "⌘⏎ отправить действие" : "⏎ спросить", size: 7.5)
                         Caps("esc закрыть", size: 7.5)
@@ -272,6 +275,30 @@ struct ProposalCard: View {
         switch proposal.action {
         case .text(let t): return t
         case .choose(let n): return "выбрать \(n)" + (proposal.choiceLabel.map { " · \($0)" } ?? "")
+        }
+    }
+}
+
+/// Строка голоса в помощнике: держат ⌃⌥Space — что с микрофоном (текст фразы — в поле); иначе подсказка
+/// «держи ⌃⌥Пробел — скажи голосом», пока голосом не пользовались 3 раза. Ничего — пусто.
+struct AssistantVoiceRow: View {
+    var voice: VoiceLine?
+    var hint: Bool
+
+    var body: some View {
+        if let v = voice {
+            HStack(spacing: 5) {
+                Image(systemName: v.alarm ? "mic.slash.fill" : "mic.fill").font(.system(size: 8, weight: .bold))
+                Text(v.note.isEmpty ? "слушаю — отпусти, и выполню" : v.note).font(.mono(9, .semibold)).lineLimit(1)
+            }
+            .foregroundColor(v.alarm ? Palette.crimson : Palette.codex)
+        } else if hint {
+            HStack(spacing: 5) {
+                Image(systemName: "mic.fill").font(.system(size: 8, weight: .bold))
+                Text(VoiceHint.text).font(.mono(9, .semibold)).lineLimit(1)
+            }
+            // Подсказка, не тревога: фиолетовым (малиновый — только «не слышу» и ошибки).
+            .foregroundColor(Palette.codex.opacity(0.9))
         }
     }
 }

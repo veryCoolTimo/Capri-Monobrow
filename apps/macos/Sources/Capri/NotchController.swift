@@ -170,7 +170,9 @@ final class NotchController: NSObject {
         panel.hasShadow = false
         // Выше строки меню (mainMenu = 24).
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3)
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        // Без `.stationary`: копия панели на каждом столе едет вместе со столом при свайпе (Тимофей: «чтобы
+        // монобровь крепилась, а не оставалась на экране»). Отдельный эффект глаз тогда не нужен — см. `spaceSwept`.
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.acceptsMouseMovedEvents = true
@@ -567,13 +569,15 @@ final class NotchController: NSObject {
     }
 
     private func drawVoiceBolt() {
-        guard state == .peek, ui.voice?.phase == .listening else {
+        // Peek — и помощник: держат ⌃⌥Space, когда он открыт (молния по нижнему краю его капли).
+        // Молния — только когда она слышит голос (выше порога): тишина выглядит иначе, чем речь.
+        guard state == .peek || state == .assistant, ui.voice?.phase == .listening, VoiceLevel.speaking(ui.voiceLevel) else {
             voiceBolt.isHidden = true
             voiceBoltShadow.isHidden = true
             return
         }
         voiceTick += 1
-        let r = local(.peek)
+        let r = local(state)
         let p = VoiceBolt.paths(left: r.minX + 14, right: r.maxX - 14, bottom: r.minY, down: -1, tick: voiceTick, level: ui.voiceLevel)
         var main = p.main
         if let fork = p.fork { main.addPath(fork) }
@@ -596,10 +600,18 @@ final class NotchController: NSObject {
 
     // MARK: смена пространства
 
+    /// Панель notch не `.stationary` и едет со столом; `SpaceSweep` оставлен на случай, если macOS её не повезёт.
+    static let panelFollowsSpaces = true
+
     /// Свайп на другой стол / в полноэкранное приложение: глаза в свёрнутом notch уезжают вместе со столом и входят
     /// с другой стороны (`SpaceSweep`). Только в свёрнутом notch с видимыми глазами — peek, раскрытый notch и
     /// помощника не трогаем. `revealed` — notch был спрятан полноэкранным приложением и проявляется: только вход.
     func spaceSwept(_ move: SpaceMove, fullscreen: Bool?, revealed: Bool) {
+        // Панель сама едет со столом (без `.stationary`) — глаза отдельно не сносим, иначе двойное движение.
+        if Self.panelFollowsSpaces {
+            if debugLog { Self.debugWrite("sweep skip (panel follows space)") }
+            return
+        }
         let skip: String? = state != .collapsed ? "notch \(state.rawValue)" : quiet ? "no wings" : ui.faceAway ? "face away"
             : suppressed ? "hidden" : nil
         if let skip {
