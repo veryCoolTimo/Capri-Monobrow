@@ -141,6 +141,7 @@ final class NotchController: NSObject {
     /// Нет ни ждущих, ни работающих: свёрнутая капля совпадает с вырезом.
     private var quiet = true
     private var collapseWork: DispatchWorkItem?
+    private var sweepEnd: DispatchWorkItem?
     private var alertWork: DispatchWorkItem?
     private var monitors: [Any] = []
     private var signalSources: [DispatchSourceSignal] = []
@@ -149,6 +150,8 @@ final class NotchController: NSObject {
     /// Переходы notch в лог — только с `--debug-control`.
     var debugLog = false
     private var lastSound: Date = .distantPast
+    /// Геометрия экрана notch (листы отладки).
+    var notchGeometry: NotchScreen { notch }
     /// Экран, на котором живёт notch.
     var notchScreen: NSScreen? { screen }
     /// Полноэкранное приложение на экране notch: свёрнутый notch спрятан, всплывает только на «ждёт меня».
@@ -396,6 +399,7 @@ final class NotchController: NSObject {
         if debugLog { Self.debugWrite("notch \(from.rawValue) → \(target.rawValue) (\(reason))") }
         let growing = NotchState.allCases.firstIndex(of: target)! > NotchState.allCases.firstIndex(of: from)!
         state = target
+        if ui.sweep != nil { sweepEnd?.cancel(); ui.sweep = nil }
         ui.expandedOpen = target == .expanded
         if target != .expanded, ui.musicHover { ui.musicHover = false }
         onStateChange?(target)
@@ -588,6 +592,35 @@ final class NotchController: NSObject {
         let row = NotchGeometry.notchRect(notch)?.height ?? NotchGeometry.pillSize.height
         let collapsed = NotchGeometry.shapeRect(.collapsed, notch)
         return CGRect(x: collapsed.minX + 13, y: NotchGeometry.anchorTop(notch) - row + (row - 16) / 2, width: 32, height: 16)
+    }
+
+    // MARK: смена пространства
+
+    /// Свайп на другой стол / в полноэкранное приложение: глаза в свёрнутом notch уезжают вместе со столом и входят
+    /// с другой стороны (`SpaceSweep`). Только в свёрнутом notch с видимыми глазами — peek, раскрытый notch и
+    /// помощника не трогаем. `revealed` — notch был спрятан полноэкранным приложением и проявляется: только вход.
+    func spaceSwept(_ move: SpaceMove, fullscreen: Bool?, revealed: Bool) {
+        let skip: String? = state != .collapsed ? "notch \(state.rawValue)" : quiet ? "no wings" : ui.faceAway ? "face away"
+            : suppressed ? "hidden" : nil
+        if let skip {
+            if debugLog { Self.debugWrite("sweep skip (\(skip))") }
+            return
+        }
+        let now = Date().timeIntervalSinceReferenceDate
+        let style = SpaceSweepStyle(move: move, soft: fullscreen == true,
+                                    reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+                                    seed: Int(now * 1000) & 0xffff)
+        let run = revealed ? SpaceSweep.arriving(now: now, style: style) : SpaceSweep.coalesce(ui.sweep, now: now, style: style)
+        if debugLog { Self.debugWrite("sweep \(run.style.move.rawValue) soft=\(run.style.soft) start=\(String(format: "%.2f", run.start - now))") }
+        if run != ui.sweep { ui.sweep = run }
+        // Снять по окончании: таймер на один раз, без постоянного.
+        sweepEnd?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.ui.sweep == run else { return }
+            self.ui.sweep = nil
+        }
+        sweepEnd = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, run.end - now) + 0.03, execute: work)
     }
 
     /// Клик по левому крылу верхней строки (там глаза Capri), а не по строке peek под ней.

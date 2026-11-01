@@ -57,6 +57,14 @@ extension NotchController {
         // Клик по ⏮ ⏯ ⏭ peek/notch без мыши: `musicbutton prev|toggle|next` (тот же путь, что клик).
         case "musicbutton": if let cmd = MusicCommand(button: arg) { onMusic?(cmd, state == .peek ? "peek" : "notch") }
         case "dump": dumpState()
+        // Лист кадров смены пространства в ~/.capri/tmp/space-sweep.png (офскрин; `sweep sheet alert` — много глаз).
+        case "sweep" where arg.hasPrefix("sheet"):
+            let n = NotchGeometry.notchRect(notchGeometry)
+            Task { @MainActor in
+                let url = SpaceSweepSheet.render(notchWidth: n?.width ?? 0, rowHeight: n?.height ?? NotchGeometry.pillSize.height,
+                                                 hasNotch: n != nil, alert: arg.hasSuffix("alert"))
+                Self.debugWrite("sweep sheet: \(url?.lastPathComponent ?? "fail")")
+            }
         default: if let cmd = parts.first { onDebug?(cmd, arg) }
         }
     }

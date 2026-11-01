@@ -133,6 +133,15 @@ final class AttentionCenter: NSObject {
         }
     }
 
+    /// Сразу после смены пространства: WindowServer уже знает, полноэкранное ли новое, а список окон — ещё нет.
+    /// Прячем/возвращаем notch без ожидания (проверки через 0,35 и 1,2 с всё равно будут). При «всегда скрывать
+    /// строку меню» — только по окнам, как в `checkFullscreen`.
+    func spaceArrived(fullscreen fs: Bool?) {
+        guard let fs, notch.notchScreen != nil, !Self.menuBarAutoHides else { return }
+        setFullscreen(fs)
+        notch.setSuppressed(fs && settings.fullscreenQuiet)
+    }
+
     static var menuBarAutoHides: Bool {
         UserDefaults(suiteName: ".GlobalPreferences")?.bool(forKey: "_HIHideMenuBar") ?? false
     }

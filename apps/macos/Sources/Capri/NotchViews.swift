@@ -18,6 +18,8 @@ final class NotchUI: ObservableObject {
     @Published var assistantFocusTick = 0
     /// Глаза ушли на рабочий стол (идёт сцена) — в notch их нет.
     @Published var faceAway = false
+    /// Смена пространства: глаза уезжают вместе со столом (`SpaceSweep`); nil — эффекта нет.
+    @Published var sweep: SpaceSweepRun?
     /// Кивает под музыку (4 с после смены трека).
     @Published var vibing = false
     /// Что играет («Artist — Track») и играет ли сейчас; nil — ничего или неизвестно.
@@ -250,7 +252,7 @@ struct TopRowView: View {
             let listening = ui.voice?.phase == .listening
             CapriFace(mood: listening ? .listening : waiting > 0 ? .alert : codex.chatBusy ? .thinking : vibing ? .vibing : .idle, style: .mask)
                 .frame(width: 32, height: 16)
-                .opacity(ui.faceAway ? 0 : 1)
+                .opacity(ui.faceAway || ui.sweep != nil ? 0 : 1)
                 .help("Capri — спросить (⌃⌥Space)")
             if vibing {
                 EqualizerBars(color: Palette.crimson, animating: true, height: 9).padding(.leading, 4)
@@ -266,6 +268,14 @@ struct TopRowView: View {
         }
         .padding(.horizontal, 13)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .topLeading) {
+            // Смена пространства: на время эффекта глаза рисует он (за край капли и в вырез).
+            if let run = ui.sweep {
+                GeometryReader { g in
+                    SpaceSweepLive(run: run, rowHeight: g.size.height, hasNotch: ui.hasNotch, alert: waiting > 0)
+                }
+            }
+        }
     }
 }
 

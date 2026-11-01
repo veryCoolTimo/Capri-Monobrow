@@ -96,6 +96,10 @@ public struct TransitionFrame: Equatable {
     public var ribbon: TransitionRibbon?
     public var bolt: TransitionBolt?
 
+    public init(kind: TransitionKind, role: TransitionRole, progress: CGFloat, rect: CGRect?, bars: [TransitionBar] = []) {
+        self.kind = kind; self.role = role; self.progress = progress; self.rect = rect; self.bars = bars
+    }
+
     /// Содержимое просто стоит на месте — рисовать как без перехода.
     public var plain: Bool {
         rect != nil && squash == 1 && bars.isEmpty && columns.isEmpty && flash == nil && ribbon == nil && bolt == nil

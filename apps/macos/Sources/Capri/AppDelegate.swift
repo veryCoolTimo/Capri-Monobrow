@@ -29,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let spotify = SpotifySearch()
     private var music: MusicController!
     private var voice: VoiceCenter!
+    private var spaces: SpaceWatcher!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installMainMenu()
@@ -87,6 +88,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         notch.start()
         attention.start()
+        // Смена пространства: сразу узнаём, полноэкранное ли новое (notch прячется/возвращается без задержки),
+        // и глаза в notch уезжают вместе со столом.
+        spaces = SpaceWatcher(screen: { [weak self] in self?.notch.notchScreen })
+        if args.contains("--debug-control") { spaces.log = { NotchController.debugWrite($0) } }
+        spaces.onChange = { [weak self] move, fullscreen in
+            guard let self else { return }
+            let wasHidden = self.notch.suppressed
+            self.attention.spaceArrived(fullscreen: fullscreen)
+            self.notch.spaceSwept(move, fullscreen: fullscreen, revealed: wasHidden && !self.notch.suppressed)
+        }
+        spaces.start()
         character.debugLog = CommandLine.arguments.contains("--debug-control")
         // В отладке живые сцены на столе не играют (только офскрин-листы), пока не скажут `scene live on`.
         character.stage.offscreenOnly = character.debugLog
@@ -437,6 +449,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window?.close()
         case "window-snapshot":
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.snapshotWindow() }
+        case "spaces":
+            // Список пространств дисплея notch (только чтение; сами пространства не переключаем).
+            NotchController.debugWrite(spaces.describe())
         case "scene" where arg.hasPrefix("sheet voice"):
             Task { @MainActor in
                 let urls = VoiceSheet.render()
